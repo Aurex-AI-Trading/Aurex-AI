@@ -1,0 +1,258 @@
+# ============================================================
+# Aurex AI Signature Strategy — Master Configuration
+# All runtime parameters live here.  No hardcoded values in code.
+# ============================================================
+
+# ── Trading symbols ───────────────────────────────────────────
+symbols:
+  - EURUSD
+  - USDJPY
+  - GBPUSD
+
+# ── Risk management ───────────────────────────────────────────
+risk:
+  risk_pct:            0.10    # % of balance risked per trade
+  min_rr:              1.5     # minimum reward-to-risk ratio accepted
+  max_open_trades:     1       # LIVE CAPITAL PROTECTION: 1 trade at a time
+  max_open_per_symbol: 1       # max concurrent positions per individual symbol
+  max_daily_trades:    2       # LIVE CAPITAL PROTECTION: max 2 trades per day
+  max_lot_size:        0.05    # demo safety cap — 0.0 means no cap
+  max_daily_loss_pct:  10.0    # halt if daily drawdown exceeds this (~$3 on $29 account)
+  max_trade_risk_pct:  5.0     # survivability cap: reject any trade where dollar risk
+                               # exceeds this % of balance after lot clamping.
+  fixed_lot_size:      0.01    # when > 0: bypass ALL dynamic sizing; every trade uses
+                               # exactly this lot regardless of balance, optimizer,
+                               # session, confidence, or size_mult. Set to 0.0 to
+                               # re-enable dynamic sizing (requires adequate capital).
+  max_sl_pips:         25      # hard SL distance cap (pips, balance-independent).
+                               # Trades with SL > this value are always rejected,
+                               # regardless of account balance or lot size.
+                               # 25 pips @ 0.01 lot = $2.50 risk (8.6% of $29).
+                               # Set to 0 to disable.
+  min_execution_tier:  2       # minimum tier allowed to execute.
+                               # 1 = Tier 1 only (score ≥ 60)
+                               # 2 = Tier 1 + Tier 2 (score ≥ 50)  ← recommended for small account
+                               # 3 = all tiers including Tier 3 and fallback
+                               # Tier 3 / fallback (0.25× lot) add frequency with no quality edge.
+  sl_buffer_pips:      5       # extra buffer beyond sweep level for SL
+  tp_fixed_rr:         2.5     # fallback TP when no next-liquidity zone found
+
+# ── Scoring weights (must sum to 100) ─────────────────────────
+scoring:
+  weights:
+    trend:        30   # +5: primary signal, present across all sessions
+    liquidity:    25   # +5: sweep is the most reliable live edge
+    fvg:          10   # -10: valuable in London/NY but structurally absent in Asian session
+    fibonacci:    15   # unchanged
+    ema:          10   # unchanged
+    confirmation: 10   # unchanged
+  thresholds:
+    tier1:        60   # score >= tier1  → EXECUTE   (1.00× lot)
+    tier2:        50   # score >= tier2  → CONDITIONAL (0.50× lot)
+    tier3:        35   # score >= tier3  → TIER3     (0.25× lot)  was 40
+    # score < tier3 → SKIP
+  min_confidence:  50  # pre-filter floor: reject markets below 50 confidence score
+
+# ── Timeframes ────────────────────────────────────────────────
+timeframes:
+  h4_candles:  210    # H4 bars fetched (EMA200 warmup needs ≥205)
+  h1_candles:  250    # H1 bars fetched
+  m15_candles: 150    # M15 bars for entry analysis
+  m5_candles:  100    # M5 bars (optional precision entry)
+
+# ── Cooldown system ───────────────────────────────────────────
+cooldown:
+  trending_minutes:    15    # cooldown when market is trending
+  ranging_minutes:     60    # cooldown when market is ranging / low confluence
+  post_loss_minutes:   60    # extended cooldown after a losing trade
+  post_win_minutes:    20    # shortened cooldown after a winning trade
+
+# ── Strategy parameters ───────────────────────────────────────
+strategy:
+  # Trend detection
+  ema_fast_period:  50     # EMA 50 — structure
+  ema_slow_period:  200    # EMA 200 — macro trend
+
+  # EMA entry zone
+  ema_entry_period:      21    # EMA 21 — entry proximity scoring
+  ema_entry_threshold_pct: 0.50  # price within 0.50% of EMA21 → full score
+
+  # Liquidity sweep
+  swing_window:          3     # bars each side to define a swing high/low
+  sweep_lookback:        50    # bars to scan for sweep event
+  equal_tol_pips:        3     # pip tolerance for "equal" highs/lows
+  min_wick_ratio:        0.55  # wick must be ≥55% of candle range
+
+  # Core score minimum (applied before bonus factors count)
+  # Prevents setups where OB/breakout/structure bonuses inflate a weak core past execution thresholds.
+  # core_score = trend + liquidity + fvg + fib + ema + confirmation (0-100, no bonuses)
+  min_core_score:        35    # trades with core < 35 are rejected regardless of bonus score
+
+  # Execution composite gate (only active when fixed_lot_size > 0)
+  # In fixed-lot mode size multipliers cannot reduce lot size, so weak execution
+  # factors (doji, shallow pullback, MTF conflict, off-session) must become hard rejections.
+  # composite = session × volatility × momentum × pullback × mtf factors (0.10–1.50)
+  # 0.40 threshold: blocks doji+shallow pullback and multi-factor weak combos while
+  # allowing strong off-session setups (0.5 session alone = 0.50 > 0.40 → passes).
+  min_exec_composite:    0.40
+
+  # ATR-based SL/TP multipliers (used by risk_manager.calculate)
+  sl_atr_mult: 1.5    # SL = entry ± ATR(14) × this (1.5 ATR covers ~95% of normal moves)
+  tp_atr_mult: 0.0    # 0 = quality-based dynamic: HIGH=3.75 (2.5R), MED=3.0 (2.0R), LOW=2.25 (1.5R)
+
+  # Signal strength gate (fallback pipeline only)
+  strength_threshold:    0.60  # minimum signal strength; raised by AI optimizer on losses
+
+  # Adaptive execution thresholds (no hard blocks — all reduce position size)
+  entry_body_ratio:      0.40  # body < 40% → -30%; body < 30% → -50%; no block
+  entry_pullback_min_atr: 0.20 # pullback < 0.2 ATR → -30%; no block
+  entry_pullback_max_atr: 2.50 # pullback > 2.5 ATR → -50%; no block
+  min_atr_pips:          10    # ATR < min → HARD REJECT (sleeping market).
+                               # Also used by adaptive sizing when fixed_lot_size = 0.
+                               # 10 pips is the realistic M15 floor for any major pair.
+  atr_optimal_max_pips:  30    # ATR > this = HIGH zone. Conservative: block.
+                               # Aggressive: existing max_atr_pips proportional reduction.
+                               # 30 pips covers normal London/NY range; above = news/spike.
+  max_atr_pips:         200    # ATR > max → proportional reduction (max/atr factor)
+
+  # Fair Value Gap
+  fvg_lookback:          50
+  fvg_min_size_pips:     1.0   # minimum gap size to qualify
+
+  # Fibonacci
+  fib_lookback:          50
+  fib_min_move_pips:     30    # minimum impulse move to compute fib
+  fib_ratios:            [0.382, 0.5, 0.618, 0.705, 0.786]
+  golden_zone:           [0.5, 0.705]
+
+# ── MT5 connection ────────────────────────────────────────────
+mt5:
+  path:      ""           # path to terminal64.exe, empty = auto-detect
+  account:   0            # broker account number — MUST set in env or .env
+  password:  ""           # MUST set in env or .env
+  server:    ""           # broker server name
+  magic:     202500
+  deviation: 20           # max slippage in points
+  timeout:   10           # operation timeout in seconds
+  max_retries:   5
+  retry_delay:   2.0      # seconds between retries
+
+# ── Trading mode ──────────────────────────────────────────────
+trading:
+  dry_run:        false   # LIVE — real orders sent to MT5
+  scan_interval:  15      # seconds between full symbol scans
+  environment:    production
+  sim_balance:    0.0     # DISABLED — real MT5 account balance used for all calculations.
+  # "aggressive" — tuned for small accounts ($29/R500): lower thresholds, higher frequency
+  # "conservative" — original production gates: use when scaling to larger capital
+  trading_mode:   aggressive
+
+# ── Logging ───────────────────────────────────────────────────
+logging:
+  level:        INFO
+  debug:        false      # true → DEBUG level, logs every symbol + decision detail
+  dir:          ./logs
+  max_bytes:    10485760   # 10 MB
+  backup_count: 10
+
+# ── Fallback strategy ─────────────────────────────────────────
+fallback:
+  enabled:            false   # LIVE CAPITAL PROTECTION: fallback (Tier 3) disabled
+  # FORCE_FALLBACK — set true to bypass idle threshold (TEST/DEBUG mode only)
+  # WARNING: forces a fallback attempt every cycle. Never use in production.
+  force_trigger:      false
+  # Idle cycles before fallback activates
+  idle_cycles_normal: 8       # asian session or low ATR
+  idle_cycles_active: 5       # London/NY session with ATR >= min_atr_pips
+  # Daily limit — resets at UTC midnight
+  max_daily_trades:   2
+  # Market quality filters
+  min_atr_pips:       8.0     # minimum ATR to enter (below = flat/dead market)
+  max_spread_pips:    3.0     # maximum allowed spread in pips
+  min_strength:       0.35    # minimum signal strength (fallback max is 0.50)
+
+# ── Stack entries ─────────────────────────────────────────────
+stack:
+  enabled:            true
+  min_confidence:     70      # minimum AI confidence to stack
+  pullback_min_atr:   0.2     # pullback must be >= this many ATR from recent swing
+  pullback_max_atr:   0.4     # pullback must be <= this many ATR from recent swing
+  body_ratio:         0.6     # minimum body/range ratio for momentum confirmation
+
+# ── Backtest ──────────────────────────────────────────────────
+backtest:
+  data_dir:         ./data/backtest    # root for CSV historical data
+  commission_pips:  0.5               # simulated commission per trade
+  slippage_pips:    0.5               # simulated slippage on fill
+  account_currency: ZAR               # account currency for backtest reports
+
+# ── Trade management ──────────────────────────────────────────
+trade_management:
+  breakeven_enabled:  true    # move SL to entry at +1R
+  partial_tp_enabled: true    # close partial_tp_ratio of position at +1R
+  partial_tp_ratio:   0.5     # fraction to close (0.5 = 50%)
+  breakeven_rr:       1.0     # R-multiple that triggers both actions
+  trail_1r5_rr:       1.5     # start trailing at +1.5R (ATR × trail_atr_mult_1)
+  trail_2r_rr:        2.0     # tighten trail at +2R   (ATR × trail_atr_mult_2)
+  trail_atr_mult_1:   1.0     # first trail stage multiplier
+  trail_atr_mult_2:   0.5     # second (tighter) trail stage multiplier
+
+# ── Testing ───────────────────────────────────────────────────
+testing:
+  test_mode: false              # MUST remain false in production
+  high_frequency_mode: false    # LIVE CAPITAL PROTECTION: enforce all daily trade limits
+
+# ── Trading mode gate presets ─────────────────────────────────
+# These override the individual strategy/risk/scoring values at runtime.
+# Switch via: trading.trading_mode = aggressive | conservative
+#
+# aggressive — designed for small accounts ($29/R500):
+#   • ATR floor 5 pips (dead-market absolute floor = 3 pips)
+#   • Rebalanced weights: trend heavier, liquidity/FVG lighter
+#     so absent sweeps/FVGs do not crater the score
+#   • Lower tier thresholds: more setups qualify, lower quality floor
+#   • All three tiers executable (tier3 = 0.25× lot)
+#   • Execution composite 0.25 (was 0.40) — still blocks doji-only entries
+#   • Structure fallback: strong trend earns 5-pt continuation credit
+#
+# conservative — original production calibration:
+#   • ATR floor 10 pips
+#   • AI-adaptive weights (learning engine self-tunes via trade outcomes)
+#   • Original tier thresholds (60/50/35)
+#   • Tier 1+2 only (tier3 blocked)
+#   • Execution composite 0.40
+
+modes:
+  aggressive:
+    min_confidence:      45     # confidence gate (was 50)
+    min_atr_pips:        5.0    # volatility floor (was 10)
+    atr_optimal_max_pips: 40    # HIGH zone above 40 pips: size reduced, not blocked
+    min_core_score:      20.0   # core gate (was 35) — still blocks zero-trend entries
+    min_exec_composite:  0.25   # execution quality floor (was 0.40)
+    min_execution_tier:  3      # allow all three tiers (was 2 = tier3 blocked)
+    tier1:               55     # EXECUTE   full lot  (was 60)
+    tier2:               38     # CONDITIONAL half lot (was 50)
+    tier3:               28     # TIER3 quarter lot   (was 35)
+    weights:
+      # Sum must equal 100.  Trend raised; liquidity/FVG reduced.
+      # Absence of sweep (-25→-15) and FVG (-10→-5) now costs only 20 pts
+      # instead of 35.  A trend + fib + ema setup scores ~40–50 without any
+      # institutional confirmation and can reach tier2 execution.
+      trend:        40   # up from 30 — primary directional edge, always present
+      liquidity:    15   # down from 25 — valuable bonus, not a gate
+      fvg:           5   # down from 10 — rare in Asian/ranging; treated as bonus
+      fibonacci:    20   # up from 15 — reliable pullback confirmation
+      ema:          10   # unchanged
+      confirmation: 10   # unchanged
+
+  conservative:
+    min_confidence:      50
+    min_atr_pips:       10.0
+    atr_optimal_max_pips: 25   # HIGH zone above 25 pips: block (news/spike risk)
+    min_core_score:     35.0
+    min_exec_composite:  0.40
+    min_execution_tier:  2
+    tier1:               60
+    tier2:               50
+    tier3:               35
+    # weights: omitted → learning engine provides adaptive weights

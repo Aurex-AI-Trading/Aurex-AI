@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 44" fill="none">
+  <!-- Symbol: Hexagonal badge -->
+  <polygon points="22,3 37,12 37,30 22,39 7,30 7,12" fill="#0A1628"/>
+
+  <!-- White "A" lettermark - geometric paths -->
+  <path d="M22 11 L30 33 H26.5 L25 27.5 H19 L17.5 33 H14 Z
+           M20.2 24.5 H23.8 L22 17.5 Z"
+        fill="white"/>
+
+  <!-- Orange accent: rising chart line -->
+  <path d="M10 27 L15 22 L19.5 25.5 L29 16"
+        stroke="#F97316" stroke-width="1.6"
+        stroke-linecap="round" stroke-linejoin="round"
+        fill="none"/>
+
+  <!-- Wordmark: AUREX -->
+  <text x="47" y="19"
+        font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="17" font-weight="700" fill="#0A1628"
+        letter-spacing="-0.3">AUREX</text>
+
+  <!-- Wordmark: AI in accent -->
+  <text x="47" y="35"
+        font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="9.5" font-weight="600" fill="#F97316"
+        letter-spacing="3.5">TRADING AI</text>
+</svg>

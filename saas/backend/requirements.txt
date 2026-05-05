@@ -1,0 +1,30 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# Auth & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+cryptography==43.0.3
+
+# Config
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# Rate limiting
+slowapi==0.1.9
+
+# Redis (optional cache)
+redis[hiredis]==5.2.1
+
+# HTTP client (for webhooks etc.)
+httpx==0.28.1
+
+# YAML (for config compat with aurex_ai)
+pyyaml==6.0.2

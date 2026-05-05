@@ -1,0 +1,199 @@
+================================================================================
+  Aurex AI Signature Strategy — Sample Log Output
+  (representative of a single scan cycle with 3 symbols)
+================================================================================
+
+2026-04-29 08:15:00 WARNING  main — === Aurex AI LIVE (DRY_RUN) | symbols=6 | interval=60s | risk=1.0% ===
+
+2026-04-29 08:15:01 INFO     main — [HEARTBEAT] cycle=1 timestamp=2026-04-29 08:15:01 symbols=6 trades_today=0 open=0 idle=0
+2026-04-29 08:15:01 INFO     main — [SCAN START] cycle=1 symbols=6
+
+── EURUSD ───────────────────────────────────────────────────────────────────────
+
+2026-04-29 08:15:02 INFO     main — [SYMBOL] EURUSD price=1.08432
+
+2026-04-29 08:15:02 INFO     strategy.confluence —
+[ANALYSIS] EURUSD
+  Trend:        bullish     +22.0 /25
+  Liquidity:    sell_side   +16.0 /20
+  FVG:          yes         +15.0 /20
+  Fibonacci:    bullish     +12.0 /15
+  EMA:                      + 8.0 /10
+  Confirmation:             + 9.0 /10
+  ─────────────────────────────────
+  Core score:   82.0
+  Order Block:  bullish     +12.0 /15 [BONUS]
+  Breakout:     none        + 0.0 /12 [BONUS]
+  ─────────────────────────────────
+  TOTAL SCORE:  94.0  → TRADE (Tier 1)
+  Votes:        3B / 0S   Direction: BUY
+
+2026-04-29 08:15:02 WARNING  execution.decision —
+[DECISION ENGINE]
+  symbol=EURUSD  direction=BUY  score=94.0
+  trend=22.0  liquidity=16.0  fvg=15.0  fib=12.0  ema=8.0  confirmation=9.0
+  ob=12.0  breakout=0.0
+  votes=3B/0S  tier=1  decision=EXECUTE
+  reason=score=94.0 >= tier1=75
+
+2026-04-29 08:15:02 WARNING  ai.optimizer —
+[OPTIMIZER]
+  Symbol:      EURUSD
+  Direction:   BUY
+  ATR:         14.2 pips
+  Original SL: 20.0 pips → Adjusted: 20.0 pips
+  Original TP: 45.0 pips → Adjusted: 45.0 pips
+  Lot size:    0.10 → 0.10 (mult=1.00)
+  Reason:      No adjustments
+
+2026-04-29 08:15:03 WARNING  main — [TRADE OPENED] EURUSD BUY | tier=1 setup=FVG+OB score=94.0 rr=2.25 lot=0.10 ticket=12345001
+
+── XAUUSD ───────────────────────────────────────────────────────────────────────
+
+2026-04-29 08:15:03 INFO     main — [SYMBOL] XAUUSD price=2318.45
+
+2026-04-29 08:15:03 INFO     strategy.confluence —
+[ANALYSIS] XAUUSD
+  Trend:        bullish     +18.0 /25
+  Liquidity:    none        + 0.0 /20
+  FVG:          yes         +12.0 /20
+  Fibonacci:    bullish     + 9.0 /15
+  EMA:                      + 7.0 /10
+  Confirmation:             + 6.0 /10
+  ─────────────────────────────────
+  Core score:   52.0
+  Order Block:  none        + 0.0 /15 [BONUS]
+  Breakout:     bullish     + 9.0 /12 [BONUS]
+  ─────────────────────────────────
+  TOTAL SCORE:  61.0  → TRADE (Tier 2)
+  Votes:        2B / 0S   Direction: BUY
+
+2026-04-29 08:15:03 INFO     execution.decision —
+[DECISION ENGINE]
+  symbol=XAUUSD  direction=BUY  score=61.0
+  trend=18.0  liquidity=0.0  fvg=12.0  fib=9.0  ema=7.0  confirmation=6.0
+  ob=0.0  breakout=9.0
+  votes=2B/0S  tier=2  decision=CONDITIONAL
+  reason=score=61.0 in tier2 [60–75)
+
+2026-04-29 08:15:03 WARNING  ai.optimizer —
+[OPTIMIZER]
+  Symbol:      XAUUSD
+  Direction:   BUY
+  ATR:         412.3 pips
+  Original SL: 20.0 pips → Adjusted: 28.0 pips
+  Original TP: 45.0 pips → Adjusted: 63.0 pips
+  Lot size:    0.05 → 0.04 (mult=0.75)
+  Reason:      High volatility + Asian session
+
+2026-04-29 08:15:04 WARNING  main — [TRADE OPENED] XAUUSD BUY | tier=2 setup=FVG score=61.0 rr=2.25 lot=0.04 ticket=12345002
+
+── GBPUSD ───────────────────────────────────────────────────────────────────────
+
+2026-04-29 08:15:04 INFO     main — [SYMBOL] GBPUSD price=1.26781
+
+2026-04-29 08:15:04 INFO     strategy.confluence —
+[ANALYSIS] GBPUSD
+  Trend:        bearish     +20.0 /25
+  Liquidity:    buy_side    +14.0 /20
+  FVG:          no          + 0.0 /20
+  Fibonacci:    none        + 0.0 /15
+  EMA:                      + 5.0 /10
+  Confirmation:             + 4.0 /10
+  ─────────────────────────────────
+  Core score:   43.0
+  Order Block:  none        + 0.0 /15 [BONUS]
+  Breakout:     none        + 0.0 /12 [BONUS]
+  ─────────────────────────────────
+  TOTAL SCORE:  43.0  → SKIP (no consensus)
+  Votes:        1B / 1S   Direction: NONE
+
+2026-04-29 08:15:04 INFO     execution.decision — [DECISION ENGINE] symbol=GBPUSD direction=NONE score=43.0 tier=0 decision=SKIP
+2026-04-29 08:15:04 INFO     main — [SKIP] symbol=GBPUSD reason=no_consensus score=43.0
+
+── USDJPY ───────────────────────────────────────────────────────────────────────
+
+2026-04-29 08:15:05 INFO     main — [SYMBOL] USDJPY price=154.230
+
+2026-04-29 08:15:05 INFO     strategy.confluence —
+[ANALYSIS] USDJPY
+  Trend:        bearish     +25.0 /25
+  Liquidity:    sell_side   +18.0 /20
+  FVG:          no          + 0.0 /20
+  Fibonacci:    bearish     +11.0 /15
+  EMA:                      + 9.0 /10
+  Confirmation:             + 8.0 /10
+  ─────────────────────────────────
+  Core score:   71.0
+  Order Block:  bearish     + 8.0 /15 [BONUS]
+  Breakout:     none        + 0.0 /12 [BONUS]
+  ─────────────────────────────────
+  TOTAL SCORE:  79.0  → TRADE (Tier 1)
+  Votes:        0B / 2S   Direction: SELL
+
+2026-04-29 08:15:05 WARNING  execution.decision —
+[DECISION ENGINE]
+  symbol=USDJPY  direction=SELL  score=79.0
+  trend=25.0  liquidity=18.0  fvg=0.0  fib=11.0  ema=9.0  confirmation=8.0
+  ob=8.0  breakout=0.0
+  votes=0B/2S  tier=1  decision=EXECUTE
+  reason=score=79.0 >= tier1=75
+
+2026-04-29 08:15:05 WARNING  ai.optimizer —
+[OPTIMIZER]
+  Symbol:      USDJPY
+  Direction:   SELL
+  ATR:         98.1 pips
+  Original SL: 20.0 pips → Adjusted: 20.0 pips
+  Original TP: 45.0 pips → Adjusted: 45.0 pips
+  Lot size:    0.08 → 0.06 (mult=0.75)
+  Reason:      Symbol WR 46% (low)
+
+2026-04-29 08:15:06 WARNING  main — [TRADE OPENED] USDJPY SELL | tier=1 setup=OB+Sweep score=79.0 rr=2.25 lot=0.06 ticket=12345003
+
+── Scan complete ─────────────────────────────────────────────────────────────────
+
+2026-04-29 08:15:06 INFO     main — [MT5 DATA] cycle=1 symbols_received=6 valid=6
+2026-04-29 08:15:06 INFO     main — [SCAN END] cycle=1 duration=5.14s signals=3 trades_today=3 idle=0 sleeping=54.9s
+
+================================================================================
+  [LEARNING] Daily snapshot (fires once per UTC day)
+================================================================================
+
+2026-04-29 00:00:01 WARNING  ai.learning_engine — [LEARNING] Daily snapshot | trades=127 wr=58.3% avg_rr=2.18 pnl=3241.50
+2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   EURUSD  trades=42  wr=61.9%
+2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   XAUUSD  trades=38  wr=55.3%
+2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   USDJPY  trades=28  wr=57.1%
+2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   GBPUSD  trades=19  wr=52.6%
+2026-04-29 00:00:02 WARNING  ai.weight_adjuster — [LEARNING] Weight adjustment applied: {'fvg': 1, 'order_block': 1, 'ema': -1} | total_trades=127 overall_wr=58.3%
+
+================================================================================
+  [FALLBACK MODE] After 10+ idle cycles
+================================================================================
+
+2026-04-29 14:30:00 INFO     main — [HEARTBEAT] cycle=47 timestamp=2026-04-29 14:30:00 symbols=6 trades_today=0 open=0 idle=11
+2026-04-29 14:30:01 INFO     ai.learning_engine — [LEARNING] Fallback mode: idle=11 → Tier3 threshold=45
+
+2026-04-29 08:15:05 INFO     strategy.confluence —
+[ANALYSIS] EURGBP
+  Trend:        bullish     +15.0 /25
+  Liquidity:    none        + 0.0 /20
+  FVG:          no          + 0.0 /20
+  Fibonacci:    bullish     + 8.0 /15
+  EMA:                      + 6.0 /10
+  Confirmation:             + 5.0 /10
+  ─────────────────────────────────
+  Core score:   34.0
+  Order Block:  none        + 0.0 /15 [BONUS]
+  Breakout:     bullish     +12.0 /12 [BONUS]
+  ─────────────────────────────────
+  TOTAL SCORE:  46.0  → TRADE (Tier 3)
+  Votes:        2B / 0S   Direction: BUY
+
+2026-04-29 08:15:05 INFO     execution.decision —
+[DECISION ENGINE]
+  symbol=EURGBP  direction=BUY  score=46.0
+  tier=3  decision=TIER3
+  reason=score=46.0 in tier3 [45–60)
+
+2026-04-29 08:15:05 WARNING  main — [TRADE OPENED] EURGBP BUY | tier=3 setup=Breakout score=46.0 rr=2.00 lot=0.02 ticket=12345021

@@ -1,0 +1,20 @@
+# ══════════════════════════════════════════════════════════
+#  Aurex AI Signature Strategy — Python Dependencies
+#  Project: AUREX_AI (standalone — NO HFM_AUTO_TRADER deps)
+#  Install: pip install -r requirements.txt
+# ══════════════════════════════════════════════════════════
+
+# ── MT5 (Windows only — required for live trading) ────────
+# Install separately on Windows:
+#   pip install MetaTrader5>=5.0.45
+# On non-Windows (dev/backtest only): omit — bridge auto-detects absence.
+# MetaTrader5>=5.0.45
+
+# ── Core data ─────────────────────────────────────────────
+PyYAML>=6.0.1
+numpy>=1.26.0          # indirect — MetaTrader5 returns numpy structured arrays
+python-dateutil>=2.9.0
+
+# ── Testing ───────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

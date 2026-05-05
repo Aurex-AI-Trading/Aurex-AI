@@ -1,0 +1,107 @@
+{
+  "symbols": {
+    "XAUUSD": {
+      "trades": 9,
+      "wins": 4,
+      "total_pnl": 204.48,
+      "total_rr": 18.0
+    },
+    "USDJPY": {
+      "trades": 7,
+      "wins": 1,
+      "total_pnl": -0.5299999999999996,
+      "total_rr": 14.0
+    },
+    "EURUSD": {
+      "trades": 10,
+      "wins": 1,
+      "total_pnl": -28.800000000000004,
+      "total_rr": 19.95
+    },
+    "GBPUSD": {
+      "trades": 1,
+      "wins": 0,
+      "total_pnl": 0.0,
+      "total_rr": 1.99
+    }
+  },
+  "tiers": {
+    "2": {
+      "trades": 8,
+      "wins": 2,
+      "total_pnl": 8.839999999999996,
+      "total_rr": 15.97
+    },
+    "1": {
+      "trades": 16,
+      "wins": 3,
+      "total_pnl": 137.16000000000003,
+      "total_rr": 31.97
+    },
+    "3": {
+      "trades": 3,
+      "wins": 1,
+      "total_pnl": 29.15,
+      "total_rr": 6.0
+    }
+  },
+  "sessions": {
+    "london": {
+      "trades": 10,
+      "wins": 2,
+      "total_pnl": 47.84,
+      "total_rr": 19.96
+    },
+    "newyork": {
+      "trades": 15,
+      "wins": 4,
+      "total_pnl": 218.66,
+      "total_rr": 29.98
+    },
+    "overlap": {
+      "trades": 2,
+      "wins": 0,
+      "total_pnl": -91.35,
+      "total_rr": 4.0
+    }
+  },
+  "setups": {
+    "FVG+OB": {
+      "trades": 17,
+      "wins": 4,
+      "total_pnl": 41.15,
+      "total_rr": 33.98
+    },
+    "OB+Sweep": {
+      "trades": 5,
+      "wins": 1,
+      "total_pnl": 132.32,
+      "total_rr": 9.99
+    },
+    "OB": {
+      "trades": 3,
+      "wins": 1,
+      "total_pnl": 2.2500000000000004,
+      "total_rr": 5.98
+    },
+    "Breakout": {
+      "trades": 1,
+      "wins": 0,
+      "total_pnl": -0.57,
+      "total_rr": 2.0
+    },
+    "Sweep": {
+      "trades": 1,
+      "wins": 0,
+      "total_pnl": 0.0,
+      "total_rr": 1.99
+    }
+  },
+  "overall": {
+    "trades": 27,
+    "wins": 6,
+    "total_pnl": 175.15,
+    "total_rr": 53.940000000000005
+  },
+  "last_updated": "2026-05-05T11:05:50.117759+00:00"
+}
