@@ -91,25 +91,13 @@ strategy:
   # core_score = trend + liquidity + fvg + fib + ema + confirmation (0-100, no bonuses)
   min_core_score:        35    # trades with core < 35 are rejected regardless of bonus score
 
-  # Execution composite gate (only active when fixed_lot_size > 0)
-  # In fixed-lot mode size multipliers cannot reduce lot size, so weak execution
-  # factors (doji, shallow pullback, MTF conflict, off-session) must become hard rejections.
-  # composite = session × volatility × momentum × pullback × mtf factors (0.10–1.50)
-  # 0.40 threshold: blocks doji+shallow pullback and multi-factor weak combos while
-  # allowing strong off-session setups (0.5 session alone = 0.50 > 0.40 → passes).
-  min_exec_composite:    0.40
-
   # ATR-based SL/TP multipliers (used by risk_manager.calculate)
   sl_atr_mult: 1.5    # SL = entry ± ATR(14) × this (1.5 ATR covers ~95% of normal moves)
-  tp_atr_mult: 0.0    # 0 = quality-based dynamic: HIGH=3.75 (2.5R), MED=3.0 (2.0R), LOW=2.25 (1.5R)
+  tp_atr_mult: 0.0    # 0 = use fixed 3.0× (2.0R target). Override with positive value.
 
   # Signal strength gate (fallback pipeline only)
   strength_threshold:    0.60  # minimum signal strength; raised by AI optimizer on losses
 
-  # Adaptive execution thresholds (no hard blocks — all reduce position size)
-  entry_body_ratio:      0.40  # body < 40% → -30%; body < 30% → -50%; no block
-  entry_pullback_min_atr: 0.20 # pullback < 0.2 ATR → -30%; no block
-  entry_pullback_max_atr: 2.50 # pullback > 2.5 ATR → -50%; no block
   min_atr_pips:          10    # ATR < min → HARD REJECT (sleeping market).
                                # Conservative reference value; aggressive mode overrides to 5.0.
                                # 10 pips suits conservative mode (only trade strong volatility).
@@ -224,7 +212,6 @@ testing:
 #   • AI-adaptive weights (learning engine self-tunes via trade outcomes)
 #   • Original tier thresholds (60/50/35)
 #   • Tier 1+2 only (tier3 blocked)
-#   • Execution composite 0.40
 
 modes:
   aggressive:
@@ -238,7 +225,6 @@ modes:
                                # 8-pip floor was blocking valid low-volatility setups
     atr_optimal_max_pips: 35    # was 40 — tighter high-volatility ceiling
     min_core_score:      35.0   # was 20.0 — CRITICAL: requires trend + at least one factor
-    min_exec_composite:  0.40   # was 0.48 — 0.40 still blocks doji+off-session combos
     min_execution_tier:  2      # was 3 — TIER 3 ELIMINATED (0.25× lot, no quality edge)
     tier1:               65     # was 55 — A+ setups only for full lot execution
     tier2:               52     # was 38 — B+ setups for half lot execution
@@ -260,53 +246,9 @@ modes:
     min_atr_pips:       10.0
     atr_optimal_max_pips: 25   # HIGH zone above 25 pips: block (news/spike risk)
     min_core_score:     35.0
-    min_exec_composite:  0.40
     min_execution_tier:  2
     tier1:               60
     tier2:               50
     tier3:               35
     # weights: omitted → learning engine provides adaptive weights
 
-# ── Strict mode quality gate ──────────────────────────────────────────────────
-# When enabled, applies institutional-grade hard filters on top of mode gates.
-# Purpose: eliminate the 1B/1S split-vote, bos=False, confirmation=0 trades
-#          that cause poor win rate on small accounts.
-# Enable by setting enabled: true here OR by passing --strict at CLI.
-strict_mode:
-  enabled:               true    # hard quality gate active
-  require_bos:           false   # BOS rarely fires — structure_score gate below is the real guard
-  min_confirmation_score: 0      # 0 = disabled; already a size penalty via _entry_conf_factor
-  min_liquidity_score:   0.0     # 0 = disabled; sweep quality already weighted in confluence score
-  min_structure_score:   5.0     # minimum structure score (0–25); 5 = trend-bias minimum
-  block_split_votes:     true    # block when |buy_votes − sell_votes| < require_vote_margin
-  require_vote_margin:   1       # minimum vote margin: 2B/0S passes, 1B/1S blocked
-  tier1_only:            false   # true → only Tier1 full-size trades (Tier2 blocked)
-  min_confidence:        55      # strict confidence floor (0 = use mode default)
-
-# ── Multi-timeframe wait state ────────────────────────────────────────────────
-# Controls M5 wait state behaviour. When H1 direction is clear but M5 is temporarily
-# retracing (normal pullback), the bot waits for M5 realignment instead of blocking.
-# Disable m5_wait_enabled to revert to the old penalty-only behaviour.
-mtf:
-  m5_wait_enabled:       true   # true = WAIT STATE; false = hard block / size penalty
-  m5_wait_minutes:       45     # wait timeout for normal accounts (minutes)
-  m5_wait_minutes_micro: 25     # shorter timeout for micro accounts (<600 ZAR)
-  readiness_threshold:   65     # execution readiness score required (0-100)
-                                 # micro accounts use 55 automatically
-  max_low_quality_scans: 3      # consecutive poor-quality scans before early invalidation
-                                 # micro accounts use 2 automatically
-
-# ── Micro account safety mode ─────────────────────────────────────────────────
-# Auto-activates when live account balance falls below balance_threshold.
-# Designed for R500 ($27) accounts: maximise capital preservation over frequency.
-# Does NOT replace the mode system — both micro_account and mode.aggressive apply.
-micro_account:
-  enabled:              true    # activate when balance < balance_threshold
-  balance_threshold:    600.0   # ZAR — below this, micro mode kicks in
-  symbols:              [EURUSD] # trade only these symbols in micro mode
-                                 # EURUSD: tightest spread, highest liquidity, safest for R500
-  max_open_trades:      1       # never hold more than 1 position
-  max_daily_trades:     2       # hard cap regardless of cfg.risk.max_daily_trades
-  min_confidence:       60      # stricter confidence gate
-  min_rr:               2.0     # minimum R:R accepted (stricter than default 1.5)
-  tier1_only:           false   # Tier2 (0.50×) still allowed — halves risk further

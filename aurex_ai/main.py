@@ -53,7 +53,6 @@ from aurex_ai.execution.confidence_engine import (
 from aurex_ai.execution.trade_manager    import TradeManager
 from aurex_ai.execution.reentry_tracker  import ReEntryTracker, ClosedTrade
 from aurex_ai.execution.adaptive_limits    import get_adaptive_limit
-from aurex_ai.execution.adaptive_execution import build_execution_factors
 
 from aurex_ai.ai.optimizer        import optimize as ai_optimize, Optimizer
 from aurex_ai.ai.learning_engine  import LearningEngine
@@ -146,7 +145,7 @@ def _check_entry_quality(
     pip:         float,
     utc_hour:    int,
 ) -> Tuple[bool, str]:
-    """Deprecated — replaced by build_execution_factors() adaptive sizing."""
+    """Deprecated — kept for backward compatibility."""
     return True, ""
 
 
@@ -247,143 +246,6 @@ class _PendingSignal:
 
 
 _pending_signals: Dict[str, _PendingSignal] = {}
-
-
-# ── MTF entry wait state ──────────────────────────────────────────────────────
-
-@dataclass
-class _MtfWaitSignal:
-    """
-    Stored when H1 macro bias is clear but M5 is temporarily retracing.
-
-    Adaptive state machine: setup is re-evaluated every scan with decay, quality
-    deterioration detection, recovery momentum scoring, and execution readiness.
-
-    State lifecycle:
-      SCANNING          → normal, no wait active
-      WAITING_M5        → H1 aligned, M5 retracing — re-evaluated each scan
-      READY_TO_EXECUTE  → readiness threshold reached (state cleared, trade proceeds)
-      INVALIDATED       → ATR collapse / decay / quality / opposite BOS / displacement
-      EXPIRED           → timeout, M5 never confirmed
-    """
-    direction:          str     # "BUY" | "SELL"
-    macro_bias:         str     # "bullish" | "bearish"
-    stored_at:          datetime
-    expires_at:         datetime
-    scan_count:         int   = 0
-    stored_score:       float = 0.0   # confluence score when setup was first detected
-    low_quality_scans:  int   = 0     # consecutive deteriorating-quality scans
-    last_quality_score: float = 0.0   # quality score from last deep re-evaluation
-    last_momentum:      int   = 0     # confidence.momentum from last scan
-
-
-@dataclass
-class _WaitStats:
-    """Per-symbol wait state analytics (Phase 7)."""
-    total_waits:       int = 0
-    successful_waits:  int = 0   # readiness reached or M5 confirmed
-    expired_waits:     int = 0   # timed out without confirmation
-    invalidated_waits: int = 0   # early invalidation (ATR/decay/BOS/displacement/quality)
-    total_wait_scans:  int = 0   # total scan cycles spent in wait across all waits
-
-
-_mtf_wait_signals: Dict[str, _MtfWaitSignal] = {}
-_wait_stats:       Dict[str, _WaitStats]      = {}
-
-
-# ── MTF wait helpers ──────────────────────────────────────────────────────────
-
-def _m5_recovery_score(
-    candles_m5: list,
-    direction:  str,    # "BUY" | "SELL"
-    pip:        float,
-) -> int:
-    """
-    Score M5 momentum recovery toward trade direction (0–100).
-
-    Detects bearish/bullish exhaustion even before M5 EMA fully realigns,
-    enabling earlier execution than waiting for a complete EMA flip.
-    Components: wick rejection, shrinking body, closing direction, doji,
-    sustained improvement over multiple candles.
-    """
-    if not candles_m5 or len(candles_m5) < 3:
-        return 0
-
-    score = 0
-    last  = candles_m5[-1]
-    prev  = candles_m5[-2]
-    rng_l = last.candle_range
-
-    if direction == "BUY":
-        # Lower wick rejection (buying pressure absorbing downside)
-        if rng_l > 0:
-            lwr = (min(last.open, last.close) - last.low) / rng_l
-            score += 25 if lwr >= 0.40 else (10 if lwr >= 0.25 else 0)
-        # Shrinking bearish body (downside exhaustion)
-        l_body = abs(last.close - last.open)
-        p_body = abs(prev.close - prev.open)
-        if p_body > 0 and last.close <= last.open:
-            score += 20 if l_body < p_body * 0.60 else (10 if l_body < p_body * 0.80 else 0)
-        # Close improving vs previous (directional shift)
-        if last.close > prev.close:
-            score += 20
-        # Doji / indecision after bearish run (exhaustion signal)
-        if rng_l > 0 and abs(last.close - last.open) / rng_l < 0.25:
-            score += 15
-        # Two consecutive higher closes (sustained recovery)
-        if len(candles_m5) >= 4 and last.close > prev.close > candles_m5[-3].close:
-            score += 20
-
-    else:  # SELL
-        # Upper wick rejection (selling pressure absorbing upside)
-        if rng_l > 0:
-            uwr = (last.high - max(last.open, last.close)) / rng_l
-            score += 25 if uwr >= 0.40 else (10 if uwr >= 0.25 else 0)
-        # Shrinking bullish body (upside exhaustion)
-        l_body = abs(last.close - last.open)
-        p_body = abs(prev.close - prev.open)
-        if p_body > 0 and last.close >= last.open:
-            score += 20 if l_body < p_body * 0.60 else (10 if l_body < p_body * 0.80 else 0)
-        # Close declining vs previous
-        if last.close < prev.close:
-            score += 20
-        # Doji / indecision after bullish run
-        if rng_l > 0 and abs(last.close - last.open) / rng_l < 0.25:
-            score += 15
-        # Two consecutive lower closes (sustained recovery)
-        if len(candles_m5) >= 4 and last.close < prev.close < candles_m5[-3].close:
-            score += 20
-
-    return min(100, score)
-
-
-def _execution_readiness_score(
-    m5_aligned:     bool,
-    recovery_score: int,
-    momentum:       int,    # confidence.momentum (0–20)
-    sweep_detected: bool,
-    struct_score:   float,
-    decay_penalty:  int,
-) -> int:
-    """
-    Execution readiness score (0–100).
-    Trade proceeds when readiness >= threshold (default 65; micro: 55).
-
-    Components:
-      M5 aligned      → +35 (full EMA confirmation)
-      M5 recovery     → up to +30 (partial confirmation via momentum signals)
-      Macro momentum  → up to +20 (confidence engine momentum sub-score)
-      Liquidity sweep → +10 (institutional footprint present)
-      Structure       → up to +10 (structure score 0–25 scaled)
-    Decay penalty applied last (reduces readiness as setup ages).
-    """
-    score  = 35 if m5_aligned else 0
-    score += min(30, int(recovery_score * 0.30))
-    score += min(20, momentum)
-    score += 10 if sweep_detected else 0
-    score += min(10, int(struct_score / 2.5))
-    score -= decay_penalty
-    return max(0, min(100, score))
 
 
 # ── Fallback helpers ──────────────────────────────────────────────────────────
@@ -1267,55 +1129,6 @@ async def scan_symbol(
         )
         return None
 
-    # ── Micro-account symbol restriction ─────────────────────────────────────
-    # When balance falls below the configured threshold, restrict trading to
-    # the safest symbol(s) only.  EURUSD has the tightest spread and deepest
-    # liquidity — the only rational choice for a sub-R600 account.
-    _micro_cfg     = getattr(cfg, "micro_account", None)
-    _in_micro_mode = False   # True when balance < threshold AND micro_account.enabled
-    if _micro_cfg is not None and getattr(_micro_cfg, "enabled", False):
-        _micro_balance_raw = await feed.get_account_info()
-        _micro_balance     = _apply_sim_balance(_micro_balance_raw, cfg).balance
-        _micro_threshold   = float(getattr(_micro_cfg, "balance_threshold", 600.0))
-        if _micro_balance < _micro_threshold:
-            _in_micro_mode = True
-            _micro_symbols = [
-                s.upper() for s in (getattr(_micro_cfg, "symbols", None) or ["EURUSD"])
-            ]
-            if symbol.upper() not in _micro_symbols:
-                log.warning(
-                    "[MICRO ACCOUNT] %s skipped — balance=%.2f < threshold=%.2f "
-                    "restricted_to=%s",
-                    symbol, _micro_balance, _micro_threshold, _micro_symbols,
-                )
-                return None
-
-            # Apply stricter daily trade limit in micro mode
-            _micro_max_daily = int(getattr(_micro_cfg, "max_daily_trades", 2))
-            if daily.trades >= _micro_max_daily:
-                log.warning(
-                    "[MICRO ACCOUNT] %s skipped — micro daily limit reached (%d/%d)",
-                    symbol, daily.trades, _micro_max_daily,
-                )
-                return None
-
-            # Apply stricter open-trade limit in micro mode
-            _micro_max_open = int(getattr(_micro_cfg, "max_open_trades", 1))
-            if not feed._backtest:
-                _micro_open = len(bridge.get_open_positions())
-                if _micro_open >= _micro_max_open:
-                    log.warning(
-                        "[MICRO ACCOUNT] %s skipped — micro open trade limit reached (%d/%d)",
-                        symbol, _micro_open, _micro_max_open,
-                    )
-                    return None
-
-            log.warning(
-                "[MICRO ACCOUNT] %s active — balance=%.2f < threshold=%.2f "
-                "| strict confidence/RR gates will apply",
-                symbol, _micro_balance, _micro_threshold,
-            )
-
     # ── Candle data ───────────────────────────────────────────────────────────
     candles_h4  = await feed.get_candles(symbol, TF_H4,  cfg.timeframes.h4_candles)
     candles_h1  = await feed.get_candles(symbol, TF_H1,  cfg.timeframes.h1_candles)
@@ -1460,8 +1273,7 @@ async def scan_symbol(
         if mode.name == "conservative":
             _log_rejected(symbol, "ATR_TOO_HIGH", atr=atr_pips)
             return None
-        # Aggressive: the existing compute_volatility_factor() in build_execution_factors()
-        # already applies max_atr proportional reduction — no extra action needed here.
+        # Aggressive: ATR is already captured in confluence score; no extra block needed.
     else:
         _atr_zone = "OPTIMAL"
         log.info(
@@ -1601,140 +1413,28 @@ async def scan_symbol(
                 )
             return None
 
-    # ── Multi-timeframe check: H1 → M5 alignment hierarchy ──────────────────
-    # H1  defines the macro bias (EMA50/200 trend — hard requirement, already confirmed).
-    # M15 setup quality is evaluated via confluence scoring — NOT by M15 EMA20 direction.
-    #     In an H1 uptrend, valid BUY entries occur during M15 pullbacks where price is
-    #     BELOW M15 EMA20. EMA-based M15 check would block the strategy's own entries.
-    # M5  defines entry timing — may temporarily retrace during valid pullback entries.
-    #     When M5 conflicts with H1: WAIT STATE (not hard block).
-    #     Fast invalidations (ATR/decay/momentum) run here.
-    #     Deep re-evaluation (sweep/BOS/readiness) runs after confluence scoring.
+    # ── H1 trend bias + M5 entry timing ─────────────────────────────────────
+    # H1 defines macro direction (already confirmed by EMA50/200 above).
+    # M5 must agree for entry — if not, skip this scan (no wait state).
     _h1_dir = trend_result.direction   # "bullish" | "bearish"
     _h1_sig = "BUY" if _h1_dir == "bullish" else "SELL"
-    _strict_cfg    = getattr(cfg, "strict_mode", None)
-    _strict_active = _strict_cfg is not None and getattr(_strict_cfg, "enabled", False)
 
-    # ── MTF config ───────────────────────────────────────────────────────────
-    _mtf_cfg     = getattr(cfg, "mtf", None)
-    _m5_wait_ok  = _mtf_cfg is None or getattr(_mtf_cfg, "m5_wait_enabled", True)
-    _m5_wait_min = int(getattr(_mtf_cfg, "m5_wait_minutes", 45)) if _mtf_cfg else 45
-    if _in_micro_mode:
-        _micro_wmin  = int(getattr(_mtf_cfg, "m5_wait_minutes_micro", 25)) if _mtf_cfg else 25
-        _m5_wait_min = min(_m5_wait_min, _micro_wmin)
-
-    # ── M5 direction via EMA20 ───────────────────────────────────────────────
     if candles_m5 and len(candles_m5) >= 22:
         _m5_closes = [c.close for c in candles_m5]
         _m5_ema20  = trend_mod.ema(_m5_closes, 20)
         _m5_dir    = "bullish" if _m5_closes[-1] > _m5_ema20[-1] else "bearish"
     else:
         _m5_dir = "neutral"
-    _m5_sig     = "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL")
-    _m5_aligned = (_m5_dir == _h1_dir)
 
-    # ── Wait state fast-path checks ──────────────────────────────────────────
-    _in_wait_state   = False
-    _max_low_q_scans = 2 if _in_micro_mode else 3
-
-    if symbol in _mtf_wait_signals:
-        _ws          = _mtf_wait_signals[symbol]
-        _now         = datetime.now(timezone.utc)
-        _elapsed_min = (_now - _ws.stored_at).total_seconds() / 60.0
-        _fast_decay  = (
-            15 if _elapsed_min > 30 else
-            10 if _elapsed_min > 20 else
-            5  if _elapsed_min > 10 else 0
-        )
-        _fast_inv = None   # set to rejection label to trigger fast exit
-
-        if _ws.direction != _h1_sig:
-            # Macro bias flipped — stale wait; allow fresh scan this cycle
-            log.info("[MTF WAIT INVALIDATED] %s macro bias %s→%s — resuming fresh scan",
-                     symbol, _ws.direction, _h1_sig)
-            _wait_stats.setdefault(symbol, _WaitStats()).invalidated_waits += 1
-            del _mtf_wait_signals[symbol]
-
-        elif atr_pips < _min_atr:
-            log.warning(
-                "[MTF WAIT INVALIDATED] %s ATR=%.1f < min=%.1f — market dormant, setup stale",
-                symbol, atr_pips, _min_atr,
-            )
-            _fast_inv = "WAIT_ATR_COLLAPSE"
-
-        elif _fast_decay > 0 and (confidence.total - _fast_decay) < _conf_threshold:
-            log.warning(
-                "[MTF WAIT DECAY] %s eff_conf=%d (raw=%d − decay=%d) < threshold=%d "
-                "after %.0fm — invalidating",
-                symbol, confidence.total - _fast_decay, confidence.total,
-                _fast_decay, _conf_threshold, _elapsed_min,
-            )
-            _fast_inv = "WAIT_CONFIDENCE_DECAY"
-
-        elif _m5_aligned:
-            # M5 realigned — fast confirmation path; fall through to execution
-            log.info(
-                "[ENTRY CONFIRMED] %s H1=%s M5=%s — EMA realigned after %d scans (%.0fm)",
-                symbol, _h1_sig, _m5_sig, _ws.scan_count, _elapsed_min,
-            )
-            _wait_stats.setdefault(symbol, _WaitStats()).successful_waits += 1
-            del _mtf_wait_signals[symbol]
-
-        else:
-            # Still waiting — track fast momentum quality, advance to deep re-eval
-            if confidence.momentum == 0:
-                _ws.low_quality_scans += 1
-                if _ws.low_quality_scans >= _max_low_q_scans:
-                    log.warning(
-                        "[MTF WAIT INVALIDATED] %s zero momentum for %d consecutive scans",
-                        symbol, _ws.low_quality_scans,
-                    )
-                    _fast_inv = "WAIT_QUALITY_DETERIORATED"
-            else:
-                _ws.low_quality_scans = max(0, _ws.low_quality_scans - 1)
-
-            if _fast_inv is None:
-                _ws.scan_count += 1
-                _in_wait_state = True
-
-        if _fast_inv is not None and symbol in _mtf_wait_signals:
-            _wait_stats.setdefault(symbol, _WaitStats()).invalidated_waits += 1
-            del _mtf_wait_signals[symbol]
-            _log_rejected(symbol, _fast_inv, confidence=confidence.total, atr=atr_pips)
-            return None
-
-    elif not _m5_aligned and _m5_wait_ok:
-        # M5 retracing against H1 — arm wait state
-        _now  = datetime.now(timezone.utc)
-        _mtf_wait_signals[symbol] = _MtfWaitSignal(
-            direction  = _h1_sig,
-            macro_bias = _h1_dir,
-            stored_at  = _now,
-            expires_at = _now + timedelta(minutes=_m5_wait_min),
-            scan_count = 0,
-        )
-        _wait_stats.setdefault(symbol, _WaitStats()).total_waits += 1
-        log.info(
-            "[SETUP DETECTED] %s H1=%s M5=%s retracing — WAIT STATE armed "
-            "(timeout=%dm, expires %s)",
-            symbol, _h1_sig, _m5_sig, _m5_wait_min,
-            (_now + timedelta(minutes=_m5_wait_min)).strftime("%H:%M:%S UTC"),
-        )
+    if _m5_dir != _h1_dir:
+        log.debug("[SKIP] %s H1=%s M5=%s — entry timing not aligned",
+                  symbol, _h1_sig,
+                  "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL"))
+        _log_rejected(symbol, "MTF_M5_NOT_ALIGNED", confidence=confidence.total, atr=atr_pips)
         return None
 
-    elif not _m5_aligned and not _m5_wait_ok:
-        # Wait disabled in config — soft penalty (conservative = hard block)
-        if mode.name == "conservative":
-            _log_rejected(symbol, "MTF_M5_CONFLICT", confidence=confidence.total, atr=atr_pips)
-            return None
-        _mtf_h4_size_penalty = round(_mtf_h4_size_penalty * 0.7, 3)
-        log.warning(
-            "[MTF WARN] %s H1=%s M5=%s — wait disabled, size_penalty=%.2f",
-            symbol, _h1_sig, _m5_sig, _mtf_h4_size_penalty,
-        )
-
-    else:
-        log.info("[MTF CHECK] %s H1=%s M5=%s → aligned", symbol, _h1_sig, _m5_sig)
+    log.info("[MTF] %s H1=%s M5=%s → aligned", symbol, _h1_sig,
+             "BUY" if _m5_dir == "bullish" else "SELL")
 
     # ── Directional cooldown fast-path ────────────────────────────────────────
     hint_dir = "BUY" if trend_result.direction == "bullish" else "SELL"
@@ -1833,26 +1533,12 @@ async def scan_symbol(
     # ── Candle confirmation score ─────────────────────────────────────────────
     conf_score = compute_confirmation_score(candles_m15, hint_dir)
 
-    # ── Entry confirmation gate ───────────────────────────────────────────────
-    # Conservative: engulfing or momentum candle required to enter.
-    # Aggressive: absent pattern reduces size by 40%; weak pattern by 15%.
-    # _entry_conf_factor is applied to combined_size_mult after risk calculation.
-    log.warning(
+    # ── Entry confirmation ────────────────────────────────────────────────────
+    # conf_score feeds the score integrity check; no hard block or size penalty here.
+    log.info(
         "[ENTRY CONFIRMATION] %s %s | pattern=%s score=%.1f",
         symbol, hint_dir, conf_score.pattern, conf_score.score,
     )
-    _entry_conf_factor = 1.0
-    if conf_score.score <= 0:
-        if mode.name == "conservative":
-            log.warning(
-                "[BLOCKED] %s — no confirmation pattern (conservative mode)", symbol,
-            )
-            _log_rejected(symbol, "NO_ENTRY_CONFIRMATION",
-                          confidence=confidence.total, atr=atr_pips)
-            return None
-        _entry_conf_factor = 0.60
-    elif conf_score.score < 8.0:
-        _entry_conf_factor = 0.85
 
     # ── Order Block analysis ──────────────────────────────────────────────────
     ob_result = ob_mod.analyze(
@@ -1979,376 +1665,46 @@ async def scan_symbol(
                       confidence=decision.confidence, atr=atr_pips)
         return None
 
-    # ── Micro-account quality gate ────────────────────────────────────────────
-    # In micro mode the confidence and tier requirements are raised to preserve capital.
-    if _in_micro_mode:
-        _micro_min_rr   = float(getattr(_micro_cfg, "min_rr", 2.0))
-        _micro_min_conf = int(getattr(_micro_cfg, "min_confidence", 60))
-        # Micro confidence gate (applied here after decision so we have both)
-        if confidence.total < _micro_min_conf:
-            log.warning(
-                "[MICRO ACCOUNT] %s skipped — confidence=%.0f < micro_min=%.0f",
-                symbol, confidence.total, _micro_min_conf,
-            )
-            _log_rejected(symbol, "MICRO_CONF_TOO_LOW",
-                          confidence=confidence.total, atr=atr_pips)
-            return None
-        # Micro tier gate — can optionally enforce Tier1 only
-        if getattr(_micro_cfg, "tier1_only", False) and decision.tier != 1:
-            log.warning(
-                "[MICRO ACCOUNT] %s skipped — tier%d rejected, micro_account tier1_only=true",
-                symbol, decision.tier,
-            )
-            _log_rejected(symbol, "MICRO_TIER_TOO_LOW",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-
-    # ── MTF wait deep re-evaluation (Phases 1, 3–6) ──────────────────────────
-    # Runs after confluence so sweep, struct, and all quality signals are available.
-    # Fast checks (ATR/decay/momentum) already ran in the MTF section above.
-    # This block decides: proceed to execution OR continue waiting OR invalidate.
-    if _in_wait_state and symbol in _mtf_wait_signals:
-        _ws          = _mtf_wait_signals[symbol]
-        _now         = datetime.now(timezone.utc)
-        _elapsed_min = (_now - _ws.stored_at).total_seconds() / 60.0
-        _decay_pen   = (
-            15 if _elapsed_min > 30 else
-            10 if _elapsed_min > 20 else
-            5  if _elapsed_min > 10 else 0
-        )
-        _wstats = _wait_stats.setdefault(symbol, _WaitStats())
-        _wstats.total_wait_scans += 1
-
-        # ── Phase 5: deep invalidation ───────────────────────────────────────
-        _opp_bos_dir = "sell" if _ws.direction == "BUY" else "buy"
-        if struct_result.bos_detected and _struct_dir == _opp_bos_dir:
-            log.warning(
-                "[MTF WAIT INVALIDATED] %s opposite BOS=%s formed against %s direction",
-                symbol, _struct_dir.upper(), _ws.direction,
-            )
-            _wstats.invalidated_waits += 1
-            del _mtf_wait_signals[symbol]
-            _log_rejected(symbol, "WAIT_OPPOSITE_BOS",
-                          confidence=confidence.total, atr=atr_pips)
-            return None
-
-        _disp_against = (
-            sweep_result.displacement
-            and (
-                (sweep_result.sweep_type == "sell_side" and _ws.direction == "BUY")
-                or (sweep_result.sweep_type == "buy_side"  and _ws.direction == "SELL")
-            )
-        )
-        if _disp_against:
-            log.warning(
-                "[MTF WAIT INVALIDATED] %s institutional displacement against %s — bias shifted",
-                symbol, _ws.direction,
-            )
-            _wstats.invalidated_waits += 1
-            del _mtf_wait_signals[symbol]
-            _log_rejected(symbol, "WAIT_DISPLACEMENT_AGAINST",
-                          confidence=confidence.total, atr=atr_pips)
-            return None
-
-        # ── Phase 1: Quality score re-evaluation ─────────────────────────────
-        _wait_quality = min(100, max(0,
-            min(60, confidence.momentum * 3)
-            + min(20, int(_struct_score / 25.0 * 20))
-            + (15 if sweep_result.detected else 0)
-            + (10 if atr_pips > _min_atr * 1.5 else 0)
-        ))
-        if _wait_quality < 30:
-            _ws.low_quality_scans += 1
-        else:
-            _ws.low_quality_scans = max(0, _ws.low_quality_scans - 1)
-
-        if _ws.low_quality_scans >= _max_low_q_scans:
-            log.warning(
-                "[MTF WAIT INVALIDATED] %s quality=%.0f deteriorated for %d consecutive scans "
-                "(sweep=%s struct=%.0f momentum=%d)",
-                symbol, _wait_quality, _ws.low_quality_scans,
-                sweep_result.detected, _struct_score, confidence.momentum,
-            )
-            _wstats.invalidated_waits += 1
-            del _mtf_wait_signals[symbol]
-            _log_rejected(symbol, "WAIT_QUALITY_DETERIORATED",
-                          confidence=confidence.total, atr=atr_pips)
-            return None
-
-        # ── Phase 4: Setup score improvement — reset timer on better setup ───
-        if _ws.stored_score == 0.0:
-            _ws.stored_score = confluence.total_score
-        elif confluence.total_score >= _ws.stored_score + 10.0:
-            log.info(
-                "[SETUP UPGRADED] %s confluence %.1f→%.1f (+%.1f) — timer reset, "
-                "fresh %dm window",
-                symbol, _ws.stored_score, confluence.total_score,
-                confluence.total_score - _ws.stored_score, _m5_wait_min,
-            )
-            _ws.stored_score      = confluence.total_score
-            _ws.scan_count        = 0
-            _ws.low_quality_scans = 0
-            _ws.stored_at         = _now
-            _ws.expires_at        = _now + timedelta(minutes=_m5_wait_min)
-
-        # ── Phase 3: M5 recovery momentum detection ──────────────────────────
-        _recovery = _m5_recovery_score(candles_m5 or [], _ws.direction, pip)
-
-        # ── Phase 6: Execution readiness score ───────────────────────────────
-        _readiness = _execution_readiness_score(
-            m5_aligned     = False,   # M5 not aligned (we're in wait state)
-            recovery_score = _recovery,
-            momentum       = confidence.momentum,
-            sweep_detected = sweep_result.detected,
-            struct_score   = _struct_score,
-            decay_penalty  = _decay_pen,
-        )
-        _readiness_threshold = 55 if _in_micro_mode else 65
-
-        # ── Timeout check ─────────────────────────────────────────────────────
-        if _now > _ws.expires_at:
-            log.warning(
-                "[MTF WAIT EXPIRED] %s — %d scans over %.0fm | "
-                "readiness=%d never reached %d | H1=%s M5=%s recovery=%d decay=-%d",
-                symbol, _ws.scan_count, _elapsed_min,
-                _readiness, _readiness_threshold,
-                _h1_sig, _m5_sig, _recovery, _decay_pen,
-            )
-            _wstats.expired_waits += 1
-            del _mtf_wait_signals[symbol]
-            _log_rejected(symbol, "MTF_WAIT_EXPIRED",
-                          confidence=confidence.total, atr=atr_pips)
-            return None
-
-        # ── Phase 7: analytics summary every 5 scans ─────────────────────────
-        if _ws.scan_count % 5 == 0:
-            log.info(
-                "[WAIT ANALYTICS] %s total=%d success=%d expired=%d invalidated=%d "
-                "scans=%d",
-                symbol,
-                _wstats.total_waits, _wstats.successful_waits,
-                _wstats.expired_waits, _wstats.invalidated_waits,
-                _wstats.total_wait_scans,
-            )
-
-        # ── Readiness gate: execute on recovery even without full M5 flip ─────
-        if _readiness >= _readiness_threshold:
-            log.info(
-                "[ENTRY CONFIRMED] %s H1=%s readiness=%d≥%d after %d scans (%.0fm) | "
-                "recovery=%d momentum=%d sweep=%s struct=%.0f decay=-%d",
-                symbol, _h1_sig,
-                _readiness, _readiness_threshold,
-                _ws.scan_count, _elapsed_min,
-                _recovery, confidence.momentum,
-                sweep_result.detected, _struct_score, _decay_pen,
-            )
-            _wstats.successful_waits += 1
-            del _mtf_wait_signals[symbol]
-            # Fall through to execution
-
-        else:
-            _ws.last_quality_score = float(_wait_quality)
-            _ws.last_momentum      = confidence.momentum
-            log.info(
-                "[MTF WAITING] %s H1=%s M5=%s | scan=%d elapsed=%.0fm "
-                "readiness=%d/%d recovery=%d quality=%.0f decay=-%d "
-                "low_q=%d/%d expires=%s",
-                symbol, _h1_sig, _m5_sig,
-                _ws.scan_count, _elapsed_min,
-                _readiness, _readiness_threshold,
-                _recovery, _wait_quality, _decay_pen,
-                _ws.low_quality_scans, _max_low_q_scans,
-                _ws.expires_at.strftime("%H:%M:%S UTC"),
-            )
-            return None
-
-    # ── Strict mode quality gates ─────────────────────────────────────────────
-    # Applied AFTER tier/core gates so we only run quality checks on trades that
-    # passed the scoring hurdle.  Blocks the low-quality setups that survive the
-    # quantitative score thresholds but lack real institutional confirmation:
-    #   • bos=False (no fresh break of structure)
-    #   • confirmation=0 (doji entries, no candle pattern)
-    #   • liquidity weak (stop-hunt wick only, no equal-level cluster)
-    #   • split votes (1B/1S — no directional consensus)
-    if _strict_active:
-        _sm_bos      = getattr(_strict_cfg, "require_bos",             True)
-        _sm_min_conf_score = float(getattr(_strict_cfg, "min_confirmation_score", 5))
-        _sm_min_liq  = float(getattr(_strict_cfg, "min_liquidity_score",  6.0))
-        _sm_min_struct = float(getattr(_strict_cfg, "min_structure_score", 5.0))
-        _sm_votes    = getattr(_strict_cfg, "block_split_votes",        True)
-        _sm_margin   = int(getattr(_strict_cfg, "require_vote_margin",   1))
-        _sm_t1_only  = getattr(_strict_cfg, "tier1_only",               False)
-        _sm_min_conf = int(getattr(_strict_cfg, "min_confidence",        0))
-
-        # BOS required
-        if _sm_bos and not struct_result.bos_detected:
-            log.warning(
-                "[STRICT MODE] %s — bos=False, structure score=%.0f | "
-                "require_bos=True → BLOCKED",
-                symbol, confluence.structure_score,
-            )
-            _log_rejected(symbol, "STRICT_NO_BOS",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-
-        # Minimum candle confirmation score
-        if conf_score.score < _sm_min_conf_score:
-            log.warning(
-                "[STRICT MODE] %s — confirmation=%.0f < min=%.0f (pattern=%s) → BLOCKED",
-                symbol, conf_score.score, _sm_min_conf_score, conf_score.pattern,
-            )
-            _log_rejected(symbol, "STRICT_WEAK_CONFIRMATION",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-
-        # Minimum liquidity sweep strength
-        if sweep_result.strength < _sm_min_liq:
-            log.warning(
-                "[STRICT MODE] %s — liquidity=%.1f < min=%.1f (pattern=%s) → BLOCKED",
-                symbol, sweep_result.strength, _sm_min_liq,
-                sweep_result.pattern if sweep_result.detected else "none",
-            )
-            _log_rejected(symbol, "STRICT_WEAK_LIQUIDITY",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-
-        # Minimum structure score
-        if confluence.structure_score < _sm_min_struct:
-            log.warning(
-                "[STRICT MODE] %s — structure=%.1f < min=%.1f → BLOCKED",
-                symbol, confluence.structure_score, _sm_min_struct,
-            )
-            _log_rejected(symbol, "STRICT_WEAK_STRUCTURE",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-
-        # Split vote block — e.g. 1B/1S means no dominant signal direction
-        if _sm_votes and _sm_margin > 0:
-            _vote_diff = abs(confluence.buy_votes - confluence.sell_votes)
-            if _vote_diff < _sm_margin:
-                log.warning(
-                    "[STRICT MODE] %s — split votes=%dB/%dS margin=%d < %d → BLOCKED",
-                    symbol, confluence.buy_votes, confluence.sell_votes,
-                    _vote_diff, _sm_margin,
-                )
-                _log_rejected(symbol, "STRICT_SPLIT_VOTES",
-                              confidence=decision.confidence, atr=atr_pips)
-                return None
-
-        # Strict Tier1 only
-        if _sm_t1_only and decision.tier != 1:
-            log.warning(
-                "[STRICT MODE] %s — tier%d rejected, tier1_only=True → BLOCKED",
-                symbol, decision.tier,
-            )
-            _log_rejected(symbol, "STRICT_TIER_TOO_LOW",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-
-        # Strict confidence override
-        if _sm_min_conf > 0 and confidence.total < _sm_min_conf:
-            log.warning(
-                "[STRICT MODE] %s — confidence=%.0f < strict_min=%d → BLOCKED",
-                symbol, confidence.total, _sm_min_conf,
-            )
-            _log_rejected(symbol, "STRICT_CONF_TOO_LOW",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-
+    # ── Score integrity: prevent inflation from missing institutional signals ──
+    _vote_diff = abs(confluence.buy_votes - confluence.sell_votes)
+    if _vote_diff < 1:
         log.warning(
-            "[STRICT MODE] %s — all quality gates passed | "
-            "bos=%s liq=%.1f struct=%.1f conf=%.0f votes=%dB/%dS",
-            symbol, struct_result.bos_detected,
-            sweep_result.strength, confluence.structure_score,
-            confidence.total, confluence.buy_votes, confluence.sell_votes,
+            "[BLOCKED] %s — split votes %dB/%dS, no directional consensus",
+            symbol, confluence.buy_votes, confluence.sell_votes,
         )
+        _log_rejected(symbol, "SPLIT_VOTES", confidence=decision.confidence, atr=atr_pips)
+        return None
 
-    # ── Adaptive execution factors ────────────────────────────────────────────
-    _pb_min_atr = float(getattr(cfg.strategy, "entry_pullback_min_atr", 0.20))
-    _pb_max_atr = float(getattr(cfg.strategy, "entry_pullback_max_atr", 2.50))
+    _score_adj = decision.score
+    if not struct_result.bos_detected:   _score_adj -= 8
+    if not sweep_result.detected:        _score_adj -= 6
+    if conf_score.score == 0:            _score_adj -= 8
 
-    _exec = build_execution_factors(
-        direction        = direction,
-        candles_m5       = candles_m5 or candles_m15,
-        atr_pips         = atr_pips,
-        pip              = pip,
-        utc_hour         = _utc_hour,
-        h1_dir           = _h1_dir,
-        m5_dir           = _m5_dir,
-        min_atr_pips     = _min_atr,
-        max_atr_pips     = _max_atr,
-        pullback_min_atr = _pb_min_atr,
-        pullback_max_atr = _pb_max_atr,
-    )
-    _exec.log_summary(symbol, direction, log)
-
-    # ── Momentum enforcement gate ──────────────────────────────────────────────
-    # _exec.momentum_factor encodes candle body quality:
-    #   1.0 = body >= 40%, correct direction      (healthy momentum)
-    #   0.7 = body 30–40%, correct direction       (acceptable)
-    #   0.5 = body < 30% (doji), OR wrong direction close
-    # Conservative: block doji / wrong-direction entries (factor < 0.70).
-    # Aggressive:   size already reduced via composite; no additional hard block.
-    _momentum_threshold = 0.70
-    if _exec.momentum_factor < _momentum_threshold:
-        _momentum_action = "BLOCK" if mode.name == "conservative" else "REDUCE"
+    if _score_adj < thresholds.tier2:
         log.warning(
-            "[MOMENTUM FILTER] %s %s | momentum_factor=%.2f threshold=%.2f action=%s",
-            symbol, direction, _exec.momentum_factor, _momentum_threshold, _momentum_action,
+            "[BLOCKED] %s — adjusted score %.1f < tier2 %.0f "
+            "(bos=%s sweep=%s conf=%.0f)",
+            symbol, _score_adj, thresholds.tier2,
+            struct_result.bos_detected, sweep_result.detected, conf_score.score,
         )
-        if mode.name == "conservative":
-            _log_rejected(symbol, "WEAK_MOMENTUM",
-                          confidence=decision.confidence, atr=atr_pips)
-            return None
-    else:
-        log.info(
-            "[MOMENTUM FILTER] %s %s | momentum_factor=%.2f — OK",
-            symbol, direction, _exec.momentum_factor,
-        )
-
-    # ── Trade quality classification ──────────────────────────────────────────
-    # Composite already encodes session × volatility × momentum × pullback × MTF.
-    # HIGH ≥0.80: all factors strong — full execution.
-    # MEDIUM 0.50-0.80: some weakness — normal execution with size already adjusted.
-    # LOW <0.50: multiple weak factors — conservative mode rejects; aggressive continues.
-    _trade_quality = (
-        "HIGH"   if _exec.composite >= 0.80 else
-        "MEDIUM" if _exec.composite >= 0.50 else
-        "LOW"
-    )
-    log.warning(
-        "[TRADE QUALITY] %s %s | quality=%s composite=%.2f entry_conf=%.2f | "
-        "session=%.2f momentum=%.2f pullback=%.2f mtf=%.2f",
-        symbol, direction, _trade_quality, _exec.composite, _entry_conf_factor,
-        _exec.session_factor, _exec.momentum_factor,
-        _exec.pullback_factor, _exec.mtf_factor,
-    )
-    if _trade_quality == "LOW" and mode.name == "conservative":
-        log.warning(
-            "[BLOCKED] %s — LOW trade quality in conservative mode (composite=%.2f < 0.50)",
-            symbol, _exec.composite,
-        )
-        _log_rejected(symbol, "TRADE_QUALITY_LOW",
+        _log_rejected(symbol, "SCORE_ADJUSTED_BELOW_THRESHOLD",
                       confidence=decision.confidence, atr=atr_pips)
         return None
 
-    # ── Execution composite gate (fixed-lot mode only) ────────────────────────
-    # In fixed-lot mode the composite multiplier cannot reduce lot size, so it
-    # would silently pass weak entries (doji, shallow pullback, MTF conflict,
-    # off-session combinations).  Convert to a hard gate: composite < threshold
-    # means entry quality is too poor to execute at any size.
-    _fixed_lot_active  = float(getattr(cfg.risk, "fixed_lot_size", 0.0)) > 0
-    _min_exec_comp     = mode.min_exec_composite
-    if _fixed_lot_active and _min_exec_comp > 0 and _exec.composite < _min_exec_comp:
-        log.warning(
-            "[BLOCKED] symbol=%s reason=entry_quality_too_low | "
-            "composite=%.2f < %.2f [MODE:%s] | factors: %s",
-            symbol, _exec.composite, _min_exec_comp, mode.name.upper(),
-            " | ".join(f"{k}={v}" for k, v in _exec.reasons.items()) or "none",
+    if decision.tier == 1 and _score_adj < thresholds.tier1:
+        from aurex_ai.execution.decision_engine import Decision as _D
+        decision = _D(
+            action     = "CONDITIONAL",
+            direction  = decision.direction,
+            score      = _score_adj,
+            tier       = 2,
+            size_mult  = 0.50,
+            reason     = decision.reason + f" [score_adj:{_score_adj:.0f}]",
+            confidence = decision.confidence,
         )
-        _log_rejected(symbol, "ENTRY_QUALITY_TOO_LOW",
-                      confidence=decision.confidence, atr=atr_pips)
-        return None
+        direction = decision.direction
+        log.info("[SCORE ADJUSTED] %s — tier1→tier2 after penalties (adj=%.0f)",
+                 symbol, _score_adj)
 
     # ── Post-decision cooldown check ──────────────────────────────────────────
     if cooldown.is_on_cooldown(symbol, direction):
@@ -2372,65 +1728,17 @@ async def scan_symbol(
         tracker        = engine.get_tracker(),
     )
 
-    # ── Session quality size modifier ────────────────────────────────────────
-    # Reduce position size when the current session has historically underperformed
-    # (only applies once we have ≥10 trades in that session — avoid early data bias).
-    _session_mult = 1.0
-    _tracker = engine.get_tracker()
-    if not _tracker.is_session_favorable(current_time.hour, threshold=0.45):
-        _session_mult = 0.75
-        log.warning(
-            "[SESSION FILTER] %s — unfavorable session, reducing size to %.0f%%",
-            symbol, _session_mult * 100,
-        )
+    combined_size_mult = max(0.10, min(1.0, round(
+        decision.size_mult * opt.lot_mult * _mtf_h4_size_penalty, 2
+    )))
 
-    # ── Dynamic risk multiplier based on rolling win rate ────────────────────
-    # Win rate > 60%: allow slight increase (+50% risk, capped at 1.5×)
-    # Drawdown > 50% of daily limit: already handled by optimizer, but add extra guard
-    _dyn_risk_mult = 1.0
-    _stats = engine.get_tracker().get_overall_stats()
-    _total = _stats.get("total_trades", 0)
-    _wr    = _stats.get("win_rate", 0.5)
-    if _total >= 20:
-        if _wr >= 0.60:
-            _dyn_risk_mult = 1.5    # performing well — scale up cautiously
-        elif _wr < 0.40:
-            _dyn_risk_mult = 0.5    # poor win rate — halve risk until it improves
-    # Drawdown circuit-breaker: if daily loss > 1.5% override to 0.5×
-    if daily.daily_loss_pct >= cfg.risk.max_daily_loss_pct * 0.75:
-        _dyn_risk_mult = min(_dyn_risk_mult, 0.5)
-        log.warning(
-            "[DYNAMIC RISK] %s — drawdown %.1f%% near limit, risk at 50%%",
-            symbol, daily.daily_loss_pct,
-        )
-
-    # Combine decision size multiplier with optimizer, session, dynamic risk, execution factors,
-    # entry confirmation quality (_entry_conf_factor: 0.60/0.85/1.0), and MTF H1/H4 penalty
-    # (_mtf_h4_size_penalty: 0.7 when H1/H4 disagree in aggressive mode, else 1.0).
-    combined_size_mult = (
-        decision.size_mult
-        * opt.lot_mult
-        * _session_mult
-        * _dyn_risk_mult
-        * _exec.composite
-        * _entry_conf_factor
-        * _mtf_h4_size_penalty
-    )
-    combined_size_mult = max(0.10, min(1.5, round(combined_size_mult, 2)))
-
-    # ── Dynamic RR profile based on trade quality ────────────────────────────
-    # LOW quality entries use tighter TP (1.5R) to bank smaller wins rather than
-    # stretching for targets unlikely to be reached in marginal setups.
-    _sl_atr_mult  = float(getattr(cfg.strategy, "sl_atr_mult", 1.5))
-    _cfg_tp_mult  = float(getattr(cfg.strategy, "tp_atr_mult", 0.0))
-    if _cfg_tp_mult > 0:
-        _tp_atr_mult = _cfg_tp_mult
-    else:
-        _tp_atr_mult = {"HIGH": 3.75, "MEDIUM": 3.0, "LOW": 2.25}.get(_trade_quality, 3.0)
-    _rr_target = round(_tp_atr_mult / _sl_atr_mult, 2) if _sl_atr_mult > 0 else 2.0
-    log.warning(
-        "[RR PROFILE] %s %s | quality=%s → sl×%.2f tp×%.2f rr_target=%.2fR",
-        symbol, direction, _trade_quality, _sl_atr_mult, _tp_atr_mult, _rr_target,
+    _sl_atr_mult = float(getattr(cfg.strategy, "sl_atr_mult", 1.5))
+    _cfg_tp_mult = float(getattr(cfg.strategy, "tp_atr_mult", 0.0))
+    _tp_atr_mult = _cfg_tp_mult if _cfg_tp_mult > 0 else 3.0
+    _rr_target   = round(_tp_atr_mult / _sl_atr_mult, 2) if _sl_atr_mult > 0 else 2.0
+    log.info(
+        "[RR PROFILE] %s %s | sl×%.2f tp×%.2f rr_target=%.2fR",
+        symbol, direction, _sl_atr_mult, _tp_atr_mult, _rr_target,
     )
 
     # ── Risk calculation ──────────────────────────────────────────────────────
@@ -2471,19 +1779,6 @@ async def scan_symbol(
         log.info("%s %s: risk rejected — %s", symbol, direction, risk.reason)
         return None
 
-    # ── Micro-account RR gate (post risk-calc) ────────────────────────────────
-    # Now that we have the actual ATR-based RR, enforce the stricter micro threshold.
-    if _in_micro_mode:
-        _micro_min_rr_post = float(getattr(_micro_cfg, "min_rr", 2.0))
-        if risk.rr_ratio < _micro_min_rr_post:
-            log.warning(
-                "[MICRO ACCOUNT] %s %s — rr=%.2f < micro_min_rr=%.2f → BLOCKED",
-                symbol, direction, risk.rr_ratio, _micro_min_rr_post,
-            )
-            _log_rejected(symbol, "MICRO_RR_TOO_LOW",
-                          confidence=decision.confidence, rr=risk.rr_ratio, atr=atr_pips)
-            return None
-
     log.debug(
         "[RISK SIZE] %s lot=%.2f risk_pct=%.2f balance=%.2f sl=%.1fpips rr=%.2f",
         symbol, risk.lot_size, cfg.risk.risk_pct, account.balance, risk.sl_pips, risk.rr_ratio,
@@ -2509,9 +1804,6 @@ async def scan_symbol(
             risk.take_profit = new_tp
             risk.sl_pips     = round(new_sl_dist / pip, 1)
             risk.rr_ratio    = new_rr
-
-    # Entry quality is now fully handled by build_execution_factors() above —
-    # no hard block here; size is already adjusted by _exec.composite.
 
     # ── Re-entry gate ────────────────────────────────────────────────────────
     _is_reentry = False
