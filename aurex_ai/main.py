@@ -499,6 +499,7 @@ async def _fallback_pipeline(
         max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  5.0),
         fixed_lot_size      = getattr(cfg.risk, "fixed_lot_size",      0.0),
         max_sl_pips         = getattr(cfg.risk, "max_sl_pips",         0.0),
+        sl_reduction_mode   = False,   # fallback is Tier-3 minimum size — keep SL strict
     )
 
     if not risk.allowed:
@@ -839,6 +840,7 @@ async def _stack_pipeline(
     account     = _apply_sim_balance(await feed.get_account_info(), cfg)
     symbol_info = await asyncio.to_thread(bridge.get_symbol_info, symbol)
 
+    _stack_aggressive = getattr(getattr(cfg, "trading", None), "trading_mode", "aggressive") == "aggressive"
     risk = calc_risk(
         direction           = direction,
         entry               = price,
@@ -856,6 +858,7 @@ async def _stack_pipeline(
         max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  5.0),
         fixed_lot_size      = getattr(cfg.risk, "fixed_lot_size",      0.0),
         max_sl_pips         = getattr(cfg.risk, "max_sl_pips",         0.0),
+        sl_reduction_mode   = _stack_aggressive,
     )
 
     if not risk.allowed:
@@ -1858,6 +1861,7 @@ async def scan_symbol(
         max_sl_pips         = getattr(cfg.risk, "max_sl_pips",         0.0),
         sl_atr_mult         = _sl_atr_mult,
         tp_atr_mult         = _tp_atr_mult,
+        sl_reduction_mode   = (mode.name == "aggressive"),
     )
 
     if not risk.allowed:

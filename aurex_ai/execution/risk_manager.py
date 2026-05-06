@@ -19,6 +19,11 @@ Trade rejected when:
   - SL or TP equals entry  (degenerate float edge case)
   - RR < min_rr  (default 1.5)
   - Lot size cannot be computed
+  - SL > max_sl_pips AND sl_reduction_mode=False (conservative hard reject)
+
+When sl_reduction_mode=True (aggressive) and SL > max_sl_pips:
+  size_mult is scaled by (max_sl_pips / sl_pips) so effective dollar risk
+  stays proportional to the cap — trade executes at reduced size.
 """
 from __future__ import annotations
 
@@ -204,6 +209,7 @@ def calculate(
     sl_atr_mult:        float = 1.5,    # SL = entry ± ATR × sl_atr_mult
     tp_atr_mult:        float = 3.0,    # TP = entry ± ATR × tp_atr_mult
     atr_period:         int   = 14,
+    sl_reduction_mode:  bool  = False,  # True (aggressive): reduce size instead of rejecting on wide SL
 ) -> RiskResult:
     """
     Compute SL, TP, and lot size using ATR-based placement.
@@ -281,16 +287,30 @@ def calculate(
     pip_val = _pip_value_per_lot(symbol, symbol_info)   # needed for projected risk log
 
     if max_sl_pips > 0 and sl_pips > max_sl_pips:
-        _eff_lot   = fixed_lot_size if fixed_lot_size > 0 else symbol_info.get("volume_min", 0.01)
-        _proj_risk = round(sl_pips * pip_val * _eff_lot, 2)
-        _proj_pct  = round(_proj_risk / account.balance * 100, 1) if account.balance > 0 else 0.0
-        _ccy_sl    = account.currency or "?"
-        log.warning(
-            "[RISK FILTER] symbol=%s | sl_pips=%.1f | risk=%.2f %s | risk_pct=%.1f%% "
-            "→ REJECTED (sl_too_large: %.1f > %.1f pips)",
-            symbol, sl_pips, _proj_risk, _ccy_sl, _proj_pct, sl_pips, max_sl_pips,
-        )
-        return _FAIL(f"sl_too_large: {sl_pips:.1f} > {max_sl_pips:.1f}")
+        if sl_reduction_mode:
+            # Aggressive: scale size_mult proportionally so effective risk stays within cap.
+            # A 51-pip SL vs a 50-pip cap → 98% size (near-invisible reduction).
+            # A 70-pip SL vs a 50-pip cap → 71% size (meaningful but trade still executes).
+            _sl_adj_factor = round(max_sl_pips / sl_pips, 4)
+            size_mult      = round(size_mult * _sl_adj_factor, 4)
+            log.warning(
+                "[RISK ADJUSTED] %s %s | SL_TOO_LARGE → size reduced"
+                " | sl_pips=%.1f > max=%.1f pips"
+                " | adj_factor=%.4f → size_mult=%.4f",
+                symbol, direction, sl_pips, max_sl_pips, _sl_adj_factor, size_mult,
+            )
+        else:
+            # Conservative: hard reject — wide SL not permitted at any size.
+            _eff_lot   = fixed_lot_size if fixed_lot_size > 0 else symbol_info.get("volume_min", 0.01)
+            _proj_risk = round(sl_pips * pip_val * _eff_lot, 2)
+            _proj_pct  = round(_proj_risk / account.balance * 100, 1) if account.balance > 0 else 0.0
+            _ccy_sl    = account.currency or "?"
+            log.warning(
+                "[RISK FILTER] symbol=%s | sl_pips=%.1f | risk=%.2f %s | risk_pct=%.1f%%"
+                " → REJECTED (sl_too_large: %.1f > %.1f pips) [conservative]",
+                symbol, sl_pips, _proj_risk, _ccy_sl, _proj_pct, sl_pips, max_sl_pips,
+            )
+            return _FAIL(f"sl_too_large: {sl_pips:.1f} > {max_sl_pips:.1f}")
 
     # ── Position size ─────────────────────────────────────────────────────────
     # pip_val already computed above

@@ -111,8 +111,9 @@ strategy:
   entry_pullback_min_atr: 0.20 # pullback < 0.2 ATR → -30%; no block
   entry_pullback_max_atr: 2.50 # pullback > 2.5 ATR → -50%; no block
   min_atr_pips:          10    # ATR < min → HARD REJECT (sleeping market).
-                               # Also used by adaptive sizing when fixed_lot_size = 0.
-                               # 10 pips is the realistic M15 floor for any major pair.
+                               # Conservative reference value; aggressive mode overrides to 5.0.
+                               # 10 pips suits conservative mode (only trade strong volatility).
+                               # 5 pips is the dead-market absolute floor for all major pairs.
   atr_optimal_max_pips:  30    # ATR > this = HIGH zone. Conservative: block.
                                # Aggressive: existing max_atr_pips proportional reduction.
                                # 30 pips covers normal London/NY range; above = news/spike.
@@ -232,7 +233,9 @@ modes:
     # Every threshold raised to require genuine institutional confirmation.
     # Tier 3 disabled. Session gate enforced at pipeline level.
     min_confidence:      52     # was 45 — stricter market-readiness floor
-    min_atr_pips:        8.0    # was 5.0 — 8 pips is the real live minimum for majors
+    min_atr_pips:        5.0    # was 8.0 — 5 pips is the dead-market absolute floor
+                               # EURUSD/GBPUSD during quiet periods: 5-8 pips is normal
+                               # 8-pip floor was blocking valid low-volatility setups
     atr_optimal_max_pips: 35    # was 40 — tighter high-volatility ceiling
     min_core_score:      35.0   # was 20.0 — CRITICAL: requires trend + at least one factor
     min_exec_composite:  0.40   # was 0.48 — 0.40 still blocks doji+off-session combos
