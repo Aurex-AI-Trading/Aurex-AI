@@ -496,7 +496,7 @@ async def _fallback_pipeline(
         sl_buffer_pips      = cfg.risk.sl_buffer_pips,
         size_mult           = 0.25,   # Tier 3 — quarter lot, always
         max_lot_size        = getattr(cfg.risk, "max_lot_size",        0.0),
-        max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  5.0),
+        max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  15.0),
         fixed_lot_size      = getattr(cfg.risk, "fixed_lot_size",      0.0),
         max_sl_pips         = getattr(cfg.risk, "max_sl_pips",         0.0),
         sl_reduction_mode   = False,   # fallback is Tier-3 minimum size — keep SL strict
@@ -855,7 +855,7 @@ async def _stack_pipeline(
         sl_buffer_pips      = cfg.risk.sl_buffer_pips,
         size_mult           = 0.5,   # half position — conservative stack sizing
         max_lot_size        = getattr(cfg.risk, "max_lot_size",        0.0),
-        max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  5.0),
+        max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  15.0),
         fixed_lot_size      = getattr(cfg.risk, "fixed_lot_size",      0.0),
         max_sl_pips         = getattr(cfg.risk, "max_sl_pips",         0.0),
         sl_reduction_mode   = _stack_aggressive,
@@ -1048,10 +1048,14 @@ async def scan_symbol(
     # ── Trading mode resolution ───────────────────────────────────────────────
     # Reads once per symbol scan; all subsequent gates use mode params.
     mode = _resolve_mode_params(cfg)
-    log.info("[MODE: %s] %s | atr_floor=%.0f conf_min=%d tiers=%d/%d/%d tier_floor=%d",
-             mode.name.upper(), symbol,
-             mode.min_atr_pips, mode.min_confidence,
-             mode.tier1, mode.tier2, mode.tier3, mode.min_execution_tier)
+    log.warning(
+        "[RISK MODE] %s | mode=%s sl_reduction=%s"
+        " | atr_floor=%.1f conf_min=%d tiers=%d/%d/%d tier_floor=%d",
+        symbol, mode.name.upper(),
+        "ADAPTIVE" if mode.name == "aggressive" else "HARD_REJECT",
+        mode.min_atr_pips, mode.min_confidence,
+        mode.tier1, mode.tier2, mode.tier3, mode.min_execution_tier,
+    )
 
     # ── Daily state reset ─────────────────────────────────────────────────────
     if daily.date != today:
@@ -1245,9 +1249,8 @@ async def scan_symbol(
         _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
         return None
 
-    # Mode ATR floor — enforced in both modes (was warn-only in aggressive).
-    # With min_atr_pips=8.0 for quality-aggressive, anything below 8 pips means
-    # the market is not generating sufficient price movement for clean setups.
+    # Mode ATR floor: aggressive=5.0 pips, conservative=10.0 pips.
+    # Below this floor the market is not generating enough movement for clean setups.
     if _min_atr > 0 and atr_pips < _min_atr:
         log.warning(
             "[BLOCKED] symbol=%s reason=atr_too_low | atr=%.1f < min=%.1f pips [MODE:%s]",
@@ -1856,7 +1859,7 @@ async def scan_symbol(
         sl_buffer_pips      = cfg.risk.sl_buffer_pips,
         size_mult           = combined_size_mult,
         max_lot_size        = getattr(cfg.risk, "max_lot_size",        0.0),
-        max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  5.0),
+        max_trade_risk_pct  = getattr(cfg.risk, "max_trade_risk_pct",  15.0),
         fixed_lot_size      = getattr(cfg.risk, "fixed_lot_size",      0.0),
         max_sl_pips         = getattr(cfg.risk, "max_sl_pips",         0.0),
         sl_atr_mult         = _sl_atr_mult,
@@ -3202,9 +3205,9 @@ def main() -> None:
     log.warning("MT5 connected | balance=%.2f %s | equity=%.2f %s",
                 _live_bal, _live_ccy, _live_equ, _live_ccy)
 
-    _fixed_lot  = float(getattr(cfg.risk, "fixed_lot_size",     0.01))
-    _max_sl     = float(getattr(cfg.risk, "max_sl_pips",        25.0))
-    _max_rsk    = float(getattr(cfg.risk, "max_trade_risk_pct",  5.0))
+    _fixed_lot  = float(getattr(cfg.risk, "fixed_lot_size",      0.0))
+    _max_sl     = float(getattr(cfg.risk, "max_sl_pips",         50.0))
+    _max_rsk    = float(getattr(cfg.risk, "max_trade_risk_pct",  15.0))
     _fb_on      = bool(getattr(getattr(cfg, "fallback", None), "enabled", False))
     _sim_bal    = float(getattr(getattr(cfg, "trading", None), "sim_balance", 0.0) or 0.0)
     _daily_halt = _live_bal * (cfg.risk.max_daily_loss_pct / 100.0) if _live_bal > 0 else 0.0
@@ -3220,7 +3223,7 @@ def main() -> None:
         "  balance          = %.2f %s (real MT5 account)\n"
         "  equity           = %.2f %s\n"
         "  symbols          = %s\n"
-        "  lot              = %.2f FIXED (dynamic sizing disabled)\n"
+        "  lot              = %s\n"
         "  max_open_trades  = %d trade at a time\n"
         "  max_daily_trades = %d trades per day\n"
         "  daily_loss_halt  = %.1f%% ≈ %.2f %s\n"
@@ -3238,7 +3241,7 @@ def main() -> None:
         "  exec_composite   = %.2f",
         _live_bal, _live_ccy, _live_equ, _live_ccy,
         ", ".join(symbols),
-        _fixed_lot if _fixed_lot > 0 else 0.01,
+        f"{_fixed_lot:.2f} FIXED (dynamic disabled)" if _fixed_lot > 0 else "DYNAMIC (risk_pct=%.2f%%)" % cfg.risk.risk_pct,
         cfg.risk.max_open_trades,
         cfg.risk.max_daily_trades,
         cfg.risk.max_daily_loss_pct, _daily_halt, _live_ccy,
@@ -3254,6 +3257,32 @@ def main() -> None:
         _startup_mode.min_execution_tier,
         _startup_mode.min_core_score,
         _startup_mode.min_exec_composite,
+    )
+
+    # ── Config check: emit every risk-critical value so operators can verify ─────
+    log.warning(
+        "\n[CONFIG CHECK] Runtime values loaded from settings.yaml:\n"
+        "  risk_pct             = %.4f%%\n"
+        "  max_trade_risk_pct   = %.1f%%\n"
+        "  fixed_lot_size       = %.2f  (%s)\n"
+        "  max_sl_pips          = %.0f  (0=disabled)\n"
+        "  max_lot_size         = %.2f\n"
+        "  min_atr_pips (mode)  = %.1f\n"
+        "  sl_reduction_mode    = %s\n"
+        "  trading_mode         = %s\n"
+        "  min_rr               = %.1f\n"
+        "  max_daily_loss_pct   = %.1f%%",
+        cfg.risk.risk_pct,
+        _max_rsk,
+        _fixed_lot,
+        "FIXED lot — dynamic sizing OFF" if _fixed_lot > 0 else "dynamic sizing ON",
+        _max_sl,
+        getattr(cfg.risk, "max_lot_size", 0.05),
+        _startup_mode.min_atr_pips,
+        "ADAPTIVE (aggressive)" if _startup_mode.name == "aggressive" else "HARD_REJECT (conservative)",
+        _startup_mode.name.upper(),
+        cfg.risk.min_rr,
+        cfg.risk.max_daily_loss_pct,
     )
 
     _install_shutdown_handlers()
