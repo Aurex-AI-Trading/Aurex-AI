@@ -1387,25 +1387,33 @@ async def scan_symbol(
     # trend_result.consistent = True when BOTH H1 EMA stack and H4 EMA align on the
     # same direction.  Inconsistency means the two frames disagree — we may be at a
     # higher-TF turning point where the risk of reversal is elevated.
+    # aggressive: soft filter (30% size reduction, trade allowed)
+    # conservative: hard block
+    _mtf_h4_size_penalty = 1.0
     if not trend_result.consistent:
         _h1_bias = ("bull" if trend_result.h1_aligned and trend_result.direction == "bullish"
                     else "bear" if trend_result.h1_aligned else "flat")
         _h4_bias = ("bull" if trend_result.h4_aligned and trend_result.direction == "bullish"
                     else "bear" if trend_result.h4_aligned else "flat")
-        # Block in both modes: H1/H4 disagreement signals a higher-TF turning
-        # point with elevated reversal risk. A small account cannot absorb that.
-        log.warning(
-            "[MTF BLOCK] %s — H1/H4 inconsistent (H1=%s H4=%s), blocking | %s",
-            symbol, _h1_bias, _h4_bias, trend_result.reason,
-        )
-        _log_rejected(symbol, "MTF_H1_H4_CONFLICT", confidence=confidence.total, atr=atr_pips)
-        if _fallback_ready:
-            return await _fallback_pipeline(
-                symbol, candles_m15, price, pip,
-                feed, bridge, cooldown, cfg, daily, session, engine,
-                signal_id, current_time, idle_cycles=idle_cycles,
+        if mode.name == "aggressive":
+            _mtf_h4_size_penalty = 0.7
+            log.warning(
+                "[MTF WARNING] %s — H1/H4 inconsistent (H1=%s H4=%s), allowing with 30%% size reduction | %s",
+                symbol, _h1_bias, _h4_bias, trend_result.reason,
             )
-        return None
+        else:
+            log.warning(
+                "[MTF BLOCK] %s — H1/H4 inconsistent (H1=%s H4=%s), blocking [conservative] | %s",
+                symbol, _h1_bias, _h4_bias, trend_result.reason,
+            )
+            _log_rejected(symbol, "MTF_H1_H4_CONFLICT", confidence=confidence.total, atr=atr_pips)
+            if _fallback_ready:
+                return await _fallback_pipeline(
+                    symbol, candles_m15, price, pip,
+                    feed, bridge, cooldown, cfg, daily, session, engine,
+                    signal_id, current_time, idle_cycles=idle_cycles,
+                )
+            return None
 
     # ── Multi-timeframe check: M5 must align with H1 direction ───────────────
     _h1_dir = trend_result.direction   # "bullish" | "bearish"
@@ -1815,7 +1823,8 @@ async def scan_symbol(
         )
 
     # Combine decision size multiplier with optimizer, session, dynamic risk, execution factors,
-    # and entry confirmation quality (_entry_conf_factor: 0.60/0.85/1.0).
+    # entry confirmation quality (_entry_conf_factor: 0.60/0.85/1.0), and MTF H1/H4 penalty
+    # (_mtf_h4_size_penalty: 0.7 when H1/H4 disagree in aggressive mode, else 1.0).
     combined_size_mult = (
         decision.size_mult
         * opt.lot_mult
@@ -1823,6 +1832,7 @@ async def scan_symbol(
         * _dyn_risk_mult
         * _exec.composite
         * _entry_conf_factor
+        * _mtf_h4_size_penalty
     )
     combined_size_mult = max(0.10, min(1.5, round(combined_size_mult, 2)))
 
