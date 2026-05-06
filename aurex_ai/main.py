@@ -1350,17 +1350,15 @@ async def scan_symbol(
         return None
 
     # ── Momentum pre-filter ───────────────────────────────────────────────────
-    # Require non-zero 5-bar Rate-of-Change. momentum=0 means price has moved
-    # < 0.02% over 75 minutes — the market is chopping in place. No valid
-    # sweep, FVG, or structure setup is actionable in that condition.
+    # Zero momentum (5-bar ROC < 0.02%) means price barely moved over 75 min.
+    # No longer a hard block — the confidence gate already rejects truly dead markets.
+    # A score penalty is applied in the score integrity section instead.
     if confidence.momentum == 0:
         log.warning(
-            "[BLOCKED] %s — zero momentum (5-bar ROC < 0.02%%) | "
-            "confidence=%d atr=%.1f",
+            "[WEAK MOMENTUM] %s — zero momentum (5-bar ROC < 0.02%%) | "
+            "confidence=%d atr=%.1f — score penalty applied, not blocked",
             symbol, confidence.total, atr_pips,
         )
-        _log_rejected(symbol, "ZERO_MOMENTUM", confidence=confidence.total, atr=atr_pips)
-        return None
 
     # ── Trend analysis ────────────────────────────────────────────────────────
     trend_result = trend_mod.analyze(
@@ -1414,27 +1412,68 @@ async def scan_symbol(
             return None
 
     # ── H1 trend bias + M5 entry timing ─────────────────────────────────────
-    # H1 defines macro direction (already confirmed by EMA50/200 above).
-    # M5 must agree for entry — if not, skip this scan (no wait state).
-    _h1_dir = trend_result.direction   # "bullish" | "bearish"
-    _h1_sig = "BUY" if _h1_dir == "bullish" else "SELL"
+    # H1 defines macro direction. M5 EMA20 is the entry timing signal.
+    # Three outcomes: aligned (full size), near/recovering (size penalty), misaligned (skip).
+    _h1_dir      = trend_result.direction   # "bullish" | "bearish"
+    _h1_sig      = "BUY" if _h1_dir == "bullish" else "SELL"
+    _m5_size_penalty = 1.0                  # applied to combined_size_mult below
 
     if candles_m5 and len(candles_m5) >= 22:
         _m5_closes = [c.close for c in candles_m5]
         _m5_ema20  = trend_mod.ema(_m5_closes, 20)
-        _m5_dir    = "bullish" if _m5_closes[-1] > _m5_ema20[-1] else "bearish"
+        _m5_last   = _m5_closes[-1]
+        _m5_e20    = _m5_ema20[-1]
+        _m5_dir    = "bullish" if _m5_last > _m5_e20 else "bearish"
+
+        # Gap normalized to ATR — how far is M5 price from its EMA20?
+        _m5_gap_atr = abs(_m5_last - _m5_e20) / (atr_pips * pip) if atr_pips > 0 else 999.0
+
+        if _m5_dir == _h1_dir:
+            # Fully aligned — normal entry
+            log.info("[MTF] %s H1=%s M5=%s → aligned", symbol, _h1_sig, _h1_sig)
+
+        elif _m5_gap_atr < 0.30:
+            # Near-aligned: price just nicked the wrong side of EMA20 (< 0.3 ATR gap).
+            # Treat as aligned with a minor size reduction.
+            _m5_size_penalty = 0.85
+            log.info("[MTF] %s H1=%s M5=near-aligned (gap=%.2f ATR) → 0.85× size",
+                     symbol, _h1_sig, _m5_gap_atr)
+
+        else:
+            # Check whether M5 is recovering toward H1 direction (last 3 candles).
+            _m5_recovering = False
+            if len(_m5_closes) >= 4:
+                _m5_recent = _m5_closes[-1] - _m5_closes[-4]
+                _m5_recovering = (
+                    (_h1_dir == "bullish" and _m5_recent > 0) or
+                    (_h1_dir == "bearish" and _m5_recent < 0)
+                )
+
+            if _m5_recovering and _m5_gap_atr < 0.80:
+                # Soft pullback: M5 is off EMA20 but already bouncing back in H1 direction.
+                # Classic SMC pullback entry zone — allow with size reduction.
+                _m5_size_penalty = 0.75
+                log.info(
+                    "[MTF] %s H1=%s M5=recovering (gap=%.2f ATR, 3-bar move=%+.5f) → 0.75× size",
+                    symbol, _h1_sig, _m5_gap_atr, _m5_closes[-1] - _m5_closes[-4],
+                )
+            else:
+                # Genuinely misaligned — M5 trending against H1 with no recovery.
+                log.debug(
+                    "[SKIP] %s H1=%s M5=%s (gap=%.2f ATR recovering=%s) — not aligned",
+                    symbol, _h1_sig,
+                    "BUY" if _m5_dir == "bullish" else "SELL",
+                    _m5_gap_atr, _m5_recovering,
+                )
+                _log_rejected(symbol, "MTF_M5_NOT_ALIGNED",
+                              confidence=confidence.total, atr=atr_pips)
+                return None
     else:
-        _m5_dir = "neutral"
-
-    if _m5_dir != _h1_dir:
-        log.debug("[SKIP] %s H1=%s M5=%s — entry timing not aligned",
-                  symbol, _h1_sig,
-                  "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL"))
-        _log_rejected(symbol, "MTF_M5_NOT_ALIGNED", confidence=confidence.total, atr=atr_pips)
-        return None
-
-    log.info("[MTF] %s H1=%s M5=%s → aligned", symbol, _h1_sig,
-             "BUY" if _m5_dir == "bullish" else "SELL")
+        # Insufficient M5 data — don't block; proceed with a small caution penalty.
+        _m5_dir      = "neutral"
+        _m5_gap_atr  = 0.0
+        _m5_size_penalty = 0.90
+        log.info("[MTF] %s H1=%s M5=insufficient data → 0.90× size", symbol, _h1_sig)
 
     # ── Directional cooldown fast-path ────────────────────────────────────────
     hint_dir = "BUY" if trend_result.direction == "bullish" else "SELL"
@@ -1679,6 +1718,7 @@ async def scan_symbol(
     if not struct_result.bos_detected:   _score_adj -= 8
     if not sweep_result.detected:        _score_adj -= 6
     if conf_score.score == 0:            _score_adj -= 8
+    if confidence.momentum == 0:         _score_adj -= 5
 
     if _score_adj < thresholds.tier2:
         log.warning(
@@ -1729,7 +1769,7 @@ async def scan_symbol(
     )
 
     combined_size_mult = max(0.10, min(1.0, round(
-        decision.size_mult * opt.lot_mult * _mtf_h4_size_penalty, 2
+        decision.size_mult * opt.lot_mult * _mtf_h4_size_penalty * _m5_size_penalty, 2
     )))
 
     _sl_atr_mult = float(getattr(cfg.strategy, "sl_atr_mult", 1.5))
