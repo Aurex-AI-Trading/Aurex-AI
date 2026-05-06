@@ -11,23 +11,26 @@ symbols:
 
 # ── Risk management ───────────────────────────────────────────
 risk:
-  risk_pct:            0.10    # % of balance risked per trade
+  risk_pct:            1.0     # % of balance risked per trade (target; floored at vol_min lot)
   min_rr:              1.5     # minimum reward-to-risk ratio accepted
   max_open_trades:     1       # LIVE CAPITAL PROTECTION: 1 trade at a time
   max_open_per_symbol: 1       # max concurrent positions per individual symbol
   max_daily_trades:    2       # LIVE CAPITAL PROTECTION: max 2 trades per day
-  max_lot_size:        0.05    # demo safety cap — 0.0 means no cap
-  max_daily_loss_pct:  10.0    # halt if daily drawdown exceeds this (~$3 on $29 account)
-  max_trade_risk_pct:  5.0     # survivability cap: reject any trade where dollar risk
-                               # exceeds this % of balance after lot clamping.
-  fixed_lot_size:      0.01    # when > 0: bypass ALL dynamic sizing; every trade uses
-                               # exactly this lot regardless of balance, optimizer,
-                               # session, confidence, or size_mult. Set to 0.0 to
-                               # re-enable dynamic sizing (requires adequate capital).
-  max_sl_pips:         25      # hard SL distance cap (pips, balance-independent).
-                               # Trades with SL > this value are always rejected,
-                               # regardless of account balance or lot size.
-                               # 25 pips @ 0.01 lot = $2.50 risk (8.6% of $29).
+  max_lot_size:        0.05    # safety cap — 0.0 means no cap
+  max_daily_loss_pct:  10.0    # halt if daily drawdown exceeds this
+  max_trade_risk_pct:  15.0    # survivability cap: micro-account floor.
+                               # On R500 the minimum lot (0.01) already costs ~7-10% per trade
+                               # depending on SL distance — 5% is mathematically unreachable.
+                               # 15% allows minimum-lot trades while blocking runaway exposure.
+  fixed_lot_size:      0.0     # 0.0 = dynamic sizing (recommended). Dynamic sizing respects
+                               # risk_pct, size_mult (tier/quality), and grows with balance.
+                               # On R500 lots will floor at volume_min (0.01) regardless —
+                               # dynamic mode still applies composite quality multipliers.
+                               # Set > 0 only for hard-fixed lot (disables all dynamic sizing).
+  max_sl_pips:         50      # SL distance cap (pips, balance-independent).
+                               # 25 was too tight: GBPUSD ATR×1.5 ≈ 27-37 pips, USDJPY 30-45.
+                               # 50 allows normal ATR-based SL while blocking exotic runaway SL.
+                               # Dollar risk is controlled by max_trade_risk_pct instead.
                                # Set to 0 to disable.
   min_execution_tier:  2       # minimum tier allowed to execute.
                                # 1 = Tier 1 only (score ≥ 60)
@@ -224,24 +227,28 @@ testing:
 
 modes:
   aggressive:
-    min_confidence:      45     # confidence gate (was 50)
-    min_atr_pips:        5.0    # volatility floor (was 10)
-    atr_optimal_max_pips: 40    # HIGH zone above 40 pips: size reduced, not blocked
-    min_core_score:      20.0   # core gate (was 35) — still blocks zero-trend entries
-    min_exec_composite:  0.25   # execution quality floor (was 0.40)
-    min_execution_tier:  3      # allow all three tiers (was 2 = tier3 blocked)
-    tier1:               55     # EXECUTE   full lot  (was 60)
-    tier2:               38     # CONDITIONAL half lot (was 50)
-    tier3:               28     # TIER3 quarter lot   (was 35)
+    # ── Quality-Aggressive: small account survivability (R500/$30) ────────────
+    # "Aggressive" = aggressive filtering, NOT aggressive entry frequency.
+    # Every threshold raised to require genuine institutional confirmation.
+    # Tier 3 disabled. Session gate enforced at pipeline level.
+    min_confidence:      52     # was 45 — stricter market-readiness floor
+    min_atr_pips:        8.0    # was 5.0 — 8 pips is the real live minimum for majors
+    atr_optimal_max_pips: 35    # was 40 — tighter high-volatility ceiling
+    min_core_score:      35.0   # was 20.0 — CRITICAL: requires trend + at least one factor
+    min_exec_composite:  0.40   # was 0.48 — 0.40 still blocks doji+off-session combos
+    min_execution_tier:  2      # was 3 — TIER 3 ELIMINATED (0.25× lot, no quality edge)
+    tier1:               65     # was 55 — A+ setups only for full lot execution
+    tier2:               52     # was 38 — B+ setups for half lot execution
+    tier3:               42     # was 28 — blocked by min_execution_tier=2 anyway
     weights:
-      # Sum must equal 100.  Trend raised; liquidity/FVG reduced.
-      # Absence of sweep (-25→-15) and FVG (-10→-5) now costs only 20 pts
-      # instead of 35.  A trend + fib + ema setup scores ~40–50 without any
-      # institutional confirmation and can reach tier2 execution.
-      trend:        40   # up from 30 — primary directional edge, always present
-      liquidity:    15   # down from 25 — valuable bonus, not a gate
-      fvg:           5   # down from 10 — rare in Asian/ranging; treated as bonus
-      fibonacci:    20   # up from 15 — reliable pullback confirmation
+      # Sum must equal 100.
+      # Institutional signals (liquidity + FVG) restored to meaningful weight.
+      # A trend+fib+ema setup without sweep/FVG now scores ~50 (below tier2=52)
+      # and also fails the institutional gate added to the main pipeline.
+      trend:        30   # was 40 — reduced to prevent single-factor dominance
+      liquidity:    22   # was 15 — raised: sweeps are the primary institutional signal
+      fvg:          10   # was 5  — raised: FVG valid in London/NY sessions
+      fibonacci:    18   # was 20 — slight reduction, still strong pullback signal
       ema:          10   # unchanged
       confirmation: 10   # unchanged
 

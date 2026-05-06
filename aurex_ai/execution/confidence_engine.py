@@ -53,18 +53,18 @@ def get_confidence_threshold(utc_hour: int = -1, atr_pips: float = 0.0) -> int:
     """
     base = MIN_TRADE_CONFIDENCE
 
-    # Session adjustment — lower bar during prime liquidity windows
+    # Session adjustment — only raise threshold during low-quality hours.
+    # London/NY sessions keep base unchanged; lowering during prime hours was
+    # counterproductive (admitted weaker markets during highest-noise periods).
     if utc_hour >= 0:
-        if 7 <= utc_hour < 21:    # London + NY sessions
-            base -= 5
-        else:                      # Asian / off-hours
-            base += 3
+        if not (7 <= utc_hour < 21):   # Asian / off-hours only
+            base += 5                   # dead hours demand a higher bar
 
     # Volatility adjustment — dead market deserves a harder gate
     if atr_pips < 5.0:
         base += 7    # flat / sleeping market
 
-    return max(15, min(42, base))
+    return max(20, min(45, base))
 
 
 @dataclass

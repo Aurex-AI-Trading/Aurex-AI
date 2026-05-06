@@ -16,8 +16,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import ctypes
+import os
 import signal
 import sys
+import tempfile
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
@@ -1107,6 +1111,18 @@ async def scan_symbol(
 
     _utc_hour = current_time.hour
 
+    # ── Session hard block ────────────────────────────────────────────────────
+    # Only trade during London + New York sessions (07:00–21:00 UTC).
+    # Off-hours liquidity is institutional-grade absent: sweeps and FVGs formed
+    # in Asian/dead sessions are retail traps, not smart money zones.
+    # Fallback pipeline is intentionally also blocked — no exceptions.
+    if not (7 <= _utc_hour < 21):
+        log.info(
+            "[BLOCKED] %s — outside trading session (UTC=%02d, require 07–21)",
+            symbol, _utc_hour,
+        )
+        return None
+
     # ── Candle data ───────────────────────────────────────────────────────────
     candles_h4  = await feed.get_candles(symbol, TF_H4,  cfg.timeframes.h4_candles)
     candles_h1  = await feed.get_candles(symbol, TF_H1,  cfg.timeframes.h1_candles)
@@ -1226,23 +1242,16 @@ async def scan_symbol(
         _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
         return None
 
-    # Mode-specific soft floor
+    # Mode ATR floor — enforced in both modes (was warn-only in aggressive).
+    # With min_atr_pips=8.0 for quality-aggressive, anything below 8 pips means
+    # the market is not generating sufficient price movement for clean setups.
     if _min_atr > 0 and atr_pips < _min_atr:
-        if mode.name == "aggressive":
-            # Aggressive: warn and continue — low-vol entries allowed above dead-market floor
-            log.warning(
-                "[ATR LOW] symbol=%s atr=%.1f pips < %.1f min — low volatility, "
-                "continuing in AGGRESSIVE mode",
-                symbol, atr_pips, _min_atr,
-            )
-        else:
-            log.warning(
-                "[BLOCKED] symbol=%s reason=atr_too_low | atr=%.1f < min=%.1f pips "
-                "[MODE: %s]",
-                symbol, atr_pips, _min_atr, mode.name.upper(),
-            )
-            _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
-            return None
+        log.warning(
+            "[BLOCKED] symbol=%s reason=atr_too_low | atr=%.1f < min=%.1f pips [MODE:%s]",
+            symbol, atr_pips, _min_atr, mode.name.upper(),
+        )
+        _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
+        return None
 
     # ── ATR zone classification ───────────────────────────────────────────────
     # LOW  (< min_atr_pips): already handled above.
@@ -1336,6 +1345,19 @@ async def scan_symbol(
         _log_rejected(symbol, "LOW_CONFIDENCE", confidence=confidence.total, atr=atr_pips)
         return None
 
+    # ── Momentum pre-filter ───────────────────────────────────────────────────
+    # Require non-zero 5-bar Rate-of-Change. momentum=0 means price has moved
+    # < 0.02% over 75 minutes — the market is chopping in place. No valid
+    # sweep, FVG, or structure setup is actionable in that condition.
+    if confidence.momentum == 0:
+        log.warning(
+            "[BLOCKED] %s — zero momentum (5-bar ROC < 0.02%%) | "
+            "confidence=%d atr=%.1f",
+            symbol, confidence.total, atr_pips,
+        )
+        _log_rejected(symbol, "ZERO_MOMENTUM", confidence=confidence.total, atr=atr_pips)
+        return None
+
     # ── Trend analysis ────────────────────────────────────────────────────────
     trend_result = trend_mod.analyze(
         candles_h1,
@@ -1364,23 +1386,20 @@ async def scan_symbol(
                     else "bear" if trend_result.h1_aligned else "flat")
         _h4_bias = ("bull" if trend_result.h4_aligned and trend_result.direction == "bullish"
                     else "bear" if trend_result.h4_aligned else "flat")
-        if mode.name == "conservative":
-            log.warning(
-                "[MTF BLOCK] %s — H1/H4 inconsistent (H1=%s H4=%s), blocking | %s",
-                symbol, _h1_bias, _h4_bias, trend_result.reason,
-            )
-            _log_rejected(symbol, "MTF_H1_H4_CONFLICT", confidence=confidence.total, atr=atr_pips)
-            if _fallback_ready:
-                return await _fallback_pipeline(
-                    symbol, candles_m15, price, pip,
-                    feed, bridge, cooldown, cfg, daily, session, engine,
-                    signal_id, current_time, idle_cycles=idle_cycles,
-                )
-            return None
+        # Block in both modes: H1/H4 disagreement signals a higher-TF turning
+        # point with elevated reversal risk. A small account cannot absorb that.
         log.warning(
-            "[MTF WARN] %s — H1/H4 inconsistent (H1=%s H4=%s), size will be reduced | %s",
+            "[MTF BLOCK] %s — H1/H4 inconsistent (H1=%s H4=%s), blocking | %s",
             symbol, _h1_bias, _h4_bias, trend_result.reason,
         )
+        _log_rejected(symbol, "MTF_H1_H4_CONFLICT", confidence=confidence.total, atr=atr_pips)
+        if _fallback_ready:
+            return await _fallback_pipeline(
+                symbol, candles_m15, price, pip,
+                feed, bridge, cooldown, cfg, daily, session, engine,
+                signal_id, current_time, idle_cycles=idle_cycles,
+            )
+        return None
 
     # ── Multi-timeframe check: M5 must align with H1 direction ───────────────
     _h1_dir = trend_result.direction   # "bullish" | "bearish"
@@ -3010,9 +3029,94 @@ def _print_banner(cfg: Settings, symbols: List[str], mode: str) -> None:
     )
 
 
+# ── Single-instance protection ────────────────────────────────────────────────
+
+_INSTANCE_LOCK_HANDLE = None   # kept alive for the full process lifetime
+
+
+def _acquire_single_instance_lock() -> None:
+    """
+    Acquire a global single-instance lock before any trading logic runs.
+
+    Windows (primary): kernel32 CreateMutexW in the Global\\ namespace.
+    The OS holds the mutex for the entire process lifetime and releases it
+    automatically on termination — even on crash.  No cleanup needed.
+
+    Non-Windows (fallback): PID-validated lock file in the system temp dir.
+    On process exit, atexit removes the file.  If the process crashes and the
+    file is orphaned, the stale PID check prevents a false "already running".
+    """
+    global _INSTANCE_LOCK_HANDLE
+
+    _MUTEX_NAME = "Global\\AurexAI_Bot_SingleInstance"
+    _LOCK_FILE  = os.path.join(tempfile.gettempdir(), "aurex_ai.lock")
+
+    # ── Windows: kernel-level named mutex ────────────────────────────────────
+    if sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+        # Declare types so the call is safe on 64-bit Windows
+        kernel32.CreateMutexW.restype  = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p,   # lpMutexAttributes (NULL)
+            ctypes.c_bool,     # bInitialOwner
+            ctypes.c_wchar_p,  # lpName
+        ]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.GetLastError.restype  = ctypes.c_ulong
+
+        handle   = kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+        last_err = kernel32.GetLastError()
+
+        _ERROR_ALREADY_EXISTS = 183
+
+        if handle and last_err != _ERROR_ALREADY_EXISTS:
+            # We created the mutex — we are the sole owner
+            _INSTANCE_LOCK_HANDLE = handle
+            print("[SYSTEM] Single instance lock acquired — bot running safely")
+            return
+
+        # Mutex already exists: another instance holds it
+        if handle:
+            kernel32.CloseHandle(handle)
+        print("[SAFETY] Another Aurex AI instance is already running. Exiting.")
+        sys.exit(0)
+
+    # ── Non-Windows fallback: PID-validated lock file ─────────────────────────
+    def _pid_alive(pid: int) -> bool:
+        """Return True if the given process is still running."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    if os.path.exists(_LOCK_FILE):
+        try:
+            stored_pid = int(Path(_LOCK_FILE).read_text().strip())
+            if stored_pid != os.getpid() and _pid_alive(stored_pid):
+                print("[SAFETY] Another Aurex AI instance is already running. Exiting.")
+                sys.exit(0)
+        except (ValueError, OSError):
+            pass   # corrupt or empty lock file — overwrite below
+
+    try:
+        Path(_LOCK_FILE).write_text(str(os.getpid()))
+        _INSTANCE_LOCK_HANDLE = _LOCK_FILE
+        atexit.register(lambda f=_LOCK_FILE: Path(f).unlink(missing_ok=True))
+        print("[SYSTEM] Single instance lock acquired — bot running safely")
+    except OSError as exc:
+        # Lock file creation failed — warn and continue rather than blocking startup.
+        # This should not happen on a normal VPS; the warning is enough to flag it.
+        print(f"[WARNING] Could not create instance lock file: {exc} — proceeding without lock")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Must be the very first action — before config, logging, and MT5 connection.
+    _acquire_single_instance_lock()
+
     args = _parse_args()
     cfg  = load_settings(path=args.config)
 

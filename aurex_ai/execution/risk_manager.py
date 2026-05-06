@@ -295,6 +295,11 @@ def calculate(
     # ── Position size ─────────────────────────────────────────────────────────
     # pip_val already computed above
 
+    vol_min  = symbol_info.get("volume_min",  0.01)
+    vol_max  = symbol_info.get("volume_max",  100.0)
+    vol_step = symbol_info.get("volume_step", 0.01)
+    _ccy     = account.currency or "?"
+
     if fixed_lot_size > 0:
         # Fixed lot mode — all dynamic sizing bypassed.
         # Optimizer lot_mult, session_mult, dynamic_risk_mult, execution factors,
@@ -303,22 +308,37 @@ def calculate(
         log.warning(
             "[LOT MODE] FIXED | %s %s | lot=%.2f | balance=%.2f %s"
             " | dynamic sizing disabled",
-            symbol, direction, raw_lots, account.balance, account.currency or "?",
+            symbol, direction, raw_lots, account.balance, _ccy,
         )
     else:
-        # Dynamic lot mode — balance-based Kelly-style sizing.
+        # Dynamic lot mode — balance-based risk-proportional sizing.
+        _eff_risk_pct = risk_pct * size_mult
+        _risk_target  = account.balance * (_eff_risk_pct / 100.0)
+        _ideal_lots   = (_risk_target / (sl_pips * pip_val)) if (sl_pips > 0 and pip_val > 0) else 0.0
+
         raw_lots = _compute_lot_size(
             balance      = account.balance,
-            risk_pct     = risk_pct * size_mult,
+            risk_pct     = _eff_risk_pct,
             sl_pips      = sl_pips,
             pip_val      = pip_val,
-            volume_min   = symbol_info.get("volume_min",  0.01),
-            volume_max   = symbol_info.get("volume_max",  100.0),
-            volume_step  = symbol_info.get("volume_step", 0.01),
+            volume_min   = vol_min,
+            volume_max   = vol_max,
+            volume_step  = vol_step,
         )
 
         if raw_lots <= 0:
             return _FAIL("lot_size_zero")
+
+        _floored = raw_lots > _ideal_lots and _ideal_lots > 0
+        log.warning(
+            "[LOT SIZING] %s %s | balance=%.2f %s risk_pct=%.3f%% size_mult=%.2f"
+            " sl_pips=%.1f pip_val=%.4f | ideal=%.5f lots → %s=%.2f lots",
+            symbol, direction,
+            account.balance, _ccy, risk_pct, size_mult,
+            sl_pips, pip_val, _ideal_lots,
+            "MIN_FLOOR" if _floored else "actual",
+            raw_lots,
+        )
 
         if max_lot_size > 0 and raw_lots > max_lot_size:
             log.warning("[RISK ADJUSTED] %s lot capped %.2f -> %.2f (dynamic mode)",
@@ -336,20 +356,26 @@ def calculate(
 
     risk_amount = round(raw_lots * sl_pips * pip_val, 2)
 
-    # Survivability gate — fires when broker volume_min forces a lot size that is
-    # too large relative to account balance.  The gate blocks the trade and logs
-    # the minimum balance required to trade this setup safely.
-    _ccy = account.currency or "?"
+    # Survivability gate — blocks trades where dollar risk exceeds max_trade_risk_pct
+    # of account balance even after lot sizing.  This fires when the broker's volume_min
+    # forces a lot that is too large for a small account at the given SL distance.
     if max_trade_risk_pct > 0 and account.balance > 0:
         _actual_risk_pct = risk_amount / account.balance * 100.0
         if _actual_risk_pct > max_trade_risk_pct:
             _min_balance_needed = round(risk_amount / (max_trade_risk_pct / 100.0), 2)
+            _min_lot_risk        = round(vol_min * sl_pips * pip_val, 2)
+            _min_lot_risk_pct    = round(_min_lot_risk / account.balance * 100.0, 1)
             log.warning(
                 "[RISK GATE] %s %s BLOCKED — risk %.2f %s = %.1f%% of %.2f %s balance "
-                "(cap=%.1f%%). Fund account to at least %.2f %s to trade this setup.",
+                "(cap=%.1f%%). | lot=%.2f sl_pips=%.1f pip_val=%.4f "
+                "| min_lot(%.2f) costs %.2f %s (%.1f%%) "
+                "| fund to %.2f %s or raise max_trade_risk_pct above %.1f%%",
                 symbol, direction,
                 risk_amount, _ccy, _actual_risk_pct, account.balance, _ccy,
-                max_trade_risk_pct, _min_balance_needed, _ccy,
+                max_trade_risk_pct,
+                raw_lots, sl_pips, pip_val,
+                vol_min, _min_lot_risk, _ccy, _min_lot_risk_pct,
+                _min_balance_needed, _ccy, _actual_risk_pct,
             )
             return _FAIL(
                 f"risk_too_large: {risk_amount:.2f} {_ccy} "
@@ -357,11 +383,12 @@ def calculate(
                 f"min_balance_required={_min_balance_needed:.2f} {_ccy}"
             )
 
-    log.info(
-        "risk: %s %s | entry=%.5f sl=%.5f tp=%.5f | "
-        "sl_pips=%.1f rr=%.2f lots=%.2f risk=%.2f %s",
+    _actual_risk_pct_final = round(risk_amount / account.balance * 100.0, 2) if account.balance > 0 else 0.0
+    log.warning(
+        "[RISK OK] %s %s | entry=%.5f sl=%.5f tp=%.5f | "
+        "sl_pips=%.1f rr=%.2f lots=%.2f risk=%.2f %s (%.1f%% of balance)",
         symbol, direction, entry, sl, tp,
-        sl_pips, rr_ratio, raw_lots, risk_amount, _ccy,
+        sl_pips, rr_ratio, raw_lots, risk_amount, _ccy, _actual_risk_pct_final,
     )
 
     return RiskResult(
