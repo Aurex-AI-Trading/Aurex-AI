@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from aurex_ai.config.loader import load_settings, Settings
 from aurex_ai.core.logger import configure_logging, get_logger
 from aurex_ai.core.data_feed import DataFeed, TF_M5, TF_H1, TF_H4, TF_M15
-from aurex_ai.core.mt5_bridge import MT5Bridge, get_mt5_time, is_mt5_time_fresh, log_time_sync_banner
+from aurex_ai.core.mt5_bridge import MT5Bridge, SymbolValidation, get_mt5_time, is_mt5_time_fresh, log_time_sync_banner
 
 from aurex_ai.strategy import trend      as trend_mod
 from aurex_ai.strategy import liquidity  as liq_mod
@@ -1130,6 +1130,55 @@ async def scan_symbol(
         )
         return None
 
+    # ── Micro-account symbol restriction ─────────────────────────────────────
+    # When balance falls below the configured threshold, restrict trading to
+    # the safest symbol(s) only.  EURUSD has the tightest spread and deepest
+    # liquidity — the only rational choice for a sub-R600 account.
+    _micro_cfg     = getattr(cfg, "micro_account", None)
+    _in_micro_mode = False   # True when balance < threshold AND micro_account.enabled
+    if _micro_cfg is not None and getattr(_micro_cfg, "enabled", False):
+        _micro_balance_raw = await feed.get_account_info()
+        _micro_balance     = _apply_sim_balance(_micro_balance_raw, cfg).balance
+        _micro_threshold   = float(getattr(_micro_cfg, "balance_threshold", 600.0))
+        if _micro_balance < _micro_threshold:
+            _in_micro_mode = True
+            _micro_symbols = [
+                s.upper() for s in (getattr(_micro_cfg, "symbols", None) or ["EURUSD"])
+            ]
+            if symbol.upper() not in _micro_symbols:
+                log.warning(
+                    "[MICRO ACCOUNT] %s skipped — balance=%.2f < threshold=%.2f "
+                    "restricted_to=%s",
+                    symbol, _micro_balance, _micro_threshold, _micro_symbols,
+                )
+                return None
+
+            # Apply stricter daily trade limit in micro mode
+            _micro_max_daily = int(getattr(_micro_cfg, "max_daily_trades", 2))
+            if daily.trades >= _micro_max_daily:
+                log.warning(
+                    "[MICRO ACCOUNT] %s skipped — micro daily limit reached (%d/%d)",
+                    symbol, daily.trades, _micro_max_daily,
+                )
+                return None
+
+            # Apply stricter open-trade limit in micro mode
+            _micro_max_open = int(getattr(_micro_cfg, "max_open_trades", 1))
+            if not feed._backtest:
+                _micro_open = len(bridge.get_open_positions())
+                if _micro_open >= _micro_max_open:
+                    log.warning(
+                        "[MICRO ACCOUNT] %s skipped — micro open trade limit reached (%d/%d)",
+                        symbol, _micro_open, _micro_max_open,
+                    )
+                    return None
+
+            log.warning(
+                "[MICRO ACCOUNT] %s active — balance=%.2f < threshold=%.2f "
+                "| strict confidence/RR gates will apply",
+                symbol, _micro_balance, _micro_threshold,
+            )
+
     # ── Candle data ───────────────────────────────────────────────────────────
     candles_h4  = await feed.get_candles(symbol, TF_H4,  cfg.timeframes.h4_candles)
     candles_h1  = await feed.get_candles(symbol, TF_H1,  cfg.timeframes.h1_candles)
@@ -1415,9 +1464,43 @@ async def scan_symbol(
                 )
             return None
 
-    # ── Multi-timeframe check: M5 must align with H1 direction ───────────────
+    # ── Multi-timeframe check: H1 → M15 → M5 alignment hierarchy ────────────
+    # H1  defines the macro bias (already confirmed via trend_result).
+    # M15 defines setup direction — must agree with H1.
+    # M5  defines entry timing — must agree with H1 to confirm execution.
+    # Strict mode: H1/M5 mismatch = hard block regardless of trading mode.
+    # Aggressive mode without strict: H1/M5 mismatch = 30% size reduction.
     _h1_dir = trend_result.direction   # "bullish" | "bearish"
     _h1_sig = "BUY" if _h1_dir == "bullish" else "SELL"
+
+    # ── M15 direction via EMA20 ──────────────────────────────────────────────
+    if len(candles_m15) >= 22:
+        _m15_closes = [c.close for c in candles_m15]
+        _m15_ema20  = trend_mod.ema(_m15_closes, 20)
+        _m15_dir    = "bullish" if _m15_closes[-1] > _m15_ema20[-1] else "bearish"
+    else:
+        _m15_dir = "neutral"
+    _m15_sig = "BUY" if _m15_dir == "bullish" else ("SELL" if _m15_dir == "bearish" else "NEUTRAL")
+
+    # H1/M15 gate — setup direction must agree with macro bias
+    if _m15_dir != "neutral" and _m15_dir != _h1_dir:
+        log.warning(
+            "[MTF H1/M15] %s H1=%s M15=%s — setup disagrees with macro bias",
+            symbol, _h1_sig, _m15_sig,
+        )
+        if mode.name == "conservative":
+            _log_rejected(symbol, "MTF_M15_CONFLICT", confidence=confidence.total, atr=atr_pips)
+            return None
+        # Aggressive: apply penalty alongside any H1/H4 penalty already set
+        _mtf_h4_size_penalty = round(_mtf_h4_size_penalty * 0.8, 3)
+        log.warning(
+            "[MTF H1/M15 WARN] %s — H1/M15 mismatch, size_penalty now %.2f",
+            symbol, _mtf_h4_size_penalty,
+        )
+    else:
+        log.info("[MTF CHECK] %s H1=%s M15=%s → aligned", symbol, _h1_sig, _m15_sig)
+
+    # ── M5 direction via EMA20 ───────────────────────────────────────────────
     if candles_m5 and len(candles_m5) >= 22:
         _m5_closes = [c.close for c in candles_m5]
         _m5_ema20  = trend_mod.ema(_m5_closes, 20)
@@ -1426,15 +1509,25 @@ async def scan_symbol(
         _m5_dir = "neutral"
     _m5_sig = "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL")
 
+    # H1/M5 gate — entry timing must confirm macro direction
+    _strict_cfg    = getattr(cfg, "strict_mode", None)
+    _strict_active = _strict_cfg is not None and getattr(_strict_cfg, "enabled", False)
+
     if _m5_dir == "neutral" or _m5_dir != _h1_dir:
-        if mode.name == "conservative":
+        if mode.name == "conservative" or _strict_active:
             log.warning(
-                "[MTF BLOCK] %s H1=%s M5=%s — mismatch, blocking in conservative mode",
+                "[MTF BLOCK] %s H1=%s M5=%s — entry timing conflict, blocking [%s]",
                 symbol, _h1_sig, _m5_sig,
+                "conservative" if mode.name == "conservative" else "strict_mode",
             )
             _log_rejected(symbol, "MTF_M5_CONFLICT", confidence=confidence.total, atr=atr_pips)
             return None
-        log.warning("[MTF WARN] %s H1=%s M5=%s — mismatch, will reduce size", symbol, _h1_sig, _m5_sig)
+        # Aggressive without strict: reduce size rather than block
+        _mtf_h4_size_penalty = round(_mtf_h4_size_penalty * 0.7, 3)
+        log.warning(
+            "[MTF WARN] %s H1=%s M5=%s — entry timing mismatch, size_penalty=%.2f",
+            symbol, _h1_sig, _m5_sig, _mtf_h4_size_penalty,
+        )
     else:
         log.info("[MTF CHECK] %s H1=%s M5=%s → aligned", symbol, _h1_sig, _m5_sig)
 
@@ -1681,6 +1774,131 @@ async def scan_symbol(
                       confidence=decision.confidence, atr=atr_pips)
         return None
 
+    # ── Micro-account quality gate ────────────────────────────────────────────
+    # In micro mode the confidence and tier requirements are raised to preserve capital.
+    if _in_micro_mode:
+        _micro_min_rr   = float(getattr(_micro_cfg, "min_rr", 2.0))
+        _micro_min_conf = int(getattr(_micro_cfg, "min_confidence", 60))
+        # Micro confidence gate (applied here after decision so we have both)
+        if confidence.total < _micro_min_conf:
+            log.warning(
+                "[MICRO ACCOUNT] %s skipped — confidence=%.0f < micro_min=%.0f",
+                symbol, confidence.total, _micro_min_conf,
+            )
+            _log_rejected(symbol, "MICRO_CONF_TOO_LOW",
+                          confidence=confidence.total, atr=atr_pips)
+            return None
+        # Micro tier gate — can optionally enforce Tier1 only
+        if getattr(_micro_cfg, "tier1_only", False) and decision.tier != 1:
+            log.warning(
+                "[MICRO ACCOUNT] %s skipped — tier%d rejected, micro_account tier1_only=true",
+                symbol, decision.tier,
+            )
+            _log_rejected(symbol, "MICRO_TIER_TOO_LOW",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
+    # ── Strict mode quality gates ─────────────────────────────────────────────
+    # Applied AFTER tier/core gates so we only run quality checks on trades that
+    # passed the scoring hurdle.  Blocks the low-quality setups that survive the
+    # quantitative score thresholds but lack real institutional confirmation:
+    #   • bos=False (no fresh break of structure)
+    #   • confirmation=0 (doji entries, no candle pattern)
+    #   • liquidity weak (stop-hunt wick only, no equal-level cluster)
+    #   • split votes (1B/1S — no directional consensus)
+    if _strict_active:
+        _sm_bos      = getattr(_strict_cfg, "require_bos",             True)
+        _sm_min_conf_score = float(getattr(_strict_cfg, "min_confirmation_score", 5))
+        _sm_min_liq  = float(getattr(_strict_cfg, "min_liquidity_score",  6.0))
+        _sm_min_struct = float(getattr(_strict_cfg, "min_structure_score", 5.0))
+        _sm_votes    = getattr(_strict_cfg, "block_split_votes",        True)
+        _sm_margin   = int(getattr(_strict_cfg, "require_vote_margin",   1))
+        _sm_t1_only  = getattr(_strict_cfg, "tier1_only",               False)
+        _sm_min_conf = int(getattr(_strict_cfg, "min_confidence",        0))
+
+        # BOS required
+        if _sm_bos and not struct_result.bos_detected:
+            log.warning(
+                "[STRICT MODE] %s — bos=False, structure score=%.0f | "
+                "require_bos=True → BLOCKED",
+                symbol, confluence.structure_score,
+            )
+            _log_rejected(symbol, "STRICT_NO_BOS",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
+        # Minimum candle confirmation score
+        if conf_score.score < _sm_min_conf_score:
+            log.warning(
+                "[STRICT MODE] %s — confirmation=%.0f < min=%.0f (pattern=%s) → BLOCKED",
+                symbol, conf_score.score, _sm_min_conf_score, conf_score.pattern,
+            )
+            _log_rejected(symbol, "STRICT_WEAK_CONFIRMATION",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
+        # Minimum liquidity sweep strength
+        if sweep_result.strength < _sm_min_liq:
+            log.warning(
+                "[STRICT MODE] %s — liquidity=%.1f < min=%.1f (pattern=%s) → BLOCKED",
+                symbol, sweep_result.strength, _sm_min_liq,
+                sweep_result.pattern if sweep_result.detected else "none",
+            )
+            _log_rejected(symbol, "STRICT_WEAK_LIQUIDITY",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
+        # Minimum structure score
+        if confluence.structure_score < _sm_min_struct:
+            log.warning(
+                "[STRICT MODE] %s — structure=%.1f < min=%.1f → BLOCKED",
+                symbol, confluence.structure_score, _sm_min_struct,
+            )
+            _log_rejected(symbol, "STRICT_WEAK_STRUCTURE",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
+        # Split vote block — e.g. 1B/1S means no dominant signal direction
+        if _sm_votes and _sm_margin > 0:
+            _vote_diff = abs(confluence.buy_votes - confluence.sell_votes)
+            if _vote_diff < _sm_margin:
+                log.warning(
+                    "[STRICT MODE] %s — split votes=%dB/%dS margin=%d < %d → BLOCKED",
+                    symbol, confluence.buy_votes, confluence.sell_votes,
+                    _vote_diff, _sm_margin,
+                )
+                _log_rejected(symbol, "STRICT_SPLIT_VOTES",
+                              confidence=decision.confidence, atr=atr_pips)
+                return None
+
+        # Strict Tier1 only
+        if _sm_t1_only and decision.tier != 1:
+            log.warning(
+                "[STRICT MODE] %s — tier%d rejected, tier1_only=True → BLOCKED",
+                symbol, decision.tier,
+            )
+            _log_rejected(symbol, "STRICT_TIER_TOO_LOW",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
+        # Strict confidence override
+        if _sm_min_conf > 0 and confidence.total < _sm_min_conf:
+            log.warning(
+                "[STRICT MODE] %s — confidence=%.0f < strict_min=%d → BLOCKED",
+                symbol, confidence.total, _sm_min_conf,
+            )
+            _log_rejected(symbol, "STRICT_CONF_TOO_LOW",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
+        log.warning(
+            "[STRICT MODE] %s — all quality gates passed | "
+            "bos=%s liq=%.1f struct=%.1f conf=%.0f votes=%dB/%dS",
+            symbol, struct_result.bos_detected,
+            sweep_result.strength, confluence.structure_score,
+            confidence.total, confluence.buy_votes, confluence.sell_votes,
+        )
+
     # ── Adaptive execution factors ────────────────────────────────────────────
     _pb_min_atr = float(getattr(cfg.strategy, "entry_pullback_min_atr", 0.20))
     _pb_max_atr = float(getattr(cfg.strategy, "entry_pullback_max_atr", 2.50))
@@ -1889,6 +2107,19 @@ async def scan_symbol(
         log.info("%s %s: risk rejected — %s", symbol, direction, risk.reason)
         return None
 
+    # ── Micro-account RR gate (post risk-calc) ────────────────────────────────
+    # Now that we have the actual ATR-based RR, enforce the stricter micro threshold.
+    if _in_micro_mode:
+        _micro_min_rr_post = float(getattr(_micro_cfg, "min_rr", 2.0))
+        if risk.rr_ratio < _micro_min_rr_post:
+            log.warning(
+                "[MICRO ACCOUNT] %s %s — rr=%.2f < micro_min_rr=%.2f → BLOCKED",
+                symbol, direction, risk.rr_ratio, _micro_min_rr_post,
+            )
+            _log_rejected(symbol, "MICRO_RR_TOO_LOW",
+                          confidence=decision.confidence, rr=risk.rr_ratio, atr=atr_pips)
+            return None
+
     log.debug(
         "[RISK SIZE] %s lot=%.2f risk_pct=%.2f balance=%.2f sl=%.1fpips rr=%.2f",
         symbol, risk.lot_size, cfg.risk.risk_pct, account.balance, risk.sl_pips, risk.rr_ratio,
@@ -1934,14 +2165,22 @@ async def scan_symbol(
             return None    # [RE-ENTRY BLOCKED] already logged inside evaluate()
         _is_reentry = (_re_reason == "reentry")
 
-    # ── Market-open guard ────────────────────────────────────────────────────
-    _mkt_open, _mkt_reason = await asyncio.to_thread(
-        bridge.is_market_open, symbol, direction
+    # ── MT5 pre-trade validation (comprehensive symbol check) ────────────────
+    # Runs before execution; includes:
+    #   • symbol_select(True) — ensure symbol visible in Market Watch
+    #   • trade_mode check with auto-recovery for DISABLED(0)
+    #   • Disabled-symbol cooldown (1800s) to avoid hammering every cycle
+    #   • Directional restrictions (LONGONLY / SHORTONLY)
+    #   • Tick freshness and spread calculation
+    # Replaces the simple is_market_open() call; the bridge.execute_order() still
+    # runs its own hard guard as a final layer of defence.
+    _mt5_val: "SymbolValidation" = await asyncio.to_thread(
+        bridge.validate_for_trading, symbol, direction, pip
     )
-    if not _mkt_open:
+    if not _mt5_val.valid:
         log.warning(
-            "[MARKET CLOSED] %s %s — skipping execution | reason=%s",
-            symbol, direction, _mkt_reason,
+            "[MT5 VALIDATION FAIL] %s %s — skipping execution | reason=%s",
+            symbol, direction, _mt5_val.reason,
         )
         return None
 
@@ -1949,8 +2188,10 @@ async def scan_symbol(
     # Only runs in live mode; skipped in dry_run to avoid stale tick data issues.
     # Effective RR accounts for spread eating TP and widening effective SL:
     #   eff_rr = (sl_pips × rr_ratio − spread) / (sl_pips + spread)
-    _spread_pips = 0.0
-    if not bridge.dry_run and risk.sl_pips > 0:
+    # Use spread from MT5 validation (already computed) if available;
+    # otherwise fall back to a direct tick query.
+    _spread_pips = _mt5_val.spread_pips if _mt5_val.spread_pips > 0 else 0.0
+    if _spread_pips == 0.0 and not bridge.dry_run and risk.sl_pips > 0:
         try:
             _bid, _ask = await asyncio.to_thread(bridge.get_tick_raw, symbol)
             if _ask > _bid > 0 and pip > 0:

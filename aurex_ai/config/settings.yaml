@@ -266,3 +266,34 @@ modes:
     tier2:               50
     tier3:               35
     # weights: omitted → learning engine provides adaptive weights
+
+# ── Strict mode quality gate ──────────────────────────────────────────────────
+# When enabled, applies institutional-grade hard filters on top of mode gates.
+# Purpose: eliminate the 1B/1S split-vote, bos=False, confirmation=0 trades
+#          that cause poor win rate on small accounts.
+# Enable by setting enabled: true here OR by passing --strict at CLI.
+strict_mode:
+  enabled:               true    # hard quality gate active
+  require_bos:           true    # require confirmed BOS (not just trend bias or fallback credit)
+  min_confirmation_score: 5      # minimum candle pattern score (engulfing=10, wick=7, momentum=6)
+  min_liquidity_score:   6.0     # minimum sweep strength (0–20); 6 = weak swing sweep qualifies
+  min_structure_score:   5.0     # minimum structure score (0–25); 5 = trend-bias minimum
+  block_split_votes:     true    # block when |buy_votes − sell_votes| < require_vote_margin
+  require_vote_margin:   1       # minimum vote margin: 2B/0S passes, 1B/1S blocked
+  tier1_only:            false   # true → only Tier1 full-size trades (Tier2 blocked)
+  min_confidence:        55      # strict confidence floor (0 = use mode default)
+
+# ── Micro account safety mode ─────────────────────────────────────────────────
+# Auto-activates when live account balance falls below balance_threshold.
+# Designed for R500 ($27) accounts: maximise capital preservation over frequency.
+# Does NOT replace the mode system — both micro_account and mode.aggressive apply.
+micro_account:
+  enabled:              true    # activate when balance < balance_threshold
+  balance_threshold:    600.0   # ZAR — below this, micro mode kicks in
+  symbols:              [EURUSD] # trade only these symbols in micro mode
+                                 # EURUSD: tightest spread, highest liquidity, safest for R500
+  max_open_trades:      1       # never hold more than 1 position
+  max_daily_trades:     2       # hard cap regardless of cfg.risk.max_daily_trades
+  min_confidence:       60      # stricter confidence gate
+  min_rr:               2.0     # minimum R:R accepted (stricter than default 1.5)
+  tier1_only:           false   # Tier2 (0.50×) still allowed — halves risk further

@@ -176,6 +176,34 @@ class OrderResult:
         )
 
 
+@dataclass
+class SymbolValidation:
+    """Structured result from validate_for_trading()."""
+    symbol:      str
+    valid:       bool
+    reason:      str       # "" on pass; human-readable failure reason
+    trade_mode:  int       # raw MT5 trade_mode integer (4=FULL, 0=DISABLED, etc.)
+    visible:     bool      # symbol visible in Market Watch
+    market_open: bool      # tick fresh and prices valid
+    spread_pips: float     # live spread in pips (0.0 in dry-run / sim)
+
+    @classmethod
+    def ok(cls, symbol: str, trade_mode: int, spread: float) -> "SymbolValidation":
+        return cls(
+            symbol=symbol, valid=True, reason="",
+            trade_mode=trade_mode, visible=True,
+            market_open=True, spread_pips=spread,
+        )
+
+    @classmethod
+    def fail(cls, symbol: str, reason: str, trade_mode: int = -1) -> "SymbolValidation":
+        return cls(
+            symbol=symbol, valid=False, reason=reason,
+            trade_mode=trade_mode, visible=False,
+            market_open=False, spread_pips=0.0,
+        )
+
+
 # ── MT5Bridge ─────────────────────────────────────────────────────────────────
 
 class MT5Bridge:
@@ -211,9 +239,12 @@ class MT5Bridge:
         self.dry_run     = dry_run
         self._connected  = False
         self._sim_ticket = 90000   # counter for dry-run tickets
-        # Timed cooldown per symbol after receiving retcode=10018.
-        # Key: symbol str  Value: UTC epoch float — blocked until this time.
+        # Timed cooldown per symbol after receiving retcode=10018 (market closed).
         self._closed_until: Dict[str, float] = {}
+        # Timed cooldown per symbol when trade_mode=DISABLED and symbol_select retry fails.
+        # Prevents hammering the broker with repeated validation attempts on a dead symbol.
+        # Cleared on next successful validation.
+        self._disabled_until: Dict[str, float] = {}
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -383,6 +414,150 @@ class MT5Bridge:
             return False, f"tick_stale({tick_age:.0f}s_old)"
 
         return True, ""
+
+    def validate_for_trading(
+        self,
+        symbol:   str,
+        direction: str   = "",
+        pip_size:  float = 0.0001,
+    ) -> "SymbolValidation":
+        """
+        Full pre-trade symbol validation with auto-recovery.
+
+        Checks (in order):
+          1. Disabled-symbol cooldown — skip if still in penalty window.
+          2. symbol_select(True) — ensure symbol is visible in Market Watch.
+          3. trade_mode — if DISABLED(0), retry symbol_select once, then arm cooldown.
+          4. Directional mode restrictions (LONGONLY / SHORTONLY).
+          5. Tick freshness and bid/ask sanity.
+          6. Spread calculation.
+
+        Logs [MT5 VALIDATION] block on every call.
+        Returns SymbolValidation.valid=True only when all checks pass.
+        """
+        if not _MT5_AVAILABLE or not self._connected or self.dry_run:
+            return SymbolValidation.ok(symbol, trade_mode=4, spread=0.0)
+
+        # ── Disabled-symbol cooldown ──────────────────────────────────────────
+        _blocked = self._disabled_until.get(symbol, 0.0)
+        if _blocked > time.time():
+            _remaining = int(_blocked - time.time())
+            reason = f"symbol_disabled_cooldown(retry_in_{_remaining}s)"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  status=BLOCKED  reason=%s",
+                symbol, reason,
+            )
+            return SymbolValidation.fail(symbol, reason, trade_mode=0)
+        elif symbol in self._disabled_until:
+            del self._disabled_until[symbol]   # cooldown expired
+
+        # ── Step 1: ensure symbol is visible in Market Watch ─────────────────
+        _visible = False
+        try:
+            _visible = mt5.symbol_select(symbol, True)
+        except Exception as exc:
+            log.warning("[MT5 VALIDATION] symbol_select(%s) raised: %s", symbol, exc)
+
+        if not _visible:
+            reason = "symbol_select_failed"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  visible=False  status=FAIL  reason=%s",
+                symbol, reason,
+            )
+            return SymbolValidation.fail(symbol, reason)
+
+        # ── Step 2: symbol_info and trade_mode ───────────────────────────────
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            reason = "symbol_info_none"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  visible=True  trade_mode=?  status=FAIL  reason=%s",
+                symbol, reason,
+            )
+            return SymbolValidation.fail(symbol, reason)
+
+        trade_mode = info.trade_mode
+
+        # trade_mode=DISABLED(0): attempt auto-recovery via symbol_select, then cooldown.
+        if trade_mode == 0:
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  trade_mode=DISABLED(0) — attempting symbol_select recovery",
+                symbol,
+            )
+            try:
+                mt5.symbol_select(symbol, True)
+            except Exception:
+                pass
+            info2 = mt5.symbol_info(symbol)
+            trade_mode = info2.trade_mode if info2 is not None else 0
+            if trade_mode == 0:
+                # Still disabled — arm 30-minute cooldown so we don't hammer every cycle.
+                self._disabled_until[symbol] = time.time() + 1800
+                reason = f"trade_mode=DISABLED(0)_recovery_failed(cooldown=1800s)"
+                log.warning(
+                    "[MT5 VALIDATION] symbol=%-8s  trade_mode=DISABLED  status=FAIL"
+                    "  reason=%s  cooldown=1800s",
+                    symbol, reason,
+                )
+                return SymbolValidation.fail(symbol, reason, trade_mode=0)
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  recovery=OK  trade_mode=%d", symbol, trade_mode,
+            )
+
+        # Directional trade_mode restrictions
+        if trade_mode == 3:
+            reason = f"trade_mode=CLOSEONLY({trade_mode})"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  trade_mode=%d  status=FAIL  reason=%s",
+                symbol, trade_mode, reason,
+            )
+            return SymbolValidation.fail(symbol, reason, trade_mode=trade_mode)
+        if trade_mode == 1 and direction.upper() == "SELL":
+            reason = f"trade_mode=LONGONLY({trade_mode})_direction=SELL"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  trade_mode=%d  direction=%s  status=FAIL  reason=%s",
+                symbol, trade_mode, direction, reason,
+            )
+            return SymbolValidation.fail(symbol, reason, trade_mode=trade_mode)
+        if trade_mode == 2 and direction.upper() == "BUY":
+            reason = f"trade_mode=SHORTONLY({trade_mode})_direction=BUY"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  trade_mode=%d  direction=%s  status=FAIL  reason=%s",
+                symbol, trade_mode, direction, reason,
+            )
+            return SymbolValidation.fail(symbol, reason, trade_mode=trade_mode)
+
+        # ── Step 3: live tick ────────────────────────────────────────────────
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None or tick.ask <= 0 or tick.bid <= 0:
+            reason = "tick_invalid_or_none"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  trade_mode=%d  tick=invalid  status=FAIL",
+                symbol, trade_mode,
+            )
+            return SymbolValidation.fail(symbol, reason, trade_mode=trade_mode)
+
+        tick_age = time.time() - tick.time
+        if tick_age > 60:
+            reason = f"tick_stale({tick_age:.0f}s)"
+            log.warning(
+                "[MT5 VALIDATION] symbol=%-8s  trade_mode=%d  tick_age=%.0fs  status=FAIL",
+                symbol, trade_mode, tick_age,
+            )
+            return SymbolValidation.fail(symbol, reason, trade_mode=trade_mode)
+
+        # ── Step 4: spread ───────────────────────────────────────────────────
+        spread_pips = round((tick.ask - tick.bid) / pip_size, 1) if pip_size > 0 else 0.0
+
+        # ── All checks passed ────────────────────────────────────────────────
+        log.warning(
+            "[MT5 VALIDATION] symbol=%-8s  visible=True  trade_mode=%d  "
+            "market_open=True  spread=%.1f  status=PASS",
+            symbol, trade_mode, spread_pips,
+        )
+        result = SymbolValidation.ok(symbol, trade_mode=trade_mode, spread=spread_pips)
+        result.visible = True
+        return result
 
     def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
         """Return symbol metadata (point, digits, trade_contract_size, etc.)."""
