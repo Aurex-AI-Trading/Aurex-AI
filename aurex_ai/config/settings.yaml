@@ -288,8 +288,13 @@ strict_mode:
 # retracing (normal pullback), the bot waits for M5 realignment instead of blocking.
 # Disable m5_wait_enabled to revert to the old penalty-only behaviour.
 mtf:
-  m5_wait_enabled:  true   # true = WAIT STATE; false = hard block / size penalty
-  m5_wait_minutes:  45     # minutes before an unconfirmed SETUP DETECTED expires
+  m5_wait_enabled:       true   # true = WAIT STATE; false = hard block / size penalty
+  m5_wait_minutes:       45     # wait timeout for normal accounts (minutes)
+  m5_wait_minutes_micro: 25     # shorter timeout for micro accounts (<600 ZAR)
+  readiness_threshold:   65     # execution readiness score required (0-100)
+                                 # micro accounts use 55 automatically
+  max_low_quality_scans: 3      # consecutive poor-quality scans before early invalidation
+                                 # micro accounts use 2 automatically
 
 # ── Micro account safety mode ─────────────────────────────────────────────────
 # Auto-activates when live account balance falls below balance_threshold.

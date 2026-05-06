@@ -254,27 +254,136 @@ _pending_signals: Dict[str, _PendingSignal] = {}
 @dataclass
 class _MtfWaitSignal:
     """
-    Stored when H1+M15 agree on direction but M5 is temporarily retracing.
+    Stored when H1 macro bias is clear but M5 is temporarily retracing.
 
-    The bot does NOT immediately reject the setup.  Instead it enters a WAIT
-    state and rechecks every scan cycle.  When M5 realigns OR a confirmation
-    pattern fires (engulfing, momentum, BOS) the state machine advances to
-    READY_TO_EXECUTE and the trade proceeds.
+    Adaptive state machine: setup is re-evaluated every scan with decay, quality
+    deterioration detection, recovery momentum scoring, and execution readiness.
 
     State lifecycle:
       SCANNING          → normal, no wait active
-      WAITING_M5        → H1/M15 aligned, M5 retracing
-      READY_TO_EXECUTE  → M5 confirmed (state cleared, trade proceeds)
-      INVALIDATED       → expired or setup conditions no longer valid
+      WAITING_M5        → H1 aligned, M5 retracing — re-evaluated each scan
+      READY_TO_EXECUTE  → readiness threshold reached (state cleared, trade proceeds)
+      INVALIDATED       → ATR collapse / decay / quality / opposite BOS / displacement
+      EXPIRED           → timeout, M5 never confirmed
     """
-    direction:   str       # "BUY" | "SELL" — the confirmed trade direction
-    macro_bias:  str       # H1 direction when stored ("bullish"|"bearish")
-    stored_at:   datetime
-    expires_at:  datetime  # timeout: setup invalidated after this time
-    scan_count:  int = 0   # number of scan cycles waited
+    direction:          str     # "BUY" | "SELL"
+    macro_bias:         str     # "bullish" | "bearish"
+    stored_at:          datetime
+    expires_at:         datetime
+    scan_count:         int   = 0
+    stored_score:       float = 0.0   # confluence score when setup was first detected
+    low_quality_scans:  int   = 0     # consecutive deteriorating-quality scans
+    last_quality_score: float = 0.0   # quality score from last deep re-evaluation
+    last_momentum:      int   = 0     # confidence.momentum from last scan
+
+
+@dataclass
+class _WaitStats:
+    """Per-symbol wait state analytics (Phase 7)."""
+    total_waits:       int = 0
+    successful_waits:  int = 0   # readiness reached or M5 confirmed
+    expired_waits:     int = 0   # timed out without confirmation
+    invalidated_waits: int = 0   # early invalidation (ATR/decay/BOS/displacement/quality)
+    total_wait_scans:  int = 0   # total scan cycles spent in wait across all waits
 
 
 _mtf_wait_signals: Dict[str, _MtfWaitSignal] = {}
+_wait_stats:       Dict[str, _WaitStats]      = {}
+
+
+# ── MTF wait helpers ──────────────────────────────────────────────────────────
+
+def _m5_recovery_score(
+    candles_m5: list,
+    direction:  str,    # "BUY" | "SELL"
+    pip:        float,
+) -> int:
+    """
+    Score M5 momentum recovery toward trade direction (0–100).
+
+    Detects bearish/bullish exhaustion even before M5 EMA fully realigns,
+    enabling earlier execution than waiting for a complete EMA flip.
+    Components: wick rejection, shrinking body, closing direction, doji,
+    sustained improvement over multiple candles.
+    """
+    if not candles_m5 or len(candles_m5) < 3:
+        return 0
+
+    score = 0
+    last  = candles_m5[-1]
+    prev  = candles_m5[-2]
+    rng_l = last.candle_range
+
+    if direction == "BUY":
+        # Lower wick rejection (buying pressure absorbing downside)
+        if rng_l > 0:
+            lwr = (min(last.open, last.close) - last.low) / rng_l
+            score += 25 if lwr >= 0.40 else (10 if lwr >= 0.25 else 0)
+        # Shrinking bearish body (downside exhaustion)
+        l_body = abs(last.close - last.open)
+        p_body = abs(prev.close - prev.open)
+        if p_body > 0 and last.close <= last.open:
+            score += 20 if l_body < p_body * 0.60 else (10 if l_body < p_body * 0.80 else 0)
+        # Close improving vs previous (directional shift)
+        if last.close > prev.close:
+            score += 20
+        # Doji / indecision after bearish run (exhaustion signal)
+        if rng_l > 0 and abs(last.close - last.open) / rng_l < 0.25:
+            score += 15
+        # Two consecutive higher closes (sustained recovery)
+        if len(candles_m5) >= 4 and last.close > prev.close > candles_m5[-3].close:
+            score += 20
+
+    else:  # SELL
+        # Upper wick rejection (selling pressure absorbing upside)
+        if rng_l > 0:
+            uwr = (last.high - max(last.open, last.close)) / rng_l
+            score += 25 if uwr >= 0.40 else (10 if uwr >= 0.25 else 0)
+        # Shrinking bullish body (upside exhaustion)
+        l_body = abs(last.close - last.open)
+        p_body = abs(prev.close - prev.open)
+        if p_body > 0 and last.close >= last.open:
+            score += 20 if l_body < p_body * 0.60 else (10 if l_body < p_body * 0.80 else 0)
+        # Close declining vs previous
+        if last.close < prev.close:
+            score += 20
+        # Doji / indecision after bullish run
+        if rng_l > 0 and abs(last.close - last.open) / rng_l < 0.25:
+            score += 15
+        # Two consecutive lower closes (sustained recovery)
+        if len(candles_m5) >= 4 and last.close < prev.close < candles_m5[-3].close:
+            score += 20
+
+    return min(100, score)
+
+
+def _execution_readiness_score(
+    m5_aligned:     bool,
+    recovery_score: int,
+    momentum:       int,    # confidence.momentum (0–20)
+    sweep_detected: bool,
+    struct_score:   float,
+    decay_penalty:  int,
+) -> int:
+    """
+    Execution readiness score (0–100).
+    Trade proceeds when readiness >= threshold (default 65; micro: 55).
+
+    Components:
+      M5 aligned      → +35 (full EMA confirmation)
+      M5 recovery     → up to +30 (partial confirmation via momentum signals)
+      Macro momentum  → up to +20 (confidence engine momentum sub-score)
+      Liquidity sweep → +10 (institutional footprint present)
+      Structure       → up to +10 (structure score 0–25 scaled)
+    Decay penalty applied last (reduces readiness as setup ages).
+    """
+    score  = 35 if m5_aligned else 0
+    score += min(30, int(recovery_score * 0.30))
+    score += min(20, momentum)
+    score += 10 if sweep_detected else 0
+    score += min(10, int(struct_score / 2.5))
+    score -= decay_penalty
+    return max(0, min(100, score))
 
 
 # ── Fallback helpers ──────────────────────────────────────────────────────────
@@ -1494,16 +1603,25 @@ async def scan_symbol(
 
     # ── Multi-timeframe check: H1 → M5 alignment hierarchy ──────────────────
     # H1  defines the macro bias (EMA50/200 trend — hard requirement, already confirmed).
-    # M15 setup quality is evaluated via confluence scoring (FVG/FIB/sweep/OB) — NOT by
-    #     M15 EMA20 direction. In an H1 uptrend, valid BUY entries occur during M15 pullbacks
-    #     where price is below M15 EMA20. An EMA-based M15 check would block these entries.
+    # M15 setup quality is evaluated via confluence scoring — NOT by M15 EMA20 direction.
+    #     In an H1 uptrend, valid BUY entries occur during M15 pullbacks where price is
+    #     BELOW M15 EMA20. EMA-based M15 check would block the strategy's own entries.
     # M5  defines entry timing — may temporarily retrace during valid pullback entries.
-    #     When M5 conflicts with H1: enter WAIT STATE (not hard block).
-    #     Wait expires after m5_wait_minutes; M5 realignment → ENTRY CONFIRMED.
+    #     When M5 conflicts with H1: WAIT STATE (not hard block).
+    #     Fast invalidations (ATR/decay/momentum) run here.
+    #     Deep re-evaluation (sweep/BOS/readiness) runs after confluence scoring.
     _h1_dir = trend_result.direction   # "bullish" | "bearish"
     _h1_sig = "BUY" if _h1_dir == "bullish" else "SELL"
     _strict_cfg    = getattr(cfg, "strict_mode", None)
     _strict_active = _strict_cfg is not None and getattr(_strict_cfg, "enabled", False)
+
+    # ── MTF config ───────────────────────────────────────────────────────────
+    _mtf_cfg     = getattr(cfg, "mtf", None)
+    _m5_wait_ok  = _mtf_cfg is None or getattr(_mtf_cfg, "m5_wait_enabled", True)
+    _m5_wait_min = int(getattr(_mtf_cfg, "m5_wait_minutes", 45)) if _mtf_cfg else 45
+    if _in_micro_mode:
+        _micro_wmin  = int(getattr(_mtf_cfg, "m5_wait_minutes_micro", 25)) if _mtf_cfg else 25
+        _m5_wait_min = min(_m5_wait_min, _micro_wmin)
 
     # ── M5 direction via EMA20 ───────────────────────────────────────────────
     if candles_m5 and len(candles_m5) >= 22:
@@ -1512,52 +1630,82 @@ async def scan_symbol(
         _m5_dir    = "bullish" if _m5_closes[-1] > _m5_ema20[-1] else "bearish"
     else:
         _m5_dir = "neutral"
-    _m5_sig      = "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL")
-    _m5_aligned  = (_m5_dir == _h1_dir)
+    _m5_sig     = "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL")
+    _m5_aligned = (_m5_dir == _h1_dir)
 
-    # ── MTF wait state: M5 retracing → WAIT, not BLOCK ─────────────────────
-    _mtf_cfg     = getattr(cfg, "mtf", None)
-    _m5_wait_ok  = _mtf_cfg is None or getattr(_mtf_cfg, "m5_wait_enabled", True)
-    _m5_wait_min = int(getattr(_mtf_cfg, "m5_wait_minutes", 45)) if _mtf_cfg else 45
+    # ── Wait state fast-path checks ──────────────────────────────────────────
+    _in_wait_state   = False
+    _max_low_q_scans = 2 if _in_micro_mode else 3
 
     if symbol in _mtf_wait_signals:
-        _ws   = _mtf_wait_signals[symbol]
-        _now  = datetime.now(timezone.utc)
+        _ws          = _mtf_wait_signals[symbol]
+        _now         = datetime.now(timezone.utc)
+        _elapsed_min = (_now - _ws.stored_at).total_seconds() / 60.0
+        _fast_decay  = (
+            15 if _elapsed_min > 30 else
+            10 if _elapsed_min > 20 else
+            5  if _elapsed_min > 10 else 0
+        )
+        _fast_inv = None   # set to rejection label to trigger fast exit
+
         if _ws.direction != _h1_sig:
-            # Macro bias flipped — invalidate stale wait
-            log.info("[MTF WAIT INVALIDATED] %s macro bias changed %s→%s",
+            # Macro bias flipped — stale wait; allow fresh scan this cycle
+            log.info("[MTF WAIT INVALIDATED] %s macro bias %s→%s — resuming fresh scan",
                      symbol, _ws.direction, _h1_sig)
+            _wait_stats.setdefault(symbol, _WaitStats()).invalidated_waits += 1
             del _mtf_wait_signals[symbol]
-        elif _now > _ws.expires_at:
-            # Timed out — M5 never confirmed within the wait window
+
+        elif atr_pips < _min_atr:
             log.warning(
-                "[MTF WAIT EXPIRED] %s waited %d scans, M5=%s never aligned with H1=%s",
-                symbol, _ws.scan_count, _m5_sig, _h1_sig,
+                "[MTF WAIT INVALIDATED] %s ATR=%.1f < min=%.1f — market dormant, setup stale",
+                symbol, atr_pips, _min_atr,
             )
-            del _mtf_wait_signals[symbol]
-            _log_rejected(symbol, "MTF_WAIT_EXPIRED", confidence=confidence.total, atr=atr_pips)
-            return None
+            _fast_inv = "WAIT_ATR_COLLAPSE"
+
+        elif _fast_decay > 0 and (confidence.total - _fast_decay) < _conf_threshold:
+            log.warning(
+                "[MTF WAIT DECAY] %s eff_conf=%d (raw=%d − decay=%d) < threshold=%d "
+                "after %.0fm — invalidating",
+                symbol, confidence.total - _fast_decay, confidence.total,
+                _fast_decay, _conf_threshold, _elapsed_min,
+            )
+            _fast_inv = "WAIT_CONFIDENCE_DECAY"
+
         elif _m5_aligned:
-            # M5 confirmed → clear wait state, continue to execution
+            # M5 realigned — fast confirmation path; fall through to execution
             log.info(
-                "[ENTRY CONFIRMED] %s H1=%s M5=%s confirmed after %d scans — proceeding to execution",
-                symbol, _h1_sig, _m5_sig, _ws.scan_count,
+                "[ENTRY CONFIRMED] %s H1=%s M5=%s — EMA realigned after %d scans (%.0fm)",
+                symbol, _h1_sig, _m5_sig, _ws.scan_count, _elapsed_min,
             )
+            _wait_stats.setdefault(symbol, _WaitStats()).successful_waits += 1
             del _mtf_wait_signals[symbol]
-            # Fall through to execution below
+
         else:
-            # Still waiting for M5 to realign
-            _ws.scan_count += 1
-            log.info(
-                "[MTF WAITING] %s H1=%s M5=%s — scan %d/%s, expires %s",
-                symbol, _h1_sig, _m5_sig, _ws.scan_count,
-                "∞" if _m5_wait_min == 0 else str(_m5_wait_min) + "m",
-                _ws.expires_at.strftime("%H:%M:%S UTC"),
-            )
+            # Still waiting — track fast momentum quality, advance to deep re-eval
+            if confidence.momentum == 0:
+                _ws.low_quality_scans += 1
+                if _ws.low_quality_scans >= _max_low_q_scans:
+                    log.warning(
+                        "[MTF WAIT INVALIDATED] %s zero momentum for %d consecutive scans",
+                        symbol, _ws.low_quality_scans,
+                    )
+                    _fast_inv = "WAIT_QUALITY_DETERIORATED"
+            else:
+                _ws.low_quality_scans = max(0, _ws.low_quality_scans - 1)
+
+            if _fast_inv is None:
+                _ws.scan_count += 1
+                _in_wait_state = True
+
+        if _fast_inv is not None and symbol in _mtf_wait_signals:
+            _wait_stats.setdefault(symbol, _WaitStats()).invalidated_waits += 1
+            del _mtf_wait_signals[symbol]
+            _log_rejected(symbol, _fast_inv, confidence=confidence.total, atr=atr_pips)
             return None
+
     elif not _m5_aligned and _m5_wait_ok:
-        # M5 retracing against H1 — arm wait state, log SETUP DETECTED
-        _now = datetime.now(timezone.utc)
+        # M5 retracing against H1 — arm wait state
+        _now  = datetime.now(timezone.utc)
         _mtf_wait_signals[symbol] = _MtfWaitSignal(
             direction  = _h1_sig,
             macro_bias = _h1_dir,
@@ -1565,14 +1713,17 @@ async def scan_symbol(
             expires_at = _now + timedelta(minutes=_m5_wait_min),
             scan_count = 0,
         )
+        _wait_stats.setdefault(symbol, _WaitStats()).total_waits += 1
         log.info(
-            "[SETUP DETECTED] %s H1=%s M5=%s retracing — WAIT STATE armed (timeout=%dm, expires %s)",
+            "[SETUP DETECTED] %s H1=%s M5=%s retracing — WAIT STATE armed "
+            "(timeout=%dm, expires %s)",
             symbol, _h1_sig, _m5_sig, _m5_wait_min,
             (_now + timedelta(minutes=_m5_wait_min)).strftime("%H:%M:%S UTC"),
         )
         return None
+
     elif not _m5_aligned and not _m5_wait_ok:
-        # Wait state disabled in config — soft penalty only (conservative = hard block)
+        # Wait disabled in config — soft penalty (conservative = hard block)
         if mode.name == "conservative":
             _log_rejected(symbol, "MTF_M5_CONFLICT", confidence=confidence.total, atr=atr_pips)
             return None
@@ -1581,6 +1732,7 @@ async def scan_symbol(
             "[MTF WARN] %s H1=%s M5=%s — wait disabled, size_penalty=%.2f",
             symbol, _h1_sig, _m5_sig, _mtf_h4_size_penalty,
         )
+
     else:
         log.info("[MTF CHECK] %s H1=%s M5=%s → aligned", symbol, _h1_sig, _m5_sig)
 
@@ -1849,6 +2001,165 @@ async def scan_symbol(
             )
             _log_rejected(symbol, "MICRO_TIER_TOO_LOW",
                           confidence=decision.confidence, atr=atr_pips)
+            return None
+
+    # ── MTF wait deep re-evaluation (Phases 1, 3–6) ──────────────────────────
+    # Runs after confluence so sweep, struct, and all quality signals are available.
+    # Fast checks (ATR/decay/momentum) already ran in the MTF section above.
+    # This block decides: proceed to execution OR continue waiting OR invalidate.
+    if _in_wait_state and symbol in _mtf_wait_signals:
+        _ws          = _mtf_wait_signals[symbol]
+        _now         = datetime.now(timezone.utc)
+        _elapsed_min = (_now - _ws.stored_at).total_seconds() / 60.0
+        _decay_pen   = (
+            15 if _elapsed_min > 30 else
+            10 if _elapsed_min > 20 else
+            5  if _elapsed_min > 10 else 0
+        )
+        _wstats = _wait_stats.setdefault(symbol, _WaitStats())
+        _wstats.total_wait_scans += 1
+
+        # ── Phase 5: deep invalidation ───────────────────────────────────────
+        _opp_bos_dir = "sell" if _ws.direction == "BUY" else "buy"
+        if struct_result.bos_detected and _struct_dir == _opp_bos_dir:
+            log.warning(
+                "[MTF WAIT INVALIDATED] %s opposite BOS=%s formed against %s direction",
+                symbol, _struct_dir.upper(), _ws.direction,
+            )
+            _wstats.invalidated_waits += 1
+            del _mtf_wait_signals[symbol]
+            _log_rejected(symbol, "WAIT_OPPOSITE_BOS",
+                          confidence=confidence.total, atr=atr_pips)
+            return None
+
+        _disp_against = (
+            sweep_result.displacement
+            and (
+                (sweep_result.sweep_type == "sell_side" and _ws.direction == "BUY")
+                or (sweep_result.sweep_type == "buy_side"  and _ws.direction == "SELL")
+            )
+        )
+        if _disp_against:
+            log.warning(
+                "[MTF WAIT INVALIDATED] %s institutional displacement against %s — bias shifted",
+                symbol, _ws.direction,
+            )
+            _wstats.invalidated_waits += 1
+            del _mtf_wait_signals[symbol]
+            _log_rejected(symbol, "WAIT_DISPLACEMENT_AGAINST",
+                          confidence=confidence.total, atr=atr_pips)
+            return None
+
+        # ── Phase 1: Quality score re-evaluation ─────────────────────────────
+        _wait_quality = min(100, max(0,
+            min(60, confidence.momentum * 3)
+            + min(20, int(_struct_score / 25.0 * 20))
+            + (15 if sweep_result.detected else 0)
+            + (10 if atr_pips > _min_atr * 1.5 else 0)
+        ))
+        if _wait_quality < 30:
+            _ws.low_quality_scans += 1
+        else:
+            _ws.low_quality_scans = max(0, _ws.low_quality_scans - 1)
+
+        if _ws.low_quality_scans >= _max_low_q_scans:
+            log.warning(
+                "[MTF WAIT INVALIDATED] %s quality=%.0f deteriorated for %d consecutive scans "
+                "(sweep=%s struct=%.0f momentum=%d)",
+                symbol, _wait_quality, _ws.low_quality_scans,
+                sweep_result.detected, _struct_score, confidence.momentum,
+            )
+            _wstats.invalidated_waits += 1
+            del _mtf_wait_signals[symbol]
+            _log_rejected(symbol, "WAIT_QUALITY_DETERIORATED",
+                          confidence=confidence.total, atr=atr_pips)
+            return None
+
+        # ── Phase 4: Setup score improvement — reset timer on better setup ───
+        if _ws.stored_score == 0.0:
+            _ws.stored_score = confluence.total_score
+        elif confluence.total_score >= _ws.stored_score + 10.0:
+            log.info(
+                "[SETUP UPGRADED] %s confluence %.1f→%.1f (+%.1f) — timer reset, "
+                "fresh %dm window",
+                symbol, _ws.stored_score, confluence.total_score,
+                confluence.total_score - _ws.stored_score, _m5_wait_min,
+            )
+            _ws.stored_score      = confluence.total_score
+            _ws.scan_count        = 0
+            _ws.low_quality_scans = 0
+            _ws.stored_at         = _now
+            _ws.expires_at        = _now + timedelta(minutes=_m5_wait_min)
+
+        # ── Phase 3: M5 recovery momentum detection ──────────────────────────
+        _recovery = _m5_recovery_score(candles_m5 or [], _ws.direction, pip)
+
+        # ── Phase 6: Execution readiness score ───────────────────────────────
+        _readiness = _execution_readiness_score(
+            m5_aligned     = False,   # M5 not aligned (we're in wait state)
+            recovery_score = _recovery,
+            momentum       = confidence.momentum,
+            sweep_detected = sweep_result.detected,
+            struct_score   = _struct_score,
+            decay_penalty  = _decay_pen,
+        )
+        _readiness_threshold = 55 if _in_micro_mode else 65
+
+        # ── Timeout check ─────────────────────────────────────────────────────
+        if _now > _ws.expires_at:
+            log.warning(
+                "[MTF WAIT EXPIRED] %s — %d scans over %.0fm | "
+                "readiness=%d never reached %d | H1=%s M5=%s recovery=%d decay=-%d",
+                symbol, _ws.scan_count, _elapsed_min,
+                _readiness, _readiness_threshold,
+                _h1_sig, _m5_sig, _recovery, _decay_pen,
+            )
+            _wstats.expired_waits += 1
+            del _mtf_wait_signals[symbol]
+            _log_rejected(symbol, "MTF_WAIT_EXPIRED",
+                          confidence=confidence.total, atr=atr_pips)
+            return None
+
+        # ── Phase 7: analytics summary every 5 scans ─────────────────────────
+        if _ws.scan_count % 5 == 0:
+            log.info(
+                "[WAIT ANALYTICS] %s total=%d success=%d expired=%d invalidated=%d "
+                "scans=%d",
+                symbol,
+                _wstats.total_waits, _wstats.successful_waits,
+                _wstats.expired_waits, _wstats.invalidated_waits,
+                _wstats.total_wait_scans,
+            )
+
+        # ── Readiness gate: execute on recovery even without full M5 flip ─────
+        if _readiness >= _readiness_threshold:
+            log.info(
+                "[ENTRY CONFIRMED] %s H1=%s readiness=%d≥%d after %d scans (%.0fm) | "
+                "recovery=%d momentum=%d sweep=%s struct=%.0f decay=-%d",
+                symbol, _h1_sig,
+                _readiness, _readiness_threshold,
+                _ws.scan_count, _elapsed_min,
+                _recovery, confidence.momentum,
+                sweep_result.detected, _struct_score, _decay_pen,
+            )
+            _wstats.successful_waits += 1
+            del _mtf_wait_signals[symbol]
+            # Fall through to execution
+
+        else:
+            _ws.last_quality_score = float(_wait_quality)
+            _ws.last_momentum      = confidence.momentum
+            log.info(
+                "[MTF WAITING] %s H1=%s M5=%s | scan=%d elapsed=%.0fm "
+                "readiness=%d/%d recovery=%d quality=%.0f decay=-%d "
+                "low_q=%d/%d expires=%s",
+                symbol, _h1_sig, _m5_sig,
+                _ws.scan_count, _elapsed_min,
+                _readiness, _readiness_threshold,
+                _recovery, _wait_quality, _decay_pen,
+                _ws.low_quality_scans, _max_low_q_scans,
+                _ws.expires_at.strftime("%H:%M:%S UTC"),
+            )
             return None
 
     # ── Strict mode quality gates ─────────────────────────────────────────────
