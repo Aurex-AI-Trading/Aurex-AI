@@ -249,6 +249,34 @@ class _PendingSignal:
 _pending_signals: Dict[str, _PendingSignal] = {}
 
 
+# ── MTF entry wait state ──────────────────────────────────────────────────────
+
+@dataclass
+class _MtfWaitSignal:
+    """
+    Stored when H1+M15 agree on direction but M5 is temporarily retracing.
+
+    The bot does NOT immediately reject the setup.  Instead it enters a WAIT
+    state and rechecks every scan cycle.  When M5 realigns OR a confirmation
+    pattern fires (engulfing, momentum, BOS) the state machine advances to
+    READY_TO_EXECUTE and the trade proceeds.
+
+    State lifecycle:
+      SCANNING          → normal, no wait active
+      WAITING_M5        → H1/M15 aligned, M5 retracing
+      READY_TO_EXECUTE  → M5 confirmed (state cleared, trade proceeds)
+      INVALIDATED       → expired or setup conditions no longer valid
+    """
+    direction:   str       # "BUY" | "SELL" — the confirmed trade direction
+    macro_bias:  str       # H1 direction when stored ("bullish"|"bearish")
+    stored_at:   datetime
+    expires_at:  datetime  # timeout: setup invalidated after this time
+    scan_count:  int = 0   # number of scan cycles waited
+
+
+_mtf_wait_signals: Dict[str, _MtfWaitSignal] = {}
+
+
 # ── Fallback helpers ──────────────────────────────────────────────────────────
 
 def _fb_config(cfg: "Settings") -> "fb_mod.FallbackConfig":
@@ -1464,41 +1492,18 @@ async def scan_symbol(
                 )
             return None
 
-    # ── Multi-timeframe check: H1 → M15 → M5 alignment hierarchy ────────────
-    # H1  defines the macro bias (already confirmed via trend_result).
-    # M15 defines setup direction — must agree with H1.
-    # M5  defines entry timing — must agree with H1 to confirm execution.
-    # Strict mode: H1/M5 mismatch = hard block regardless of trading mode.
-    # Aggressive mode without strict: H1/M5 mismatch = 30% size reduction.
+    # ── Multi-timeframe check: H1 → M5 alignment hierarchy ──────────────────
+    # H1  defines the macro bias (EMA50/200 trend — hard requirement, already confirmed).
+    # M15 setup quality is evaluated via confluence scoring (FVG/FIB/sweep/OB) — NOT by
+    #     M15 EMA20 direction. In an H1 uptrend, valid BUY entries occur during M15 pullbacks
+    #     where price is below M15 EMA20. An EMA-based M15 check would block these entries.
+    # M5  defines entry timing — may temporarily retrace during valid pullback entries.
+    #     When M5 conflicts with H1: enter WAIT STATE (not hard block).
+    #     Wait expires after m5_wait_minutes; M5 realignment → ENTRY CONFIRMED.
     _h1_dir = trend_result.direction   # "bullish" | "bearish"
     _h1_sig = "BUY" if _h1_dir == "bullish" else "SELL"
-
-    # ── M15 direction via EMA20 ──────────────────────────────────────────────
-    if len(candles_m15) >= 22:
-        _m15_closes = [c.close for c in candles_m15]
-        _m15_ema20  = trend_mod.ema(_m15_closes, 20)
-        _m15_dir    = "bullish" if _m15_closes[-1] > _m15_ema20[-1] else "bearish"
-    else:
-        _m15_dir = "neutral"
-    _m15_sig = "BUY" if _m15_dir == "bullish" else ("SELL" if _m15_dir == "bearish" else "NEUTRAL")
-
-    # H1/M15 gate — setup direction must agree with macro bias
-    if _m15_dir != "neutral" and _m15_dir != _h1_dir:
-        log.warning(
-            "[MTF H1/M15] %s H1=%s M15=%s — setup disagrees with macro bias",
-            symbol, _h1_sig, _m15_sig,
-        )
-        if mode.name == "conservative":
-            _log_rejected(symbol, "MTF_M15_CONFLICT", confidence=confidence.total, atr=atr_pips)
-            return None
-        # Aggressive: apply penalty alongside any H1/H4 penalty already set
-        _mtf_h4_size_penalty = round(_mtf_h4_size_penalty * 0.8, 3)
-        log.warning(
-            "[MTF H1/M15 WARN] %s — H1/M15 mismatch, size_penalty now %.2f",
-            symbol, _mtf_h4_size_penalty,
-        )
-    else:
-        log.info("[MTF CHECK] %s H1=%s M15=%s → aligned", symbol, _h1_sig, _m15_sig)
+    _strict_cfg    = getattr(cfg, "strict_mode", None)
+    _strict_active = _strict_cfg is not None and getattr(_strict_cfg, "enabled", False)
 
     # ── M5 direction via EMA20 ───────────────────────────────────────────────
     if candles_m5 and len(candles_m5) >= 22:
@@ -1507,25 +1512,73 @@ async def scan_symbol(
         _m5_dir    = "bullish" if _m5_closes[-1] > _m5_ema20[-1] else "bearish"
     else:
         _m5_dir = "neutral"
-    _m5_sig = "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL")
+    _m5_sig      = "BUY" if _m5_dir == "bullish" else ("SELL" if _m5_dir == "bearish" else "NEUTRAL")
+    _m5_aligned  = (_m5_dir == _h1_dir)
 
-    # H1/M5 gate — entry timing must confirm macro direction
-    _strict_cfg    = getattr(cfg, "strict_mode", None)
-    _strict_active = _strict_cfg is not None and getattr(_strict_cfg, "enabled", False)
+    # ── MTF wait state: M5 retracing → WAIT, not BLOCK ─────────────────────
+    _mtf_cfg     = getattr(cfg, "mtf", None)
+    _m5_wait_ok  = _mtf_cfg is None or getattr(_mtf_cfg, "m5_wait_enabled", True)
+    _m5_wait_min = int(getattr(_mtf_cfg, "m5_wait_minutes", 45)) if _mtf_cfg else 45
 
-    if _m5_dir == "neutral" or _m5_dir != _h1_dir:
-        if mode.name == "conservative" or _strict_active:
+    if symbol in _mtf_wait_signals:
+        _ws   = _mtf_wait_signals[symbol]
+        _now  = datetime.now(timezone.utc)
+        if _ws.direction != _h1_sig:
+            # Macro bias flipped — invalidate stale wait
+            log.info("[MTF WAIT INVALIDATED] %s macro bias changed %s→%s",
+                     symbol, _ws.direction, _h1_sig)
+            del _mtf_wait_signals[symbol]
+        elif _now > _ws.expires_at:
+            # Timed out — M5 never confirmed within the wait window
             log.warning(
-                "[MTF BLOCK] %s H1=%s M5=%s — entry timing conflict, blocking [%s]",
-                symbol, _h1_sig, _m5_sig,
-                "conservative" if mode.name == "conservative" else "strict_mode",
+                "[MTF WAIT EXPIRED] %s waited %d scans, M5=%s never aligned with H1=%s",
+                symbol, _ws.scan_count, _m5_sig, _h1_sig,
             )
+            del _mtf_wait_signals[symbol]
+            _log_rejected(symbol, "MTF_WAIT_EXPIRED", confidence=confidence.total, atr=atr_pips)
+            return None
+        elif _m5_aligned:
+            # M5 confirmed → clear wait state, continue to execution
+            log.info(
+                "[ENTRY CONFIRMED] %s H1=%s M5=%s confirmed after %d scans — proceeding to execution",
+                symbol, _h1_sig, _m5_sig, _ws.scan_count,
+            )
+            del _mtf_wait_signals[symbol]
+            # Fall through to execution below
+        else:
+            # Still waiting for M5 to realign
+            _ws.scan_count += 1
+            log.info(
+                "[MTF WAITING] %s H1=%s M5=%s — scan %d/%s, expires %s",
+                symbol, _h1_sig, _m5_sig, _ws.scan_count,
+                "∞" if _m5_wait_min == 0 else str(_m5_wait_min) + "m",
+                _ws.expires_at.strftime("%H:%M:%S UTC"),
+            )
+            return None
+    elif not _m5_aligned and _m5_wait_ok:
+        # M5 retracing against H1 — arm wait state, log SETUP DETECTED
+        _now = datetime.now(timezone.utc)
+        _mtf_wait_signals[symbol] = _MtfWaitSignal(
+            direction  = _h1_sig,
+            macro_bias = _h1_dir,
+            stored_at  = _now,
+            expires_at = _now + timedelta(minutes=_m5_wait_min),
+            scan_count = 0,
+        )
+        log.info(
+            "[SETUP DETECTED] %s H1=%s M5=%s retracing — WAIT STATE armed (timeout=%dm, expires %s)",
+            symbol, _h1_sig, _m5_sig, _m5_wait_min,
+            (_now + timedelta(minutes=_m5_wait_min)).strftime("%H:%M:%S UTC"),
+        )
+        return None
+    elif not _m5_aligned and not _m5_wait_ok:
+        # Wait state disabled in config — soft penalty only (conservative = hard block)
+        if mode.name == "conservative":
             _log_rejected(symbol, "MTF_M5_CONFLICT", confidence=confidence.total, atr=atr_pips)
             return None
-        # Aggressive without strict: reduce size rather than block
         _mtf_h4_size_penalty = round(_mtf_h4_size_penalty * 0.7, 3)
         log.warning(
-            "[MTF WARN] %s H1=%s M5=%s — entry timing mismatch, size_penalty=%.2f",
+            "[MTF WARN] %s H1=%s M5=%s — wait disabled, size_penalty=%.2f",
             symbol, _h1_sig, _m5_sig, _mtf_h4_size_penalty,
         )
     else:

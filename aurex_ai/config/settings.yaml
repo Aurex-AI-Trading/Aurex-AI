@@ -274,14 +274,22 @@ modes:
 # Enable by setting enabled: true here OR by passing --strict at CLI.
 strict_mode:
   enabled:               true    # hard quality gate active
-  require_bos:           true    # require confirmed BOS (not just trend bias or fallback credit)
-  min_confirmation_score: 5      # minimum candle pattern score (engulfing=10, wick=7, momentum=6)
-  min_liquidity_score:   6.0     # minimum sweep strength (0–20); 6 = weak swing sweep qualifies
+  require_bos:           false   # BOS rarely fires — structure_score gate below is the real guard
+  min_confirmation_score: 0      # 0 = disabled; already a size penalty via _entry_conf_factor
+  min_liquidity_score:   0.0     # 0 = disabled; sweep quality already weighted in confluence score
   min_structure_score:   5.0     # minimum structure score (0–25); 5 = trend-bias minimum
   block_split_votes:     true    # block when |buy_votes − sell_votes| < require_vote_margin
   require_vote_margin:   1       # minimum vote margin: 2B/0S passes, 1B/1S blocked
   tier1_only:            false   # true → only Tier1 full-size trades (Tier2 blocked)
   min_confidence:        55      # strict confidence floor (0 = use mode default)
+
+# ── Multi-timeframe wait state ────────────────────────────────────────────────
+# Controls M5 wait state behaviour. When H1 direction is clear but M5 is temporarily
+# retracing (normal pullback), the bot waits for M5 realignment instead of blocking.
+# Disable m5_wait_enabled to revert to the old penalty-only behaviour.
+mtf:
+  m5_wait_enabled:  true   # true = WAIT STATE; false = hard block / size penalty
+  m5_wait_minutes:  45     # minutes before an unconfirmed SETUP DETECTED expires
 
 # ── Micro account safety mode ─────────────────────────────────────────────────
 # Auto-activates when live account balance falls below balance_threshold.
