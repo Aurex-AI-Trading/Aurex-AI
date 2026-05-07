@@ -6,19 +6,19 @@
       "total_pnl": 204.48,
       "total_rr": 18.0
     },
-    "USDJPY": {
+    "USDJPY.Z": {
       "trades": 7,
       "wins": 1,
       "total_pnl": -0.5299999999999996,
       "total_rr": 14.0
     },
-    "EURUSD": {
+    "EURUSD.Z": {
       "trades": 10,
       "wins": 1,
       "total_pnl": -28.800000000000004,
       "total_rr": 19.95
     },
-    "GBPUSD": {
+    "GBPUSD.Z": {
       "trades": 1,
       "wins": 0,
       "total_pnl": 0.0,

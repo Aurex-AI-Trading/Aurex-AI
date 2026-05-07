@@ -4,10 +4,15 @@
 # ============================================================
 
 # ── Trading symbols ───────────────────────────────────────────
+# Use full broker symbol names as displayed in MT5 Market Watch.
+# HFM Premium appends .Z to all FX pairs.
+# Change broker_suffix to match your broker (e.g. ".m", ".pro", ".ecn", "").
+broker_suffix: ".Z"
+
 symbols:
-  - EURUSD
-  - USDJPY
-  - GBPUSD
+  - EURUSD.Z
+  - USDJPY.Z
+  - GBPUSD.Z
 
 # ── Risk management ───────────────────────────────────────────
 risk:

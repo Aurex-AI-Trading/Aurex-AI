@@ -14,7 +14,7 @@ NONE direction always maps to SKIP regardless of score.
 
 Log output:
   [DECISION ENGINE]
-  symbol=EURUSD  direction=BUY  score=82.0
+  symbol=EURUSD.Z  direction=BUY  score=82.0
   trend=22.5  liquidity=18.0  fvg=15.0  fib=12.0  ema=8.0  confirmation=9.0
   ob=12.0  breakout=9.0
   votes=3B/0S  tier=1  decision=EXECUTE

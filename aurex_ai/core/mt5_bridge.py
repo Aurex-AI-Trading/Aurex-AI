@@ -57,7 +57,7 @@ def is_mt5_time_fresh() -> bool:
     return _mt5_time_fresh
 
 
-def log_time_sync_banner(symbol: str = "EURUSD") -> None:
+def log_time_sync_banner(symbol: str = "EURUSD.Z") -> None:
     """
     Log a startup time-sync validation banner comparing local PC time to MT5 broker time.
 
@@ -104,7 +104,7 @@ def log_time_sync_banner(symbol: str = "EURUSD") -> None:
     )
 
 
-def get_mt5_time(symbol: str = "EURUSD") -> _dt.datetime:
+def get_mt5_time(symbol: str = "EURUSD.Z") -> _dt.datetime:
     """
     Return the current MT5 broker server time as a UTC-aware datetime.
 
@@ -560,9 +560,21 @@ class MT5Bridge:
         return result
 
     def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
-        """Return symbol metadata (point, digits, trade_contract_size, etc.)."""
+        """Return symbol metadata (point, digits, trade_contract_size, etc.).
+
+        Lookup order in simulation mode:
+            1. Exact match  (e.g. "EURUSD.Z")
+            2. Base symbol  (e.g. "EURUSD" — for no-suffix brokers)
+            3. DEFAULT      (safe fallback for unsupported symbols)
+        """
         if not _MT5_AVAILABLE or not self._connected:
-            return _SIM_SYMBOL_INFO.get(symbol.upper(), _SIM_SYMBOL_INFO["DEFAULT"])
+            sym_up = symbol.upper()
+            if sym_up in _SIM_SYMBOL_INFO:
+                return _SIM_SYMBOL_INFO[sym_up]
+            # Try stripping broker suffix for backward compat
+            from aurex_ai.core.symbol_mapper import strip_suffix
+            base_up = strip_suffix(sym_up).upper()
+            return _SIM_SYMBOL_INFO.get(base_up, _SIM_SYMBOL_INFO["DEFAULT"])
         self._ensure_symbol(symbol)
         info = mt5.symbol_info(symbol)
         if info is None:
@@ -953,12 +965,32 @@ class _SimAccountInfo:
     leverage   = 100
 
 
+# Simulation symbol specs — keyed by HFM Premium broker names (.Z suffix).
+# get_symbol_info() falls back through: exact match → base match → DEFAULT.
+# This makes the bridge work correctly for both suffixed and bare-symbol brokers.
 _SIM_SYMBOL_INFO: Dict[str, Dict] = {
     "DEFAULT": {
         "point": 0.00001, "digits": 5, "trade_contract_size": 100_000,
         "volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01,
         "trade_tick_value": 1.0, "trade_tick_size": 0.00001,
     },
+    # ── HFM Premium (.Z suffix) ───────────────────────────────
+    "EURUSD.Z": {
+        "point": 0.00001, "digits": 5, "trade_contract_size": 100_000,
+        "volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01,
+        "trade_tick_value": 1.0, "trade_tick_size": 0.00001,
+    },
+    "GBPUSD.Z": {
+        "point": 0.00001, "digits": 5, "trade_contract_size": 100_000,
+        "volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01,
+        "trade_tick_value": 1.0, "trade_tick_size": 0.00001,
+    },
+    "USDJPY.Z": {
+        "point": 0.001,   "digits": 3, "trade_contract_size": 100_000,
+        "volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01,
+        "trade_tick_value": 0.91, "trade_tick_size": 0.001,
+    },
+    # ── Bare symbols (no-suffix brokers / backward compatibility) ─
     "EURUSD": {
         "point": 0.00001, "digits": 5, "trade_contract_size": 100_000,
         "volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01,

@@ -127,7 +127,7 @@ def _score(
 def analyze(
     candles:       List[Candle],
     price:         float,
-    symbol:        str                  = "EURUSD",
+    symbol:        str                  = "EURUSD.Z",
     lookback:      int                  = 50,
     fib_ratios:    Optional[List[float]]= None,
     golden_zone:   Tuple[float, float]  = (0.5, 0.705),

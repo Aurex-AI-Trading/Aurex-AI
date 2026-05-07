@@ -133,7 +133,7 @@ class TradeLogger:
 
     Usage:
         tl = TradeLogger.get_instance()
-        tl.log_open(ticket=12345, signal_id="EURUSD-7", ...)
+        tl.log_open(ticket=12345, signal_id="EURUSD.Z-7", ...)
         tl.log_close(ticket=12345, result="WIN", profit_usd=42.5, pips=28.0)
     """
 

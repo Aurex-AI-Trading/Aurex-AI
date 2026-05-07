@@ -80,10 +80,10 @@ class PerformanceTracker:
     Usage:
         tracker = PerformanceTracker.get_instance()
         tracker.record_trade(
-            symbol="EURUSD", tier=1, setup_type="FVG+OB",
+            symbol="EURUSD.Z", tier=1, setup_type="FVG+OB",
             won=True, pnl=45.0, rr=2.1,
         )
-        wr = tracker.get_win_rate("symbol", "EURUSD")
+        wr = tracker.get_win_rate("symbol", "EURUSD.Z")
     """
     _instance: Optional["PerformanceTracker"] = None
 

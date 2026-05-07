@@ -23,10 +23,10 @@ Design constraints:
   - All SL/TP and position sizing delegated to the existing risk_manager
 
 Logging examples:
-  [FALLBACK DEBUG] EURUSD idle=5 threshold=5 session=london atr=14.2 -> TRIGGER
-  [FALLBACK] EURUSD BUY (trend+momentum) | strength=0.42
-  [FALLBACK DEBUG] GBPUSD idle=3 threshold=5 session=asian atr=6.1 -> SKIP (idle<threshold)
-  [FALLBACK DEBUG] USDJPY spread=4.2 pips > max=3.0 -> SKIP (spread too wide)
+  [FALLBACK DEBUG] EURUSD.Z idle=5 threshold=5 session=london atr=14.2 -> TRIGGER
+  [FALLBACK] EURUSD.Z BUY (trend+momentum) | strength=0.42
+  [FALLBACK DEBUG] GBPUSD.Z idle=3 threshold=5 session=asian atr=6.1 -> SKIP (idle<threshold)
+  [FALLBACK DEBUG] USDJPY.Z spread=4.2 pips > max=3.0 -> SKIP (spread too wide)
 """
 from __future__ import annotations
 

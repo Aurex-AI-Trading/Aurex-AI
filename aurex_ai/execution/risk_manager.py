@@ -196,7 +196,7 @@ def calculate(
     candles_m15:    List[Candle],
     sweep:          SweepResult,        # kept for call-site compatibility; not used for SL
     symbol_info:    Dict[str, Any],
-    symbol:         str   = "EURUSD",
+    symbol:         str   = "EURUSD.Z",
     risk_pct:       float = 1.0,
     min_rr:         float = 1.5,        # reject trade if RR < this
     tp_fixed_rr:    float = 2.5,        # kept for call-site compatibility

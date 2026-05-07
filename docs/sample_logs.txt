@@ -8,12 +8,12 @@
 2026-04-29 08:15:01 INFO     main — [HEARTBEAT] cycle=1 timestamp=2026-04-29 08:15:01 symbols=6 trades_today=0 open=0 idle=0
 2026-04-29 08:15:01 INFO     main — [SCAN START] cycle=1 symbols=6
 
-── EURUSD ───────────────────────────────────────────────────────────────────────
+── EURUSD.Z ───────────────────────────────────────────────────────────────────────
 
-2026-04-29 08:15:02 INFO     main — [SYMBOL] EURUSD price=1.08432
+2026-04-29 08:15:02 INFO     main — [SYMBOL] EURUSD.Z price=1.08432
 
 2026-04-29 08:15:02 INFO     strategy.confluence —
-[ANALYSIS] EURUSD
+[ANALYSIS] EURUSD.Z
   Trend:        bullish     +22.0 /25
   Liquidity:    sell_side   +16.0 /20
   FVG:          yes         +15.0 /20
@@ -30,7 +30,7 @@
 
 2026-04-29 08:15:02 WARNING  execution.decision —
 [DECISION ENGINE]
-  symbol=EURUSD  direction=BUY  score=94.0
+  symbol=EURUSD.Z  direction=BUY  score=94.0
   trend=22.0  liquidity=16.0  fvg=15.0  fib=12.0  ema=8.0  confirmation=9.0
   ob=12.0  breakout=0.0
   votes=3B/0S  tier=1  decision=EXECUTE
@@ -38,7 +38,7 @@
 
 2026-04-29 08:15:02 WARNING  ai.optimizer —
 [OPTIMIZER]
-  Symbol:      EURUSD
+  Symbol:      EURUSD.Z
   Direction:   BUY
   ATR:         14.2 pips
   Original SL: 20.0 pips → Adjusted: 20.0 pips
@@ -46,7 +46,7 @@
   Lot size:    0.10 → 0.10 (mult=1.00)
   Reason:      No adjustments
 
-2026-04-29 08:15:03 WARNING  main — [TRADE OPENED] EURUSD BUY | tier=1 setup=FVG+OB score=94.0 rr=2.25 lot=0.10 ticket=12345001
+2026-04-29 08:15:03 WARNING  main — [TRADE OPENED] EURUSD.Z BUY | tier=1 setup=FVG+OB score=94.0 rr=2.25 lot=0.10 ticket=12345001
 
 ── XAUUSD ───────────────────────────────────────────────────────────────────────
 
@@ -88,12 +88,12 @@
 
 2026-04-29 08:15:04 WARNING  main — [TRADE OPENED] XAUUSD BUY | tier=2 setup=FVG score=61.0 rr=2.25 lot=0.04 ticket=12345002
 
-── GBPUSD ───────────────────────────────────────────────────────────────────────
+── GBPUSD.Z ───────────────────────────────────────────────────────────────────────
 
-2026-04-29 08:15:04 INFO     main — [SYMBOL] GBPUSD price=1.26781
+2026-04-29 08:15:04 INFO     main — [SYMBOL] GBPUSD.Z price=1.26781
 
 2026-04-29 08:15:04 INFO     strategy.confluence —
-[ANALYSIS] GBPUSD
+[ANALYSIS] GBPUSD.Z
   Trend:        bearish     +20.0 /25
   Liquidity:    buy_side    +14.0 /20
   FVG:          no          + 0.0 /20
@@ -108,15 +108,15 @@
   TOTAL SCORE:  43.0  → SKIP (no consensus)
   Votes:        1B / 1S   Direction: NONE
 
-2026-04-29 08:15:04 INFO     execution.decision — [DECISION ENGINE] symbol=GBPUSD direction=NONE score=43.0 tier=0 decision=SKIP
-2026-04-29 08:15:04 INFO     main — [SKIP] symbol=GBPUSD reason=no_consensus score=43.0
+2026-04-29 08:15:04 INFO     execution.decision — [DECISION ENGINE] symbol=GBPUSD.Z direction=NONE score=43.0 tier=0 decision=SKIP
+2026-04-29 08:15:04 INFO     main — [SKIP] symbol=GBPUSD.Z reason=no_consensus score=43.0
 
-── USDJPY ───────────────────────────────────────────────────────────────────────
+── USDJPY.Z ───────────────────────────────────────────────────────────────────────
 
-2026-04-29 08:15:05 INFO     main — [SYMBOL] USDJPY price=154.230
+2026-04-29 08:15:05 INFO     main — [SYMBOL] USDJPY.Z price=154.230
 
 2026-04-29 08:15:05 INFO     strategy.confluence —
-[ANALYSIS] USDJPY
+[ANALYSIS] USDJPY.Z
   Trend:        bearish     +25.0 /25
   Liquidity:    sell_side   +18.0 /20
   FVG:          no          + 0.0 /20
@@ -133,7 +133,7 @@
 
 2026-04-29 08:15:05 WARNING  execution.decision —
 [DECISION ENGINE]
-  symbol=USDJPY  direction=SELL  score=79.0
+  symbol=USDJPY.Z  direction=SELL  score=79.0
   trend=25.0  liquidity=18.0  fvg=0.0  fib=11.0  ema=9.0  confirmation=8.0
   ob=8.0  breakout=0.0
   votes=0B/2S  tier=1  decision=EXECUTE
@@ -141,7 +141,7 @@
 
 2026-04-29 08:15:05 WARNING  ai.optimizer —
 [OPTIMIZER]
-  Symbol:      USDJPY
+  Symbol:      USDJPY.Z
   Direction:   SELL
   ATR:         98.1 pips
   Original SL: 20.0 pips → Adjusted: 20.0 pips
@@ -149,7 +149,7 @@
   Lot size:    0.08 → 0.06 (mult=0.75)
   Reason:      Symbol WR 46% (low)
 
-2026-04-29 08:15:06 WARNING  main — [TRADE OPENED] USDJPY SELL | tier=1 setup=OB+Sweep score=79.0 rr=2.25 lot=0.06 ticket=12345003
+2026-04-29 08:15:06 WARNING  main — [TRADE OPENED] USDJPY.Z SELL | tier=1 setup=OB+Sweep score=79.0 rr=2.25 lot=0.06 ticket=12345003
 
 ── Scan complete ─────────────────────────────────────────────────────────────────
 
@@ -161,10 +161,10 @@
 ================================================================================
 
 2026-04-29 00:00:01 WARNING  ai.learning_engine — [LEARNING] Daily snapshot | trades=127 wr=58.3% avg_rr=2.18 pnl=3241.50
-2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   EURUSD  trades=42  wr=61.9%
+2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   EURUSD.Z  trades=42  wr=61.9%
 2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   XAUUSD  trades=38  wr=55.3%
-2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   USDJPY  trades=28  wr=57.1%
-2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   GBPUSD  trades=19  wr=52.6%
+2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   USDJPY.Z  trades=28  wr=57.1%
+2026-04-29 00:00:01 INFO     ai.learning_engine — [LEARNING]   GBPUSD.Z  trades=19  wr=52.6%
 2026-04-29 00:00:02 WARNING  ai.weight_adjuster — [LEARNING] Weight adjustment applied: {'fvg': 1, 'order_block': 1, 'ema': -1} | total_trades=127 overall_wr=58.3%
 
 ================================================================================

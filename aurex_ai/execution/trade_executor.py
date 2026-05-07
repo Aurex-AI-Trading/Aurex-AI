@@ -33,9 +33,47 @@ from aurex_ai.core.logger import get_logger
 
 log = get_logger("execution.executor")
 
-# Hard symbol whitelist — only these instruments are permitted to reach MT5.
-# To add a symbol: update settings.yaml AND add it here (two-gate enforcement).
-ALLOWED_SYMBOLS = {"EURUSD", "USDJPY", "GBPUSD"}
+# Hard symbol whitelist — only symbols declared in settings.yaml reach MT5.
+# Populated at startup by _load_allowed_symbols(); never mutated after that.
+# Includes both bare and suffixed forms so validation passes regardless of
+# how callers format the symbol (EURUSD or EURUSD.Z both allowed).
+ALLOWED_SYMBOLS: frozenset = frozenset()   # replaced by _load_allowed_symbols()
+
+
+def _load_allowed_symbols(cfg=None) -> frozenset:
+    """
+    Build the executor whitelist from config.
+
+    Reads cfg.symbols (list of broker symbols, e.g. ["EURUSD.Z", ...]) and
+    cfg.broker_suffix (e.g. ".Z") to construct a frozenset that accepts both
+    bare and suffixed forms.  Falls back to hardcoded HFM Premium defaults if
+    cfg is not supplied.
+
+    Call once at startup:
+        from aurex_ai.execution.trade_executor import _load_allowed_symbols
+        _load_allowed_symbols(cfg)
+    """
+    global ALLOWED_SYMBOLS
+    from aurex_ai.core.symbol_mapper import expand_allowed_set, BASE_SYMBOLS
+    try:
+        broker_symbols = list(cfg.symbols) if cfg else []
+        suffix = str(getattr(cfg, "broker_suffix", ".Z") or "") if cfg else ".Z"
+    except Exception:
+        broker_symbols = []
+        suffix = ".Z"
+
+    if broker_symbols:
+        from aurex_ai.core.symbol_mapper import get_base_symbols
+        bases = get_base_symbols(broker_symbols)
+    else:
+        bases = BASE_SYMBOLS
+
+    ALLOWED_SYMBOLS = expand_allowed_set(bases, suffix)
+    log.info(
+        "[EXECUTOR] Allowed symbols whitelist: %s",
+        sorted(ALLOWED_SYMBOLS),
+    )
+    return ALLOWED_SYMBOLS
 
 
 @dataclass
@@ -102,7 +140,8 @@ async def execute(
             dry_run=bridge.dry_run, signal_id=signal_id,
         )
 
-    # Hard symbol whitelist — EURUSD, USDJPY, GBPUSD only.
+    # Hard symbol whitelist — only symbols declared in settings.yaml.
+    # Accepts both bare (EURUSD) and broker-suffixed (EURUSD.Z) forms.
     # Any other symbol is a misconfiguration or injection; block unconditionally.
     if symbol.upper() not in ALLOWED_SYMBOLS:
         log.error(

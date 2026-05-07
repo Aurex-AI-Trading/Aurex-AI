@@ -6,7 +6,7 @@ Run modes:
     python aurex_ai/main.py --dry-run                # force dry-run
     python aurex_ai/main.py --live                   # force live orders
     python aurex_ai/main.py --backtest               # walk-forward backtest
-    python aurex_ai/main.py --symbols EURUSD USDJPY  # override symbol list
+    python aurex_ai/main.py --symbols EURUSD.Z USDJPY.Z  # override symbol list
     python aurex_ai/main.py --config /path/to/settings.yaml
 
 Or as a module:
@@ -46,7 +46,7 @@ from aurex_ai.execution.scoring_model    import compute_ema_score, compute_confi
 from aurex_ai.execution.decision_engine  import decide, Decision
 from aurex_ai.execution.risk_manager     import calculate as calc_risk
 from aurex_ai.execution.cooldown_manager import CooldownManager
-from aurex_ai.execution.trade_executor   import execute, TradeResult
+from aurex_ai.execution.trade_executor   import execute, TradeResult, _load_allowed_symbols
 from aurex_ai.execution.confidence_engine import (
     compute_confidence, MIN_TRADE_CONFIDENCE, get_confidence_threshold,
 )
@@ -2911,7 +2911,7 @@ def _parse_args() -> argparse.Namespace:
         epilog = (
             "Examples:\n"
             "  python aurex_ai/main.py --dry-run\n"
-            "  python aurex_ai/main.py --live --symbols EURUSD USDJPY GBPUSD\n"
+            "  python aurex_ai/main.py --live --symbols EURUSD.Z USDJPY.Z GBPUSD.Z\n"
             "  python aurex_ai/main.py --backtest --data-dir ./data/backtest\n"
         ),
     )
@@ -2922,7 +2922,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--live", action="store_true", default=None,
         help="Force live trading mode")
     p.add_argument("--symbols", nargs="+", metavar="SYM",
-        help="Limit symbol list (e.g. --symbols EURUSD USDJPY GBPUSD)")
+        help="Limit symbol list (e.g. --symbols EURUSD.Z USDJPY.Z GBPUSD.Z)")
     p.add_argument("--backtest", action="store_true",
         help="Walk-forward backtest using CSV data")
     p.add_argument("--data-dir", metavar="DIR",
@@ -3081,6 +3081,10 @@ def main() -> None:
 
     symbols: List[str] = args.symbols if args.symbols else list(cfg.symbols)
 
+    # Initialise executor whitelist from config (broker-suffixed symbols).
+    # Must run before any scan_symbol() call reaches trade_executor.execute().
+    _load_allowed_symbols(cfg)
+
     configure_logging(
         level        = cfg.logging.level,
         log_dir      = cfg.logging.dir,
@@ -3120,9 +3124,53 @@ def main() -> None:
         log.error("MT5 connection failed — aborting startup")
         sys.exit(1)
 
+    # ── Broker suffix detection + symbol validation ───────────────────────────
+    # Detect the broker's suffix from live MT5 Market Watch, then ensure every
+    # configured symbol is visible and tradeable before the scan loop starts.
+    from aurex_ai.core.symbol_mapper import (
+        detect_broker_suffix, ensure_visible, validate_symbol, log_symbol_config,
+    )
+    try:
+        import MetaTrader5 as _mt5_mod
+    except ImportError:
+        _mt5_mod = None
+
+    _detected_suffix = detect_broker_suffix(_mt5_mod, base_symbols=None)
+    _cfg_suffix      = str(getattr(cfg, "broker_suffix", ".Z") or "")
+    if _detected_suffix and _detected_suffix != _cfg_suffix:
+        log.warning(
+            "[STARTUP] Detected broker suffix '%s' differs from config '%s' — "
+            "using detected value.  Update broker_suffix in settings.yaml to silence.",
+            _detected_suffix, _cfg_suffix,
+        )
+        _active_suffix = _detected_suffix
+    else:
+        _active_suffix = _cfg_suffix
+
+    log_symbol_config(symbols, _active_suffix, broker_name=cfg.mt5.server or "")
+
+    _invalid_symbols = []
+    for _sym in symbols:
+        _ok, _reason = validate_symbol(_sym, _mt5_mod if not bridge.dry_run else None)
+        if not _ok:
+            log.error(
+                "[STARTUP] Symbol %s failed pre-trade validation: %s — "
+                "this symbol will be skipped by the scan loop",
+                _sym, _reason,
+            )
+            _invalid_symbols.append(_sym)
+        else:
+            log.warning("[STARTUP] Symbol %s → validated OK", _sym)
+
+    if _invalid_symbols and not bridge.dry_run:
+        log.warning(
+            "[STARTUP] %d/%d symbols failed validation: %s — "
+            "trading will proceed on remaining valid symbols only",
+            len(_invalid_symbols), len(symbols), _invalid_symbols,
+        )
+
     # Time-sync validation: log local vs MT5 broker time once at startup.
-    # All subsequent trading logic uses get_mt5_time() — this is for human verification only.
-    log_time_sync_banner(symbol=symbols[0] if symbols else "EURUSD")
+    log_time_sync_banner(symbol=symbols[0] if symbols else "EURUSD.Z")
 
     log.warning(
         "[STARTUP] MT5 connected OK | symbols=%d | mode=%s | scan_interval=%ds "

@@ -12,7 +12,7 @@ Adjustments applied (in order):
 
 Log output:
   [OPTIMIZER]
-  Symbol:      EURUSD
+  Symbol:      EURUSD.Z
   Direction:   BUY
   ATR:         18.3 pips
   Original SL: 20.0 pips -> Adjusted: 28.0 pips

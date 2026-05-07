@@ -104,7 +104,7 @@ def _score_zone(price: float, zone: FVGZone) -> Tuple[float, bool, str]:
 def analyze(
     candles:       List[Candle],
     price:         float,
-    symbol:        str   = "EURUSD",
+    symbol:        str   = "EURUSD.Z",
     lookback:      int   = 50,
     min_size_pips: float = 1.0,
     pip_size:      float = 0.0001,

@@ -12,7 +12,7 @@
     "timestamp": "2026-05-01T09:20:02+00:00"
   },
   {
-    "symbol": "USDJPY",
+    "symbol": "USDJPY.Z",
     "direction": "SELL",
     "confidence": 68.0,
     "strength": 8.7,
@@ -24,7 +24,7 @@
     "timestamp": "2026-05-01T09:45:17+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 53.0,
     "strength": 20.0,
@@ -36,7 +36,7 @@
     "timestamp": "2026-05-01T12:25:52+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 57.0,
     "strength": 0.0,
@@ -60,7 +60,7 @@
     "timestamp": "2026-05-01T16:55:24+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 57.0,
     "strength": 0.0,
@@ -84,7 +84,7 @@
     "timestamp": "2026-05-01T17:52:56+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 59.0,
     "strength": 0.0,
@@ -96,7 +96,7 @@
     "timestamp": "2026-05-01T18:26:13+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 61.0,
     "strength": 0.0,
@@ -108,7 +108,7 @@
     "timestamp": "2026-05-01T18:50:45+00:00"
   },
   {
-    "symbol": "USDJPY",
+    "symbol": "USDJPY.Z",
     "direction": "SELL",
     "confidence": 73.0,
     "strength": 9.1,
@@ -120,7 +120,7 @@
     "timestamp": "2026-05-01T18:51:00+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 75.0,
     "strength": 0.0,
@@ -132,7 +132,7 @@
     "timestamp": "2026-05-01T20:34:32+00:00"
   },
   {
-    "symbol": "USDJPY",
+    "symbol": "USDJPY.Z",
     "direction": "SELL",
     "confidence": 71.0,
     "strength": 9.1,
@@ -144,7 +144,7 @@
     "timestamp": "2026-05-01T21:10:20+00:00"
   },
   {
-    "symbol": "USDJPY",
+    "symbol": "USDJPY.Z",
     "direction": "SELL",
     "confidence": 72.0,
     "strength": 0.0,
@@ -180,7 +180,7 @@
     "timestamp": "2026-05-04T09:45:27+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 46.0,
     "strength": 0.0,
@@ -240,7 +240,7 @@
     "timestamp": "2026-05-04T18:23:28+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 61.0,
     "strength": 0.0,
@@ -252,7 +252,7 @@
     "timestamp": "2026-05-04T18:24:11+00:00"
   },
   {
-    "symbol": "USDJPY",
+    "symbol": "USDJPY.Z",
     "direction": "SELL",
     "confidence": 60.0,
     "strength": 0.0,
@@ -264,7 +264,7 @@
     "timestamp": "2026-05-04T15:42:59.338082+00:00"
   },
   {
-    "symbol": "USDJPY",
+    "symbol": "USDJPY.Z",
     "direction": "SELL",
     "confidence": 52.0,
     "strength": 11.3,
@@ -276,7 +276,7 @@
     "timestamp": "2026-05-05T10:30:10+00:00"
   },
   {
-    "symbol": "GBPUSD",
+    "symbol": "GBPUSD.Z",
     "direction": "BUY",
     "confidence": 52.0,
     "strength": 20.0,
@@ -288,7 +288,7 @@
     "timestamp": "2026-05-05T07:55:56.800091+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 35.0,
     "strength": 19.1,
@@ -300,7 +300,7 @@
     "timestamp": "2026-05-05T07:55:56.800091+00:00"
   },
   {
-    "symbol": "EURUSD",
+    "symbol": "EURUSD.Z",
     "direction": "BUY",
     "confidence": 61.0,
     "strength": 9.3,
@@ -312,7 +312,7 @@
     "timestamp": "2026-05-05T11:05:49.935393+00:00"
   },
   {
-    "symbol": "USDJPY",
+    "symbol": "USDJPY.Z",
     "direction": "SELL",
     "confidence": 61.0,
     "strength": 20.0,

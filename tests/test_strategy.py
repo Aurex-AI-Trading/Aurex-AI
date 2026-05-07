@@ -336,30 +336,30 @@ class TestDecisionEngine:
         )
 
     def test_tier1_execute(self):
-        d = decide("EURUSD", self._confluence(80.0))
+        d = decide("EURUSD.Z", self._confluence(80.0))
         assert d.action == "EXECUTE"
         assert d.tier   == 1
         assert d.size_mult == 1.0
 
     def test_tier2_conditional(self):
-        d = decide("EURUSD", self._confluence(65.0))
+        d = decide("EURUSD.Z", self._confluence(65.0))
         assert d.action == "CONDITIONAL"
         assert d.tier   == 2
         assert d.size_mult == 0.5
 
     def test_tier3(self):
-        d = decide("EURUSD", self._confluence(52.0))
+        d = decide("EURUSD.Z", self._confluence(52.0))
         assert d.action == "TIER3"
         assert d.tier   == 3
         assert d.size_mult == 0.25
 
     def test_skip_low_score(self):
-        d = decide("EURUSD", self._confluence(40.0))
+        d = decide("EURUSD.Z", self._confluence(40.0))
         assert d.action == "SKIP"
         assert d.size_mult == 0.0
 
     def test_none_direction_always_skip(self):
-        d = decide("EURUSD", self._confluence(95.0, direction="NONE"))
+        d = decide("EURUSD.Z", self._confluence(95.0, direction="NONE"))
         assert d.action == "SKIP"
 
 
@@ -387,7 +387,7 @@ class TestRiskManager:
             direction="BUY", entry=1.0800,
             account=self._ACCOUNT, candles_m15=candles,
             sweep=self._NULL_SWEEP, symbol_info=self._SYM_INFO,
-            symbol="EURUSD",
+            symbol="EURUSD.Z",
         )
         assert result.allowed
         assert result.stop_loss < 1.0800
@@ -404,7 +404,7 @@ class TestRiskManager:
             direction="SELL", entry=entry,
             account=self._ACCOUNT, candles_m15=candles,
             sweep=self._NULL_SWEEP, symbol_info=self._SYM_INFO,
-            symbol="EURUSD",
+            symbol="EURUSD.Z",
         )
         assert result.allowed
         assert result.stop_loss > entry
@@ -416,13 +416,13 @@ class TestRiskManager:
             direction="BUY", entry=1.0800,
             account=self._ACCOUNT, candles_m15=candles,
             sweep=self._NULL_SWEEP, symbol_info=self._SYM_INFO,
-            symbol="EURUSD", size_mult=1.0,
+            symbol="EURUSD.Z", size_mult=1.0,
         )
         half = calc_risk(
             direction="BUY", entry=1.0800,
             account=self._ACCOUNT, candles_m15=candles,
             sweep=self._NULL_SWEEP, symbol_info=self._SYM_INFO,
-            symbol="EURUSD", size_mult=0.5,
+            symbol="EURUSD.Z", size_mult=0.5,
         )
         if full.allowed and half.allowed:
             assert half.lot_size < full.lot_size
@@ -433,7 +433,7 @@ class TestRiskManager:
 class TestCooldown:
     def test_not_on_cooldown_initially(self):
         cm = CooldownManager()
-        assert not cm.is_on_cooldown("EURUSD", "BUY")
+        assert not cm.is_on_cooldown("EURUSD.Z", "BUY")
 
     def test_arm_and_check_cooldown(self):
         cm         = CooldownManager()
@@ -443,8 +443,8 @@ class TestCooldown:
             ema50_h1=0.0, ema200_h1=0.0, ema50_h4=0.0, ema200_h4=0.0,
             price=1.0800, reason="test",
         )
-        cm.arm("EURUSD", "BUY", trend=null_trend, trending_minutes=60, ranging_minutes=120)
-        assert cm.is_on_cooldown("EURUSD", "BUY")
+        cm.arm("EURUSD.Z", "BUY", trend=null_trend, trending_minutes=60, ranging_minutes=120)
+        assert cm.is_on_cooldown("EURUSD.Z", "BUY")
         assert cm.remaining("EURUSD", "BUY") > 0
 
     def test_clear_removes_cooldown(self):
@@ -455,14 +455,14 @@ class TestCooldown:
             ema50_h1=0.0, ema200_h1=0.0, ema50_h4=0.0, ema200_h4=0.0,
             price=1.0800, reason="test",
         )
-        cm.arm("EURUSD", "BUY", trend=null_trend, trending_minutes=60, ranging_minutes=120)
-        cm.clear("EURUSD", "BUY")
-        assert not cm.is_on_cooldown("EURUSD", "BUY")
+        cm.arm("EURUSD.Z", "BUY", trend=null_trend, trending_minutes=60, ranging_minutes=120)
+        cm.clear("EURUSD.Z", "BUY")
+        assert not cm.is_on_cooldown("EURUSD.Z", "BUY")
 
     def test_arm_after_outcome_covers_both_directions(self):
         cm = CooldownManager()
-        cm.arm_after_outcome("EURUSD", was_win=False, post_loss_minutes=45, post_win_minutes=20)
-        assert cm.is_on_cooldown("EURUSD", "BUY")
+        cm.arm_after_outcome("EURUSD.Z", was_win=False, post_loss_minutes=45, post_win_minutes=20)
+        assert cm.is_on_cooldown("EURUSD.Z", "BUY")
         assert cm.is_on_cooldown("EURUSD", "SELL")
 
 
@@ -633,7 +633,7 @@ class _MockBridge:
 
 def _make_pos(ticket, direction, entry, sl, tp, volume=0.10):
     return {
-        "ticket": ticket, "symbol": "EURUSD", "type": direction,
+        "ticket": ticket, "symbol": "EURUSD.Z", "type": direction,
         "price_open": entry, "sl": sl, "tp": tp, "volume": volume,
     }
 

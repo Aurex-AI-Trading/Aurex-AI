@@ -14,12 +14,12 @@ Cooldown state is in-memory and resets on process restart.
 
 Usage:
     cm = CooldownManager()
-    if cm.is_on_cooldown("EURUSD", "BUY"):
+    if cm.is_on_cooldown("EURUSD.Z", "BUY"):
         return
     # ... execute trade ...
-    cm.arm("EURUSD", "BUY", is_trending=True, settings=cfg)
+    cm.arm("EURUSD.Z", "BUY", is_trending=True, settings=cfg)
     # on trade close:
-    cm.arm_after_outcome("EURUSD", was_win=False, settings=cfg)
+    cm.arm_after_outcome("EURUSD.Z", was_win=False, settings=cfg)
 """
 from __future__ import annotations
 

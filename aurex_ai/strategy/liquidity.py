@@ -191,7 +191,7 @@ def _detect_inducement(
 
 def analyze(
     candles:         List[Candle],
-    symbol:          str   = "EURUSD",
+    symbol:          str   = "EURUSD.Z",
     lookback:        int   = 50,
     swing_window:    int   = 3,
     equal_tol_pips:  int   = 3,
