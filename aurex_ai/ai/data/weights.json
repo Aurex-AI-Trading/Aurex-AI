@@ -4,9 +4,9 @@
     "liquidity": 28,
     "fvg": 9,
     "fibonacci": 11,
-    "ema": 11,
-    "confirmation": 6,
+    "ema": 10,
+    "confirmation": 7,
     "order_block": 17
   },
-  "last_updated": "2026-05-08T08:28:22+00:00"
+  "last_updated": "2026-05-08T15:20:28+00:00"
 }
