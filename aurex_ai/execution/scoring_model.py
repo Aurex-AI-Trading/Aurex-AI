@@ -110,16 +110,19 @@ def compute_confirmation_score(
     max_score: float = 10.0,
 ) -> ConfirmationScore:
     """
-    Score the quality of the most recent candle pattern in `direction`.
+    Score the quality of the entry signal based on candle patterns and structure.
 
-    Patterns checked (in priority order):
-      1. Strong engulfing  — current body ≥ 1.5× previous body, correct direction
-      2. Engulfing         — current candle engulfs previous body
-      3. Rejection wick    — wick opposing direction is ≥ 60% of candle range
-      4. Momentum candle   — body ≥ 70% of range, in correct direction
+    Patterns checked in priority order (highest score wins):
+      1. Strong engulfing  — current body ≥ 1.5× previous body, correct direction  (10)
+      2. Engulfing         — current candle engulfs previous body                   (8)
+      3. Rejection wick    — opposing wick ≥ 60% of candle range                   (7)
+      4. Momentum candle   — body ≥ 70% of range, correct direction                (6)
+      5. EMA21 reclaim     — price crossed EMA21 in signal direction this bar       (5)
+      6. Consecutive bars  — last 2 completed bars both closed in signal direction  (4)
+      7. Micro pullback    — brief retrace (prev bar) followed by resumption (cur)  (3.5)
 
     Args:
-        candles:   At least 2 candles.  Uses the last two.
+        candles:   At least 2 candles (22+ for EMA21 reclaim, 3+ for micro pullback).
         direction: Trade direction to match patterns against.
 
     Returns:
@@ -136,14 +139,14 @@ def compute_confirmation_score(
     cur_body  = abs(cur.close  - cur.open)
     prev_body = abs(prev.close - prev.open)
 
-    # ── 1. Engulfing patterns ─────────────────────────────────────────────────
     if direction == "BUY":
-        is_directional = cur.close > cur.open   # bullish candle
+        is_directional = cur.close > cur.open
         engulfs_body   = (cur.open <= prev.close) and (cur.close >= prev.open)
     else:
-        is_directional = cur.close < cur.open   # bearish candle
+        is_directional = cur.close < cur.open
         engulfs_body   = (cur.open >= prev.close) and (cur.close <= prev.open)
 
+    # ── 1 & 2: Engulfing patterns ─────────────────────────────────────────────
     if is_directional and engulfs_body:
         body_ratio = (cur_body / prev_body) if prev_body > 0 else 1.0
         if body_ratio >= 1.5:
@@ -152,24 +155,62 @@ def compute_confirmation_score(
         log.debug("confirmation: engulfing dir=%s", direction)
         return ConfirmationScore(score=round(max_score * 0.80, 1), pattern="engulfing")
 
-    # ── 2. Rejection wick ─────────────────────────────────────────────────────
+    # ── 3: Rejection wick ─────────────────────────────────────────────────────
     if cur.candle_range > 0:
-        if direction == "BUY":
-            wick_ratio = cur.lower_wick / cur.candle_range
-        else:
-            wick_ratio = cur.upper_wick / cur.candle_range
-
+        wick_ratio = (
+            cur.lower_wick / cur.candle_range if direction == "BUY"
+            else cur.upper_wick / cur.candle_range
+        )
         if wick_ratio >= 0.60:
-            score = round(max_score * 0.70, 1)
             log.debug("confirmation: rejection_wick dir=%s ratio=%.2f", direction, wick_ratio)
-            return ConfirmationScore(score=score, pattern="rejection_wick")
+            return ConfirmationScore(score=round(max_score * 0.70, 1), pattern="rejection_wick")
 
-    # ── 3. Momentum candle ────────────────────────────────────────────────────
+    # ── 4: Momentum candle ────────────────────────────────────────────────────
     if cur.candle_range > 0:
         body_pct = cur_body / cur.candle_range
         if body_pct >= 0.70 and is_directional:
-            score = round(max_score * 0.60, 1)
             log.debug("confirmation: momentum_candle dir=%s body_pct=%.2f", direction, body_pct)
-            return ConfirmationScore(score=score, pattern="momentum_candle")
+            return ConfirmationScore(score=round(max_score * 0.60, 1), pattern="momentum_candle")
+
+    # ── 5: EMA21 reclaim ─────────────────────────────────────────────────────
+    # Price crossed EMA21 in the signal direction between the previous and current bar.
+    if len(candles) >= 22:
+        closes     = [c.close for c in candles]
+        ema21_vals = _ema_fn(closes, 21)
+        if ema21_vals and len(ema21_vals) >= 2:
+            e21_cur  = ema21_vals[-1]
+            e21_prev = ema21_vals[-2]
+            if direction == "BUY" and prev.close < e21_prev and cur.close > e21_cur:
+                log.debug("confirmation: ema_reclaim_bullish ema21=%.5f", e21_cur)
+                return ConfirmationScore(score=round(max_score * 0.50, 1), pattern="ema_reclaim")
+            if direction == "SELL" and prev.close > e21_prev and cur.close < e21_cur:
+                log.debug("confirmation: ema_reclaim_bearish ema21=%.5f", e21_cur)
+                return ConfirmationScore(score=round(max_score * 0.50, 1), pattern="ema_reclaim")
+
+    # ── 6: Consecutive directional candles ────────────────────────────────────
+    # Two completed candles both closed in signal direction — momentum continuation.
+    if len(candles) >= 3:
+        prior = candles[-3]
+        if direction == "BUY":
+            if prior.close > prior.open and prev.close > prev.open:
+                log.debug("confirmation: consecutive_bullish")
+                return ConfirmationScore(score=round(max_score * 0.40, 1), pattern="continuation")
+        else:
+            if prior.close < prior.open and prev.close < prev.open:
+                log.debug("confirmation: consecutive_bearish")
+                return ConfirmationScore(score=round(max_score * 0.40, 1), pattern="continuation")
+
+    # ── 7: Micro pullback continuation ───────────────────────────────────────
+    # Brief retrace on the previous bar followed by current bar resuming direction.
+    if len(candles) >= 3:
+        prior = candles[-3]
+        if direction == "BUY":
+            if prev.low < prior.low and cur.close > prev.close:
+                log.debug("confirmation: micro_pullback_bullish")
+                return ConfirmationScore(score=round(max_score * 0.35, 1), pattern="micro_pullback")
+        else:
+            if prev.high > prior.high and cur.close < prev.close:
+                log.debug("confirmation: micro_pullback_bearish")
+                return ConfirmationScore(score=round(max_score * 0.35, 1), pattern="micro_pullback")
 
     return _NONE

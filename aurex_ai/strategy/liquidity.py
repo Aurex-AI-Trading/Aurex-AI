@@ -196,6 +196,7 @@ def analyze(
     swing_window:    int   = 3,
     equal_tol_pips:  int   = 3,
     min_wick_ratio:  float = 0.55,
+    atr_pips:        float = 0.0,
 ) -> SweepResult:
     """
     Scan the last `lookback` candles for a liquidity sweep event.
@@ -211,6 +212,9 @@ def analyze(
         swing_window:   Bars each side to define a swing point.
         equal_tol_pips: Pip tolerance for "equal" highs/lows.
         min_wick_ratio: Minimum wick fraction to qualify as a sweep wick.
+        atr_pips:       Recent ATR in pips — used for adaptive wick threshold.
+                        Higher ATR = wider candles = proportionally smaller wicks;
+                        the threshold is lowered so real sweeps aren't filtered out.
     """
     if len(candles) < lookback + swing_window:
         return _NONE
@@ -221,6 +225,18 @@ def analyze(
     event_zone = window[-5:]          # latest 5 bars = potential sweep candles
     # Index of the first event-zone bar within `window`, used for inducement detection.
     _ez_start  = max(0, len(window) - 5)
+
+    # Adaptive wick threshold: high-ATR environments produce wider candles where
+    # wicks are proportionally smaller relative to total range. Lower the threshold
+    # so genuine sweep wicks are not filtered out in volatile sessions.
+    if atr_pips >= 15:
+        _min_wick = max(0.35, min_wick_ratio - 0.20)
+    elif atr_pips >= 10:
+        _min_wick = max(0.40, min_wick_ratio - 0.15)
+    elif atr_pips >= 7:
+        _min_wick = max(0.45, min_wick_ratio - 0.10)
+    else:
+        _min_wick = min_wick_ratio
 
     sh = _swing_highs(window, swing_window)
     sl = _swing_lows(window,  swing_window)
@@ -235,7 +251,7 @@ def analyze(
         for c in event_zone:
             if c.high > level and c.close < level:
                 wr = _upper_wick_ratio(c)
-                if wr >= min_wick_ratio:
+                if wr >= _min_wick:
                     score = min(20.0, 12.0 + touches * 2.0 + wr * 4.0)
                     # Displacement confirmation: +1 pt bonus (capped at 20)
                     _displace = _detect_displacement(candles, "sell_side")
@@ -266,7 +282,7 @@ def analyze(
         for c in event_zone:
             if c.low < level and c.close > level:
                 wr = _lower_wick_ratio(c)
-                if wr >= min_wick_ratio:
+                if wr >= _min_wick:
                     score = min(20.0, 12.0 + touches * 2.0 + wr * 4.0)
                     _displace = _detect_displacement(candles, "buy_side")
                     if _displace:
@@ -365,8 +381,8 @@ def analyze(
 
     log.warning(
         "[SWEEP] no_sweep | symbol=%s eq_highs=%d eq_lows=%d swing_highs=%d swing_lows=%d "
-        "last_uwr=%.2f last_lwr=%.2f (min_wick=%.2f swing_window=%d)",
+        "last_uwr=%.2f last_lwr=%.2f (min_wick=%.2f adaptive=%.2f atr=%.1f swing_window=%d)",
         symbol, len(eq_highs), len(eq_lows), len(sh), len(sl),
-        uwr, lwr, min_wick_ratio, swing_window,
+        uwr, lwr, min_wick_ratio, _min_wick, atr_pips, swing_window,
     )
     return _NONE

@@ -1512,6 +1512,7 @@ async def scan_symbol(
         swing_window   = cfg.strategy.swing_window,
         equal_tol_pips = cfg.strategy.equal_tol_pips,
         min_wick_ratio = cfg.strategy.min_wick_ratio,
+        atr_pips       = atr_pips,
     )
 
     # ── Structure detection (BOS + trend bias) ────────────────────────────────
@@ -1729,24 +1730,86 @@ async def scan_symbol(
         _log_rejected(symbol, "SPLIT_VOTES", confidence=decision.confidence, atr=atr_pips)
         return None
 
-    _score_adj = decision.score
-    if not struct_result.bos_detected:   _score_adj -= 8
-    if not sweep_result.detected:        _score_adj -= 6
-    if conf_score.score == 0:            _score_adj -= 8
-    if confidence.momentum == 0:         _score_adj -= 5
+    # ── Score integrity: soft moderation layer ───────────────────────────────
+    # IMPORTANT: BOS, sweep, and confirmation are already zero-weighted in
+    # confluence when absent — hard flat deductions would double-penalise those
+    # factors and contradict the decision engine output.
+    # This block applies a CAPPED PERCENTAGE reduction (max 15%) as a moderation
+    # signal only.  Strong confident setups bypass it entirely.
+    _penalty_pct: float = 0.0
+    _penalty_labels: list = []
 
-    if _score_adj < thresholds.tier2:
+    if not sweep_result.detected:
+        _penalty_pct += 0.07       # -7% no liquidity sweep
+        _penalty_labels.append("no_sweep(-7%)")
+    if not struct_result.bos_detected:
+        _penalty_pct += 0.05       # -5% no confirmed BOS
+        _penalty_labels.append("no_bos(-5%)")
+    if conf_score.score == 0:
+        _penalty_pct += 0.04       # -4% no candle confirmation pattern
+        _penalty_labels.append("no_conf(-4%)")
+    if confidence.momentum == 0:
+        _penalty_pct += 0.03       # -3% zero momentum in confidence engine
+        _penalty_labels.append("no_momentum(-3%)")
+
+    _penalty_pct = min(_penalty_pct, 0.15)      # hard cap: max 15% total reduction
+    _score_adj   = round(decision.score * (1.0 - _penalty_pct), 1)
+
+    # ── Setup quality classification ──────────────────────────────────────────
+    _has_breakout = bo_result.direction  != "none"
+    _has_ob       = ob_result.ob_type    != "none"
+    _strong_trend = (trend_result.direction != "neutral" and trend_result.consistent)
+
+    if sweep_result.detected and struct_result.bos_detected:
+        _quality = "A+"   # Full institutional: sweep + BOS confirmed
+    elif _strong_trend and (_has_breakout or _has_ob):
+        _quality = "A"    # Structural edge: trend + breakout or OB context
+    elif decision.score >= thresholds.tier1:
+        _quality = "A"    # Numerically strong regardless of missing signals
+    elif decision.score >= thresholds.tier2:
+        _quality = "B"    # Mid-quality: passes confluence, missing signals
+    else:
+        _quality = "C"    # Weak setup
+
+    log.warning(
+        "[SCORE INTEGRITY] %s | raw=%.1f adj=%.1f penalty=%.0f%% quality=%s | %s",
+        symbol, decision.score, _score_adj, _penalty_pct * 100, _quality,
+        " | ".join(_penalty_labels) if _penalty_labels else "no_penalties",
+    )
+
+    # ── High-confidence execution bypass ──────────────────────────────────────
+    # When confidence is strong, trend is MTF-aligned, ATR is healthy, and the
+    # setup is quality A or A+, the adjusted score is used for logging only —
+    # not as a rejection gate.  Missing sweep/BOS/confirmation reflects liquidity
+    # detection limits, not a fundamentally bad structural setup.
+    _bypass = (
+        confidence.total >= 65
+        and decision.tier <= 2
+        and trend_result.consistent
+        and atr_pips >= 5.0
+        and _quality in ("A+", "A")
+    )
+    if _bypass:
         log.warning(
-            "[BLOCKED] %s — adjusted score %.1f < tier2 %.0f "
-            "(bos=%s sweep=%s conf=%.0f)",
-            symbol, _score_adj, thresholds.tier2,
+            "[SCORE INTEGRITY] %s — bypass ACTIVE | conf=%d quality=%s "
+            "adj=%.1f (not used as rejection gate) trend=%s atr=%.1f",
+            symbol, confidence.total, _quality, _score_adj,
+            trend_result.direction, atr_pips,
+        )
+    elif _score_adj < thresholds.tier2:
+        log.warning(
+            "[BLOCKED] %s — adjusted score %.1f < tier2 %.0f quality=%s "
+            "| bos=%s sweep=%s conf=%.0f",
+            symbol, _score_adj, thresholds.tier2, _quality,
             struct_result.bos_detected, sweep_result.detected, conf_score.score,
         )
         _log_rejected(symbol, "SCORE_ADJUSTED_BELOW_THRESHOLD",
                       confidence=decision.confidence, atr=atr_pips)
         return None
 
-    if decision.tier == 1 and _score_adj < thresholds.tier1:
+    # Tier downgrade: step Tier 1 → Tier 2 when adjusted score is below tier1.
+    # Skipped during bypass (preserve confluence tier classification).
+    if not _bypass and decision.tier == 1 and _score_adj < thresholds.tier1:
         from aurex_ai.execution.decision_engine import Decision as _D
         decision = _D(
             action     = "CONDITIONAL",
@@ -1754,12 +1817,14 @@ async def scan_symbol(
             score      = _score_adj,
             tier       = 2,
             size_mult  = 0.50,
-            reason     = decision.reason + f" [score_adj:{_score_adj:.0f}]",
+            reason     = decision.reason + f" [adj:{_score_adj:.0f} q:{_quality}]",
             confidence = decision.confidence,
         )
         direction = decision.direction
-        log.info("[SCORE ADJUSTED] %s — tier1→tier2 after penalties (adj=%.0f)",
-                 symbol, _score_adj)
+        log.warning(
+            "[SCORE ADJUSTED] %s tier1→tier2 | raw=%.1f adj=%.1f quality=%s",
+            symbol, confluence.total_score, _score_adj, _quality,
+        )
 
     # ── Post-decision cooldown check ──────────────────────────────────────────
     if cooldown.is_on_cooldown(symbol, direction):
