@@ -118,8 +118,14 @@ class SupabaseSync:
     def _resolve_user_id(self, bridge: Any) -> Optional[str]:
         if self._user_id:
             return self._user_id
-        acct = getattr(bridge, "account", None)
-        if not acct:
+        # Prefer the live login number from MT5 account_info (works when the bridge
+        # connects to an already-running terminal with account=0 in config).
+        try:
+            info = bridge.get_account_info_raw()
+            acct = str(int(getattr(info, "login", 0) or 0))
+        except Exception:
+            acct = str(getattr(bridge, "account", 0) or 0)
+        if not acct or acct == "0":
             return None
         rows = self._get("mt5_accounts", {"account_number": f"eq.{acct}", "select": "user_id"})
         if rows:
