@@ -69,6 +69,13 @@ except ImportError:
     def _api_is_paused() -> bool: return False  # type: ignore[misc]
     _API_AVAILABLE = False
 
+try:
+    from aurex_ai.core.supabase_sync import SupabaseSync as _SupabaseSync
+    _SYNC_AVAILABLE = True
+except ImportError:
+    _SupabaseSync  = None   # type: ignore[assignment,misc]
+    _SYNC_AVAILABLE = False
+
 log = get_logger("main")
 
 _SHUTDOWN = asyncio.Event()
@@ -2260,6 +2267,7 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     session         = _SessionState()
     engine          = LearningEngine.get_instance()
     trade_logger    = TradeLogger.get_instance()
+    sync            = _SupabaseSync() if _SYNC_AVAILABLE else None
     interval = cfg.trading.scan_interval
     mode     = "DRY_RUN" if bridge.dry_run else "LIVE"
 
@@ -2370,6 +2378,13 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             scan_num, now_ts, len(symbols), daily.trades, len(session.open_tickets), idle_cycles,
         )
         log.info("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
+
+        # Push live data to Supabase (non-blocking — runs in thread)
+        if sync is not None and not bridge.dry_run:
+            try:
+                await asyncio.to_thread(sync.sync_all, bridge, trade_logger)
+            except Exception as _sync_exc:
+                log.debug("[SYNC] background sync error: %s", _sync_exc)
 
         # Rank symbols by their confidence score from the previous cycle.
         # First cycle all scores are 0 so order equals the configured list.
@@ -2541,6 +2556,13 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         try:
             await asyncio.wait_for(_SHUTDOWN.wait(), timeout=wait)
         except asyncio.TimeoutError:
+            pass
+
+    if sync is not None:
+        try:
+            sync.on_shutdown()
+            sync.close()
+        except Exception:
             pass
 
     log.warning(
