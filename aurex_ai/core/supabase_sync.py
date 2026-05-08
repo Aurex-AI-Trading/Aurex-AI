@@ -226,7 +226,17 @@ class SupabaseSync:
             payload["pnl_zar"]   = round(float(t.get("profit_usd", 0.0) or 0.0), 2)
             payload["pnl_pips"]  = round(float(t.get("pips",        0.0) or 0.0), 2)
             payload["closed_at"] = t.get("closed_at") or None
-        self._upsert("trades", payload, conflict="mt5_ticket")
+        # trades.mt5_ticket has no UNIQUE constraint — use check-then-insert/update
+        existing = self._get("trades", {
+            "mt5_ticket": f"eq.{ticket}",
+            "user_id":    f"eq.{user_id}",
+            "select":     "id",
+        })
+        if existing:
+            update = {k: v for k, v in payload.items() if k not in ("user_id", "mt5_ticket")}
+            self._patch("trades", {"mt5_ticket": f"eq.{ticket}", "user_id": f"eq.{user_id}"}, update)
+        else:
+            self._insert("trades", payload)
 
     # ── Daily analytics ───────────────────────────────────────────────────────
 
@@ -285,6 +295,18 @@ class SupabaseSync:
                 log.debug("[SYNC] DELETE %s status=%d", table, r.status_code)
         except Exception as exc:
             log.debug("[SYNC] DELETE %s error: %s", table, exc)
+
+    def _insert(self, table: str, payload: Dict) -> None:
+        try:
+            r = self._client.post(
+                table,
+                json=payload,
+                headers={"Prefer": "return=minimal"},
+            )
+            if r.status_code not in (200, 201, 204):
+                log.debug("[SYNC] INSERT %s status=%d body=%s", table, r.status_code, r.text[:200])
+        except Exception as exc:
+            log.debug("[SYNC] INSERT %s error: %s", table, exc)
 
     def _upsert(self, table: str, payload: Dict, conflict: str = "id") -> None:
         try:
