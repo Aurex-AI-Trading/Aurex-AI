@@ -242,8 +242,8 @@ def analyze(
                     if _displace:
                         score = min(20.0, score + 1.0)
                     _induce = _detect_inducement(sh, sl, level, "sell_side", tol, _ez_start)
-                    log.debug(
-                        "sweep: equal_highs_swept level=%.5f touches=%d wr=%.2f "
+                    log.warning(
+                        "[SWEEP] equal_highs_swept | level=%.5f touches=%d wr=%.2f "
                         "score=%.1f displacement=%s inducement=%s",
                         level, touches, wr, score, _displace, _induce,
                     )
@@ -272,8 +272,8 @@ def analyze(
                     if _displace:
                         score = min(20.0, score + 1.0)
                     _induce = _detect_inducement(sh, sl, level, "buy_side", tol, _ez_start)
-                    log.debug(
-                        "sweep: equal_lows_swept level=%.5f touches=%d wr=%.2f "
+                    log.warning(
+                        "[SWEEP] equal_lows_swept | level=%.5f touches=%d wr=%.2f "
                         "score=%.1f displacement=%s inducement=%s",
                         level, touches, wr, score, _displace, _induce,
                     )
@@ -302,8 +302,8 @@ def analyze(
                 _displace = _detect_displacement(candles, "sell_side")
                 if _displace:
                     score = min(14.0, score + 1.0)
-                log.debug("sweep: swing_high_swept level=%.5f wr=%.2f displacement=%s",
-                          last_sh, wr, _displace)
+                log.warning("[SWEEP] swing_high_swept | level=%.5f wr=%.2f displacement=%s",
+                            last_sh, wr, _displace)
                 return SweepResult(
                     detected=True, sweep_type="sell_side",
                     strength=round(score, 1), swept_level=round(last_sh, 5),
@@ -323,8 +323,8 @@ def analyze(
                 _displace = _detect_displacement(candles, "buy_side")
                 if _displace:
                     score = min(14.0, score + 1.0)
-                log.debug("sweep: swing_low_swept level=%.5f wr=%.2f displacement=%s",
-                          last_sl, wr, _displace)
+                log.warning("[SWEEP] swing_low_swept | level=%.5f wr=%.2f displacement=%s",
+                            last_sl, wr, _displace)
                 return SweepResult(
                     detected=True, sweep_type="buy_side",
                     strength=round(score, 1), swept_level=round(last_sl, 5),
@@ -363,4 +363,10 @@ def analyze(
             displacement=False, inducement=False,
         )
 
+    log.warning(
+        "[SWEEP] no_sweep | symbol=%s eq_highs=%d eq_lows=%d swing_highs=%d swing_lows=%d "
+        "last_uwr=%.2f last_lwr=%.2f (min_wick=%.2f swing_window=%d)",
+        symbol, len(eq_highs), len(eq_lows), len(sh), len(sl),
+        uwr, lwr, min_wick_ratio, swing_window,
+    )
     return _NONE

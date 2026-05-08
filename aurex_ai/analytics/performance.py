@@ -158,11 +158,12 @@ class PerformanceEngine:
             dd = equity - peak
             if dd < max_dd:
                 max_dd = dd
-        # When peak > 0: standard peak-to-trough %.
-        # When peak <= 0 (no profitable trades): every dollar lost is pure drawdown;
-        # report -100.0 to expose the all-loss case rather than hiding it as 0%.
+        # When peak > 0: standard peak-to-trough %, capped at -100% (a cumulative equity
+        # drawdown beyond the peak is mathematically possible but has no intuitive meaning
+        # above -100%; capping prevents misleading -279% style displays).
+        # When peak <= 0 (no profitable trades): report -100.0.
         report.max_drawdown_pct = round(
-            (max_dd / peak * 100.0) if peak > 0 else (-100.0 if max_dd < 0 else 0.0), 2
+            max(max_dd / peak * 100.0, -100.0) if peak > 0 else (-100.0 if max_dd < 0 else 0.0), 2
         )
 
         # ── Trades per day ────────────────────────────────────────────────────

@@ -131,11 +131,24 @@ def _log_rejected(
     rr:         float = 0.0,
     spread:     float = 0.0,
     atr:        float = 0.0,
+    eff_rr:     Optional[float] = None,
+    **kwargs,
 ) -> None:
-    log.warning(
-        "[BLOCKED] symbol=%s reason=%s | confidence=%.1f | rr=%.2f | spread=%.1f | atr=%.1f",
-        symbol, reason, confidence, rr, spread, atr,
-    )
+    try:
+        extras = ""
+        if eff_rr is not None:
+            extras += f" | eff_rr={eff_rr:.2f}"
+        for k, v in kwargs.items():
+            try:
+                extras += f" | {k}={v}"
+            except Exception:
+                pass
+        log.warning(
+            "[BLOCKED] symbol=%s reason=%s | confidence=%.1f | rr=%.2f | spread=%.1f | atr=%.1f%s",
+            symbol, reason, confidence, rr, spread, atr, extras,
+        )
+    except Exception as exc:
+        log.error("[BLOCKED LOGGER ERROR] %s %s — %s", symbol, reason, exc)
 
 
 def _check_entry_quality(
@@ -1310,9 +1323,11 @@ async def scan_symbol(
 
     # Confidence tier cap: even when the gate passes, borderline-confidence markets
     # cap the maximum eligible tier so full position is not placed in uncertain conditions.
-    # confidence >= 60 → all tiers eligible (Tier 1 allowed)
-    # confidence 50–59 → Tier 2 cap (0.50× max in dynamic mode) — valid setup, uncertain market
-    _CONF_FULL_TIER = 60
+    # confidence >= 55 → all tiers eligible (Tier 1 allowed)
+    # confidence 45–54 → Tier 2 cap (0.50× max) — valid setup, uncertain market
+    # Soft zone: 55-59 allows Tier1 but main flow applies 0.80× size penalty via the
+    # combined_size_mult path, so risk is still reduced without a hard tier cliff.
+    _CONF_FULL_TIER = 55
     _conf_tier_cap  = 1 if confidence.total >= _CONF_FULL_TIER else 2
 
     log.warning(
@@ -1894,20 +1909,50 @@ async def scan_symbol(
                 _spread_pips = round((_ask - _bid) / pip, 1)
         except Exception:
             pass
+    # ── SL floor enforcement ─────────────────────────────────────────────────
+    # A SL smaller than 4× spread is almost always consumed by the spread itself,
+    # destroying the effective risk/reward before price moves at all.
+    # Expand the SL to the floor while scaling the TP proportionally to preserve
+    # the configured RR ratio.
+    if _spread_pips > 0 and risk.sl_pips > 0:
+        _sl_floor = round(_spread_pips * 4.0, 1)
+        if risk.sl_pips < _sl_floor:
+            _sl_scale = _sl_floor / risk.sl_pips
+            _sl_dist  = abs(risk.entry - risk.stop_loss) * _sl_scale
+            _tp_dist  = abs(risk.take_profit - risk.entry) * _sl_scale
+            _old_sl   = risk.sl_pips
+            if direction == "BUY":
+                risk.stop_loss   = round(risk.entry - _sl_dist, 5)
+                risk.take_profit = round(risk.entry + _tp_dist, 5)
+            else:
+                risk.stop_loss   = round(risk.entry + _sl_dist, 5)
+                risk.take_profit = round(risk.entry - _tp_dist, 5)
+            risk.sl_pips = _sl_floor
+            log.warning(
+                "[SL FLOOR] %s %s | sl_pips expanded %.1f → %.1f (spread=%.1fpips floor=4× spread)"
+                " | SL=%.5f TP=%.5f",
+                symbol, direction, _old_sl, _sl_floor, _spread_pips,
+                risk.stop_loss, risk.take_profit,
+            )
+
     if _spread_pips > 0 and risk.sl_pips > 0:
         _eff_sl = risk.sl_pips + _spread_pips
         _eff_tp = risk.sl_pips * risk.rr_ratio - _spread_pips
         _eff_rr = round(_eff_tp / _eff_sl, 2) if _eff_sl > 0 else 0.0
         _max_spread = float(getattr(getattr(cfg, "fallback", None), "max_spread_pips", 3.0))
+        # eff_rr floor is 80% of the raw min_rr (minimum 1.0).
+        # Spread degrades eff_rr below the raw RR target; accepting up to 20% degradation
+        # preserves trades where the structural edge is strong but the spread is moderate.
+        _min_eff_rr = max(cfg.risk.min_rr * 0.80, 1.0)
         _spread_action = "PASS"
         if _max_spread > 0 and _spread_pips > _max_spread:
             _spread_action = "REJECT_SPREAD"
-        elif _eff_rr < cfg.risk.min_rr:
+        elif _eff_rr < _min_eff_rr:
             _spread_action = "REJECT_RR"
         log.warning(
-            "[SPREAD FILTER] %s %s | spread=%.1fpips sl=%.1f raw_rr=%.2f eff_rr=%.2f min_rr=%.2f | action=%s",
+            "[SPREAD FILTER] %s %s | spread=%.1fpips sl=%.1f raw_rr=%.2f eff_rr=%.2f min_eff_rr=%.2f (raw_min=%.2f) | action=%s",
             symbol, direction, _spread_pips, risk.sl_pips, risk.rr_ratio, _eff_rr,
-            cfg.risk.min_rr, _spread_action,
+            _min_eff_rr, cfg.risk.min_rr, _spread_action,
         )
         if _spread_action == "REJECT_SPREAD":
             _log_rejected(symbol, "SPREAD_TOO_HIGH", spread=_spread_pips, max=_max_spread)
