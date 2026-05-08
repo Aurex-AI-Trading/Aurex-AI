@@ -59,6 +59,7 @@ def _pip_size(symbol: str) -> float:
     s = symbol.upper()
     if "JPY" in s:               return 0.01
     if "BTC" in s or "ETH" in s: return 1.0
+    if "XAU" in s or "GOLD" in s: return 0.1   # Gold: 1 pip = $0.10; sl_pips stays within max_sl_pips
     if any(x in s for x in ("NAS", "US30", "US500", "SPX", "GER", "UK")): return 0.5
     return 0.0001
 

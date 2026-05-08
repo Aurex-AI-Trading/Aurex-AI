@@ -10,19 +10,21 @@
 broker_suffix: ".Z"
 
 symbols:
-  - EURUSD.Z
-  - USDJPY.Z
-  - GBPUSD.Z
+  - XAUUSD.Z   # Gold — best performer: 44% WR, +204 PnL (vs 25% WR overall)
+  - GBPUSD.Z   # High ATR, strong institutional flow — London session leader
+  - GBPJPY.Z   # High ATR, trend-driven, excels with FVG+OB in London
+  - EURUSD.Z   # Deepest liquidity — good for sweeps when trending
+  - USDJPY.Z   # Risk-on gauge; carry pair with clear institutional bias
 
 # ── Risk management ───────────────────────────────────────────
 risk:
   risk_pct:            1.0     # % of balance risked per trade (target; floored at vol_min lot)
-  min_rr:              1.5     # minimum reward-to-risk ratio accepted
+  min_rr:              2.0     # minimum RR — TP is always ATR×3.0/SL×1.5 = 2.0; floor ensures this
   max_open_trades:     1       # LIVE CAPITAL PROTECTION: 1 trade at a time
   max_open_per_symbol: 1       # max concurrent positions per individual symbol
-  max_daily_trades:    2       # LIVE CAPITAL PROTECTION: max 2 trades per day
+  max_daily_trades:    3       # 5 symbols — 3 trades/day still conservative; was 2
   max_lot_size:        0.05    # safety cap — 0.0 means no cap
-  max_daily_loss_pct:  10.0    # halt if daily drawdown exceeds this
+  max_daily_loss_pct:  8.0     # halt at 8% daily DD (tighter than 10% — protect capital)
   max_trade_risk_pct:  15.0    # survivability cap: micro-account floor.
                                # On R500 the minimum lot (0.01) already costs ~7-10% per trade
                                # depending on SL distance — 5% is mathematically unreachable.
@@ -32,10 +34,9 @@ risk:
                                # On R500 lots will floor at volume_min (0.01) regardless —
                                # dynamic mode still applies composite quality multipliers.
                                # Set > 0 only for hard-fixed lot (disables all dynamic sizing).
-  max_sl_pips:         50      # SL distance cap (pips, balance-independent).
-                               # 25 was too tight: GBPUSD ATR×1.5 ≈ 27-37 pips, USDJPY 30-45.
-                               # 50 allows normal ATR-based SL while blocking exotic runaway SL.
-                               # Dollar risk is controlled by max_trade_risk_pct instead.
+  max_sl_pips:         100     # SL cap raised to 100 for XAUUSD.Z and GBPJPY.Z compatibility.
+                               # Gold M15 ATR×1.5 ≈ 15-75 pips (0.1 pip); GBPJPY ≈ 60-120 pips.
+                               # Dollar risk is controlled by max_trade_risk_pct not pip count.
                                # Set to 0 to disable.
   min_execution_tier:  2       # minimum tier allowed to execute.
                                # 1 = Tier 1 only (score ≥ 60)
@@ -43,7 +44,7 @@ risk:
                                # 3 = all tiers including Tier 3 and fallback
                                # Tier 3 / fallback (0.25× lot) add frequency with no quality edge.
   sl_buffer_pips:      5       # extra buffer beyond sweep level for SL
-  tp_fixed_rr:         2.5     # fallback TP when no next-liquidity zone found
+  tp_fixed_rr:         2.5     # legacy parameter (TP set by tp_atr_mult in strategy section)
 
 # ── Scoring weights (must sum to 100) ─────────────────────────
 scoring:
@@ -73,7 +74,7 @@ cooldown:
   trending_minutes:    15    # cooldown when market is trending
   ranging_minutes:     60    # cooldown when market is ranging / low confluence
   post_loss_minutes:   60    # extended cooldown after a losing trade
-  post_win_minutes:    20    # shortened cooldown after a winning trade
+  post_win_minutes:    15    # shortened cooldown — good setups appear quickly; was 20
 
 # ── Strategy parameters ───────────────────────────────────────
 strategy:
@@ -187,17 +188,27 @@ backtest:
 trade_management:
   breakeven_enabled:  true    # move SL to entry at +1R
   partial_tp_enabled: true    # close partial_tp_ratio of position at +1R
-  partial_tp_ratio:   0.5     # fraction to close (0.5 = 50%)
+  partial_tp_ratio:   0.45    # 45% closed at 1R; 55% stays for the runner — was 0.5
   breakeven_rr:       1.0     # R-multiple that triggers both actions
   trail_1r5_rr:       1.5     # start trailing at +1.5R (ATR × trail_atr_mult_1)
   trail_2r_rr:        2.0     # tighten trail at +2R   (ATR × trail_atr_mult_2)
   trail_atr_mult_1:   1.0     # first trail stage multiplier
-  trail_atr_mult_2:   0.5     # second (tighter) trail stage multiplier
+  trail_atr_mult_2:   0.4     # tighter trail at 2R — lock in more profit; was 0.5
 
 # ── Testing ───────────────────────────────────────────────────
 testing:
   test_mode: false              # MUST remain false in production
   high_frequency_mode: false    # LIVE CAPITAL PROTECTION: enforce all daily trade limits
+
+# ── Session management ────────────────────────────────────────
+session:
+  # London-NY overlap (13:00-15:59 UTC) data shows 0% win rate and -116 ZAR loss
+  # across 4 trades. This 3-hour window sees US news events (13:30 UTC), London
+  # position unwinding, and directional confusion as NY tries to establish trend.
+  # Result: false breakouts, wide spreads, whipsaw action.
+  block_overlap:        true   # block all new entries 13:00–15:59 UTC
+  overlap_start_hour:   13     # inclusive
+  overlap_end_hour:     16     # exclusive (16:00 = first allowed NY pure hour)
 
 # ── Trading mode gate presets ─────────────────────────────────
 # These override the individual strategy/risk/scoring values at runtime.
@@ -224,27 +235,25 @@ modes:
     # "Aggressive" = aggressive filtering, NOT aggressive entry frequency.
     # Every threshold raised to require genuine institutional confirmation.
     # Tier 3 disabled. Session gate enforced at pipeline level.
-    min_confidence:      52     # was 45 — stricter market-readiness floor
-    min_atr_pips:        5.0    # was 8.0 — 5 pips is the dead-market absolute floor
-                               # EURUSD/GBPUSD during quiet periods: 5-8 pips is normal
-                               # 8-pip floor was blocking valid low-volatility setups
-    atr_optimal_max_pips: 35    # was 40 — tighter high-volatility ceiling
-    min_core_score:      35.0   # was 20.0 — CRITICAL: requires trend + at least one factor
-    min_execution_tier:  2      # was 3 — TIER 3 ELIMINATED (0.25× lot, no quality edge)
-    tier1:               65     # was 55 — A+ setups only for full lot execution
-    tier2:               52     # was 38 — B+ setups for half lot execution
-    tier3:               42     # was 28 — blocked by min_execution_tier=2 anyway
+    min_confidence:      52     # stricter market-readiness floor
+    min_atr_pips:        5.0    # 5 pips is the dead-market absolute floor
+    atr_optimal_max_pips: 35    # cap high-volatility ceiling (news/spike protection)
+    min_core_score:      35.0   # requires trend + at least one institutional factor
+    min_execution_tier:  2      # TIER 3 ELIMINATED (0.25× lot, no quality edge)
+    tier1:               65     # A+ setups only for full lot execution
+    tier2:               52     # B+ setups for half lot execution
+    tier3:               42     # blocked by min_execution_tier=2 anyway
     weights:
-      # Sum must equal 100.
-      # Institutional signals (liquidity + FVG) restored to meaningful weight.
-      # A trend+fib+ema setup without sweep/FVG now scores ~50 (below tier2=52)
-      # and also fails the institutional gate added to the main pipeline.
-      trend:        30   # was 40 — reduced to prevent single-factor dominance
-      liquidity:    22   # was 15 — raised: sweeps are the primary institutional signal
-      fvg:          10   # was 5  — raised: FVG valid in London/NY sessions
-      fibonacci:    18   # was 20 — slight reduction, still strong pullback signal
-      ema:          10   # unchanged
-      confirmation: 10   # unchanged
+      # AI learning engine weights (weights.json) — trend and liquidity dominate.
+      # Fibonacci overweighted in prior config; AI reduces it significantly.
+      # A strong trend + sweep + FVG setup scores ~85; trend-only scores ~55 (below tier2).
+      # Sum = 100.
+      trend:        35   # AI-learned +5: primary driver of profitable trades
+      liquidity:    28   # AI-learned +6: sweep is the strongest institutional signal
+      fvg:           9   # AI-learned -1: valid in London/NY but don't overweight
+      fibonacci:    11   # AI-learned -7: pullback tool only; strong trends break fib levels
+      ema:          11   # AI-learned +1: entry proximity still matters
+      confirmation:  6   # AI-learned -4: candle pattern confirms but doesn't lead
 
   conservative:
     min_confidence:      50

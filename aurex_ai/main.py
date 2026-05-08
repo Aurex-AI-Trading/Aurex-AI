@@ -95,6 +95,7 @@ def _pip_size(symbol: str) -> float:
     s = symbol.upper()
     if "JPY" in s:                return 0.01
     if "BTC" in s or "ETH" in s:  return 1.0
+    if "XAU" in s or "GOLD" in s: return 0.1   # Gold: 1 pip = $0.10; ATR ~5-50 pips on M15
     if any(x in s for x in ("NAS", "US30", "US500", "SPX", "GER", "UK")): return 0.5
     return 0.0001
 
@@ -1146,6 +1147,21 @@ async def scan_symbol(
         log.info(
             "[BLOCKED] %s — outside trading session (UTC=%02d, require 07–21)",
             symbol, _utc_hour,
+        )
+        return None
+
+    # ── London-NY overlap block ───────────────────────────────────────────────
+    # Historical data: 13:00-15:59 UTC produces 0% win rate.
+    # This window sees US news events (13:30 UTC), London position unwinding,
+    # and directional confusion as both sessions compete for control.
+    _sess_cfg    = getattr(cfg, "session", None)
+    _block_ov    = bool(getattr(_sess_cfg, "block_overlap", False))
+    _ov_start    = int(getattr(_sess_cfg,  "overlap_start_hour", 13))
+    _ov_end      = int(getattr(_sess_cfg,  "overlap_end_hour",   16))
+    if _block_ov and _ov_start <= _utc_hour < _ov_end:
+        log.info(
+            "[BLOCKED] %s — London-NY overlap blocked (UTC=%02d, %02d:00-%02d:00 excluded)",
+            symbol, _utc_hour, _ov_start, _ov_end,
         )
         return None
 
