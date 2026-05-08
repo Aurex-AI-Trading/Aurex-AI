@@ -7,36 +7,36 @@
       "total_rr": 18.0
     },
     "USDJPY.Z": {
-      "trades": 7,
+      "trades": 8,
       "wins": 1,
-      "total_pnl": -0.5299999999999996,
-      "total_rr": 14.0
+      "total_pnl": -13.059999999999999,
+      "total_rr": 16.0
     },
     "EURUSD.Z": {
-      "trades": 10,
-      "wins": 1,
-      "total_pnl": -28.800000000000004,
-      "total_rr": 19.95
+      "trades": 12,
+      "wins": 2,
+      "total_pnl": -16.53,
+      "total_rr": 23.95
     },
     "GBPUSD.Z": {
-      "trades": 1,
-      "wins": 0,
-      "total_pnl": 0.0,
-      "total_rr": 1.99
+      "trades": 3,
+      "wins": 1,
+      "total_pnl": 10.67,
+      "total_rr": 5.99
     }
   },
   "tiers": {
     "2": {
-      "trades": 8,
+      "trades": 9,
       "wins": 2,
-      "total_pnl": 8.839999999999996,
-      "total_rr": 15.97
+      "total_pnl": -4.7900000000000045,
+      "total_rr": 17.96
     },
     "1": {
-      "trades": 16,
-      "wins": 3,
-      "total_pnl": 137.16000000000003,
-      "total_rr": 31.97
+      "trades": 20,
+      "wins": 5,
+      "total_pnl": 161.20000000000005,
+      "total_rr": 39.98
     },
     "3": {
       "trades": 3,
@@ -47,10 +47,10 @@
   },
   "sessions": {
     "london": {
-      "trades": 10,
-      "wins": 2,
-      "total_pnl": 47.84,
-      "total_rr": 19.96
+      "trades": 13,
+      "wins": 4,
+      "total_pnl": 83.05,
+      "total_rr": 25.97
     },
     "newyork": {
       "trades": 15,
@@ -59,18 +59,18 @@
       "total_rr": 29.98
     },
     "overlap": {
-      "trades": 2,
+      "trades": 4,
       "wins": 0,
-      "total_pnl": -91.35,
-      "total_rr": 4.0
+      "total_pnl": -116.14999999999999,
+      "total_rr": 7.99
     }
   },
   "setups": {
     "FVG+OB": {
-      "trades": 17,
-      "wins": 4,
-      "total_pnl": 41.15,
-      "total_rr": 33.98
+      "trades": 22,
+      "wins": 6,
+      "total_pnl": 51.559999999999995,
+      "total_rr": 43.98
     },
     "OB+Sweep": {
       "trades": 5,
@@ -98,10 +98,10 @@
     }
   },
   "overall": {
-    "trades": 27,
-    "wins": 6,
-    "total_pnl": 175.15,
-    "total_rr": 53.940000000000005
+    "trades": 32,
+    "wins": 8,
+    "total_pnl": 185.56000000000003,
+    "total_rr": 63.940000000000005
   },
-  "last_updated": "2026-05-05T11:05:50.117759+00:00"
+  "last_updated": "2026-05-08T15:30:01+00:00"
 }

@@ -2,11 +2,11 @@
   "weights": {
     "trend": 35,
     "liquidity": 28,
-    "fvg": 8,
+    "fvg": 9,
     "fibonacci": 11,
-    "ema": 12,
+    "ema": 11,
     "confirmation": 6,
     "order_block": 17
   },
-  "last_updated": "2026-05-05T11:05:50+00:00"
+  "last_updated": "2026-05-08T08:28:22+00:00"
 }
