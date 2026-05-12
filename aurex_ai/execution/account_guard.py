@@ -218,12 +218,12 @@ class AccountGuard:
         if active:
             log.warning(
                 "[SMALL ACCOUNT MODE] balance=%.2f < threshold=%.2f ZAR | "
-                "max_open=1 max_lot_forex=0.01 max_lot_gold=0.01",
+                "max_open=5 max_lot_forex=0.01 max_lot_gold=0.01",
                 balance, self.small_acct_bal,
             )
         return SmallAccountLimits(
             active        = active,
-            max_open      = 1,
+            max_open      = 5,
             max_lot_forex = 0.01,
             max_lot_gold  = 0.01,
         )

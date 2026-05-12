@@ -868,8 +868,6 @@ async def _stack_pipeline(
     if not _enabled:
         return None
 
-    log.info("[STACK CHECK] %s %s | ticket=%d", symbol, direction, ticket)
-
     # ── Guard: already stacked this session ──────────────────────────────────
     if stack_state.was_stacked(symbol):
         log.info("[STACK BLOCKED] %s | reason=already_stacked", symbol)
@@ -887,13 +885,17 @@ async def _stack_pipeline(
 
     # ── Guard: open position cap (respects max_open_trades config) ──────────
     open_count   = len(bridge.get_open_positions())
-    _stack_max   = int(getattr(cfg.risk, "max_open_trades", 2))
-    # A stack adds a 2nd position on top of the existing 1; only allow if the
-    # config ceiling is >= 2.  With max_open_trades=1, stacking is always blocked.
-    if open_count >= _stack_max or _stack_max < 2:
+    _stack_max   = int(getattr(cfg.risk, "max_open_trades", 5))
+    _max_per_sym = int(getattr(cfg.risk, "max_open_per_symbol", 2))
+    _sym_count   = len(bridge.get_open_positions(symbol=symbol))
+    log.info(
+        "[STACK CHECK] %s %s | ticket=%d total_open=%d/%d symbol_open=%d/%d",
+        symbol, direction, ticket, open_count, _stack_max, _sym_count, _max_per_sym,
+    )
+    if open_count >= _stack_max:
         log.info(
-            "[STACK BLOCKED] %s | reason=open_cap open=%d max_open=%d",
-            symbol, open_count, _stack_max,
+            "[STACK BLOCKED] %s | reason=open_cap total_open=%d/%d symbol_open=%d/%d",
+            symbol, open_count, _stack_max, _sym_count, _max_per_sym,
         )
         return None
 
@@ -1259,17 +1261,21 @@ async def scan_symbol(
 
     # ── Open position cap (global) ────────────────────────────────────────────
     if open_count >= cfg.risk.max_open_trades:
-        log.warning("[TRADE BLOCKED] %s — max open trades reached (%d/%d)",
-                    symbol, open_count, cfg.risk.max_open_trades)
+        log.warning(
+            "[TRADE BLOCKED] %s — max open trades reached total_open=%d/%d",
+            symbol, open_count, cfg.risk.max_open_trades,
+        )
         return None
 
     # ── Per-symbol cap ────────────────────────────────────────────────────────
     if not feed._backtest:
-        _max_per_sym = int(getattr(cfg.risk, "max_open_per_symbol", 1))
+        _max_per_sym = int(getattr(cfg.risk, "max_open_per_symbol", 2))
         _sym_count   = len(bridge.get_open_positions(symbol=symbol))
         if _sym_count >= _max_per_sym:
-            log.info("[TRADE BLOCKED] %s — symbol position cap reached (%d/%d)",
-                     symbol, _sym_count, _max_per_sym)
+            log.warning(
+                "[TRADE BLOCKED] %s — symbol cap reached total_open=%d/%d symbol_open=%d/%d",
+                symbol, open_count, cfg.risk.max_open_trades, _sym_count, _max_per_sym,
+            )
             return None
 
     # ── Adaptive daily trade cap (skipped in HF mode) ───────────────────────
@@ -2961,6 +2967,13 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         cfg.risk.max_daily_trades, cfg.risk.max_open_trades,
         getattr(cfg.risk, "max_lot_size", 0.0),
         str(_hf_mode).lower(),
+    )
+
+    _sym_cap = int(getattr(cfg.risk, "max_open_per_symbol", 2))
+    log.warning(
+        "[TRADE ENGINE READY] max_open=%d symbol_cap=%d daily_limit=%d mode=%s",
+        cfg.risk.max_open_trades, _sym_cap, cfg.risk.max_daily_trades,
+        getattr(cfg.trading, "trading_mode", "unknown").upper(),
     )
 
     # ── Manual override API ───────────────────────────────────────────────────

@@ -25,11 +25,11 @@ symbols:
 risk:
   risk_pct:            1.0     # % of balance risked per trade (target; floored at vol_min lot)
   min_rr:              2.0     # minimum RR — TP is always ATR×3.0/SL×1.5 = 2.0; floor ensures this
-  max_open_trades:     2       # Phase 8: controlled scaling — 2 simultaneous trades max
-                               # Correlation protection (see correlation: section) prevents
-                               # duplicate directional stacking and currency overexposure.
-  max_open_per_symbol: 1       # max concurrent positions per individual symbol (never stack same pair)
-  max_daily_trades:    2       # institutional discipline: 2 high-quality trades > 3 marginal ones
+  max_open_trades:     5       # Phase 9: 5 simultaneous trades max — multi-symbol institutional scaling
+                               # Per-symbol cap (max_open_per_symbol) prevents stacking same pair.
+                               # Correlation section disabled when max_open_trades>=3.
+  max_open_per_symbol: 2       # max concurrent positions per individual symbol (same pair cap)
+  max_daily_trades:    10      # institutional discipline: up to 10 trades per day across 5 symbols
   max_lot_size:        0.05    # safety cap — 0.0 means no cap
   max_daily_loss_pct:  8.0     # halt at 8% daily DD (tighter than 10% — protect capital)
   max_trade_risk_pct:  15.0    # survivability cap: micro-account floor.
@@ -349,20 +349,19 @@ modes:
 
 # ── Correlation / currency exposure protection (Phase 8) ─────────────────────
 # Prevents simultaneous trades that double-up on the same currency side.
-# Active when max_open_trades >= 2.  Rules:
+# Phase 9: DISABLED — limits of 1 are incompatible with max_open_trades=5.
+# Per-symbol cap (max_open_per_symbol=2) already prevents stacking the same pair.
+# Re-enable with higher limits if you want stricter cross-currency diversification.
 #   max_usd_longs  — max open positions that are net long USD
-#                    (USDJPY BUY, EURUSD SELL, GBPUSD SELL, XAUUSD SELL)
 #   max_usd_shorts — max open positions that are net short USD
-#                    (EURUSD BUY, GBPUSD BUY, USDJPY SELL, XAUUSD BUY)
 #   max_gbp_exposure — max concurrent GBP positions (GBPUSD + GBPJPY)
 #   max_jpy_exposure — max concurrent JPY positions (USDJPY + GBPJPY)
-# With max_open_trades=2, these rules allow exactly ONE trade per currency side.
 correlation:
-  enabled:           true
-  max_usd_longs:     1    # never stack two USD-long positions simultaneously
-  max_usd_shorts:    1    # never stack two USD-short positions simultaneously
-  max_gbp_exposure:  1    # never hold GBPUSD + GBPJPY at the same time
-  max_jpy_exposure:  1    # never hold USDJPY + GBPJPY at the same time
+  enabled:           false   # Phase 9: disabled — incompatible with 5-trade scaling
+  max_usd_longs:     3    # allow 3 USD-long positions (if re-enabled)
+  max_usd_shorts:    3    # allow 3 USD-short positions (if re-enabled)
+  max_gbp_exposure:  2    # allow 2 concurrent GBP positions (if re-enabled)
+  max_jpy_exposure:  2    # allow 2 concurrent JPY positions (if re-enabled)
 
 # ── Spread control (Phase 5) ──────────────────────────────────────────────────
 # Early spread/ATR ratio check before running the full confluence pipeline.
