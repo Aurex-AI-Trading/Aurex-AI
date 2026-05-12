@@ -34,6 +34,7 @@ from aurex_ai.core.mt5_bridge import (
     MT5Bridge, SymbolValidation,
     get_mt5_time, is_mt5_time_fresh,
     log_time_sync_banner, check_time_drift,
+    detect_broker_tz_offset,
     _TIME_BLOCK_THRESHOLD,
 )
 
@@ -4016,13 +4017,24 @@ def main() -> None:
             len(_invalid_symbols), len(symbols), _invalid_symbols,
         )
 
+    # ── Broker timezone auto-detection ───────────────────────────────────────
+    # HFM and most retail brokers return tick.time as local server time (EET/EEST),
+    # NOT Unix UTC.  Detect the offset before the time-sync banner so the banner
+    # shows correct ~0s drift instead of a false +10800s block.
+    _broker_sym = symbols[0] if symbols else "EURUSD.Z"
+    try:
+        detect_broker_tz_offset(_broker_sym)
+    except Exception:
+        log.exception("[BROKER TIME ANALYSIS] Offset detection failed — drift check may show false positive")
+
     # ── Time-sync validation ─────────────────────────────────────────────────
     # log_time_sync_banner() logs the full banner and returns abs drift (seconds).
+    # After broker TZ normalization the drift should be ~0s for a healthy VPS.
     # 0.0 is returned when MT5 feed is not yet live (market closed / pre-connect).
     # [TIME SYNC VERIFIED] / [TIME WARNING] / [TIME CRITICAL] / [TIME BLOCK] are
     # emitted inside the function based on drift thresholds.
     # Trading ALWAYS uses MT5 broker time — local VPS clock is never traded on.
-    _startup_drift = log_time_sync_banner(symbol=symbols[0] if symbols else "EURUSD.Z")
+    _startup_drift = log_time_sync_banner(symbol=_broker_sym)
 
     # Hard fail-safe: if MT5 is live AND drift >= _TIME_BLOCK_THRESHOLD (300s),
     # refuse to start trading.  The operator must either:

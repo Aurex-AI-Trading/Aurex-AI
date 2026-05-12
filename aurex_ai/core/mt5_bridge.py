@@ -54,10 +54,105 @@ _TIME_BLOCK_THRESHOLD    = 300   # seconds — [TIME BLOCK]    hard fail-safe; m
 # Set True when get_mt5_time() returned actual broker tick time; False = local UTC fallback.
 _mt5_time_fresh: bool = False
 
+# Broker timezone offset detection (auto-detected on first live tick).
+# HFM MT5 uses EET/EEST: UTC+2 (winter) or UTC+3 (DST summer).
+# tick.time is broker server local time, NOT UTC. Without correction, the
+# difference looks like +7200/+10800s clock drift which falsely triggers TIME BLOCK.
+_broker_tz_offset_secs: float = 0.0   # seconds broker local is ahead of UTC
+_broker_tz_detected:    bool  = False  # True once a fresh tick has been used to detect
+
 
 def is_mt5_time_fresh() -> bool:
     """True if the most recent get_mt5_time() call returned verified MT5 broker time."""
     return _mt5_time_fresh
+
+
+def detect_broker_tz_offset(symbol: str = "EURUSD.Z") -> float:
+    """
+    Auto-detect the broker server's UTC offset by comparing a fresh tick timestamp
+    against the NTP-synced VPS UTC clock.
+
+    HFM MT5 (and most retail brokers) return tick.time as local server time,
+    not Unix UTC. The Python MT5 library does not document this, so callers that
+    do datetime.fromtimestamp(tick.time, tz=utc) get broker local time labelled
+    as UTC, producing a fake drift equal to the broker's UTC offset.
+
+    Algorithm:
+      1. Fetch a fresh tick (must be < _MAX_TICK_AGE_SECONDS old after normalization).
+      2. Treat tick.time as "UTC" (the broken reading) to get broker_raw_as_utc.
+      3. Compute raw_offset = broker_raw_as_utc - vps_utc.
+      4. Round to nearest 30-minute boundary (covers all IANA TZ offsets).
+      5. Skip if |raw_offset| > 86400s — stale weekend tick; offset unreliable.
+
+    Sets _broker_tz_offset_secs and _broker_tz_detected.
+    Returns the detected offset in seconds (positive = broker ahead of UTC).
+    Emits [BROKER TIME ANALYSIS] diagnostic log.
+    """
+    global _broker_tz_offset_secs, _broker_tz_detected
+
+    if not _MT5_AVAILABLE:
+        log.debug("[BROKER TIME ANALYSIS] MT5 not available — skipping offset detection")
+        return 0.0
+
+    try:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None or tick.time <= 0:
+            log.warning("[BROKER TIME ANALYSIS] No tick for %s — cannot detect broker TZ", symbol)
+            return _broker_tz_offset_secs
+
+        vps_utc          = _dt.datetime.now(_dt.timezone.utc)
+        broker_raw_as_utc = _dt.datetime.fromtimestamp(tick.time, tz=_dt.timezone.utc)
+
+        raw_offset = (broker_raw_as_utc - vps_utc).total_seconds()
+
+        if abs(raw_offset) > 86400:
+            log.warning(
+                "[BROKER TIME ANALYSIS] Raw offset %.0fs > 86400s — "
+                "tick may be stale (weekend?). Keeping previous offset (%.0fs).",
+                raw_offset, _broker_tz_offset_secs,
+            )
+            return _broker_tz_offset_secs
+
+        # Round to nearest 30-min boundary
+        rounded_offset = round(raw_offset / 1800) * 1800
+        offset_h       = int(rounded_offset // 3600)
+        offset_m       = int(abs(rounded_offset) % 3600 // 60)
+        offset_sign    = "+" if rounded_offset >= 0 else "-"
+        offset_label   = f"UTC{offset_sign}{abs(offset_h):02d}:{offset_m:02d}"
+
+        # Normalized (correct) broker UTC time after offset removal
+        normalized_epoch = tick.time - int(rounded_offset)
+        normalized_dt    = _dt.datetime.fromtimestamp(normalized_epoch, tz=_dt.timezone.utc)
+        actual_drift     = (normalized_dt - vps_utc).total_seconds()
+
+        _broker_tz_offset_secs = rounded_offset
+        _broker_tz_detected    = True
+
+        log.warning(
+            "\n"
+            "  ┌──────────────────────────────────────────────────┐\n"
+            "  │           BROKER TIME ANALYSIS                    │\n"
+            "  ├──────────────────────────────────────────────────┤\n"
+            "  │  Broker Raw Time   : %-28s│\n"
+            "  │  VPS UTC (NTP)     : %-28s│\n"
+            "  │  Detected Broker TZ: %-28s│\n"
+            "  │  Normalized Broker : %-28s│\n"
+            "  │  Actual Drift      : %-28s│\n"
+            "  │  Status            : %-28s│\n"
+            "  └──────────────────────────────────────────────────┘",
+            broker_raw_as_utc.strftime("%Y-%m-%d %H:%M:%S") + " (local)",
+            vps_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            offset_label,
+            normalized_dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            f"{actual_drift:+.1f}s",
+            "SYNCHRONIZED" if abs(actual_drift) < _TIME_WARN_THRESHOLD else f"DRIFT {actual_drift:+.1f}s",
+        )
+
+        return rounded_offset
+
+    except Exception as exc:
+        log.warning("[BROKER TIME ANALYSIS] Detection failed: %s", exc)
+        return _broker_tz_offset_secs
 
 
 def _get_ntp_active_source() -> str:
@@ -103,7 +198,7 @@ def log_time_sync_banner(symbol: str = "EURUSD.Z") -> float:
         Caller checks this value for the hard fail-safe (>= _TIME_BLOCK_THRESHOLD → exit).
     """
     local_utc  = _dt.datetime.now(_dt.timezone.utc)
-    mt5_time   = get_mt5_time(symbol)
+    mt5_time   = get_mt5_time(symbol)   # normalized UTC (after broker TZ correction)
     fresh      = is_mt5_time_fresh()
     mt5_source = "MT5 LIVE TICK" if fresh else "LOCAL UTC (MT5 unavailable)"
 
@@ -115,10 +210,24 @@ def log_time_sync_banner(symbol: str = "EURUSD.Z") -> float:
     tz_m           = int((abs(tz_secs) % 3600) // 60)
     local_str      = local_wall.strftime("%Y-%m-%d %H:%M:%S") + f" UTC{tz_sign}{tz_h:02d}:{tz_m:02d}"
 
-    # Broker drift: (mt5_time − local_utc).
-    # ≈ 0  → clocks agree.
-    # > 0  → VPS clock is behind MT5 (set too early; NTP not applied yet).
-    # < 0  → VPS clock is ahead of MT5 (rare; clock jumped forward).
+    # Broker TZ label (UTC+02:00, UTC+03:00, etc.)
+    boff_h    = int(abs(_broker_tz_offset_secs) // 3600)
+    boff_m    = int(abs(_broker_tz_offset_secs) % 3600 // 60)
+    boff_sign = "+" if _broker_tz_offset_secs >= 0 else "-"
+    broker_tz_label = f"UTC{boff_sign}{boff_h:02d}:{boff_m:02d}" if _broker_tz_detected else "Unknown (not yet detected)"
+
+    # Raw (un-normalized) broker time for display
+    raw_broker_str = "N/A"
+    if fresh and _MT5_AVAILABLE:
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is not None and tick.time > 0:
+                raw_broker_dt  = _dt.datetime.fromtimestamp(tick.time, tz=_dt.timezone.utc)
+                raw_broker_str = raw_broker_dt.strftime("%Y-%m-%d %H:%M:%S") + " (local)"
+        except Exception:
+            pass
+
+    # Drift: normalized MT5 UTC vs VPS UTC.  Should be ~0 after correct TZ offset.
     delta_secs = (mt5_time - local_utc).total_seconds()
     abs_delta  = abs(delta_secs)
     drift_str  = f"{'+' if delta_secs >= 0 else '-'}{abs_delta:.1f}s"
@@ -141,15 +250,19 @@ def log_time_sync_banner(symbol: str = "EURUSD.Z") -> float:
         "  │            TIME SYNC VERIFICATION                 │\n"
         "  ├──────────────────────────────────────────────────┤\n"
         "  │  Windows Local  : %-30s│\n"
-        "  │  UTC            : %-30s│\n"
-        "  │  MT5 Broker     : %-30s│\n"
+        "  │  UTC (NTP)      : %-30s│\n"
+        "  │  Broker Raw     : %-30s│\n"
+        "  │  Broker TZ      : %-30s│\n"
+        "  │  Broker UTC Norm: %-30s│\n"
         "  │  NTP Source     : %-30s│\n"
-        "  │  Drift          : %-30s│\n"
+        "  │  Actual Drift   : %-30s│\n"
         "  │  MT5 feed       : %-30s│\n"
         "  │  Status         : %-30s│\n"
         "  └──────────────────────────────────────────────────┘",
         local_str,
         local_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        raw_broker_str,
+        broker_tz_label,
         mt5_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         ntp_src,
         drift_str,
@@ -239,26 +352,36 @@ def check_time_drift(symbol: str = "EURUSD.Z") -> float:
 
 def get_mt5_time(symbol: str = "EURUSD.Z") -> _dt.datetime:
     """
-    Return the current MT5 broker server time as a UTC-aware datetime.
+    Return the current MT5 broker server time as a true UTC-aware datetime.
 
-    Source: mt5.symbol_info_tick(symbol).time — Unix epoch from the broker feed.
+    Source: mt5.symbol_info_tick(symbol).time — broker local Unix epoch.
+    The MT5 library returns broker server LOCAL time, not UTC.  We subtract
+    _broker_tz_offset_secs (auto-detected by detect_broker_tz_offset) to
+    convert to true UTC before any age or drift calculation.
+
     Falls back to local UTC time when MT5 is unavailable, not connected, or when
     the last tick is stale (> _MAX_TICK_AGE_SECONDS old — market closed / feed frozen).
 
     Check is_mt5_time_fresh() after calling to know which source was used.
     """
-    global _mt5_time_fresh
+    global _mt5_time_fresh, _broker_tz_offset_secs, _broker_tz_detected
     if _MT5_AVAILABLE:
         try:
             tick = mt5.symbol_info_tick(symbol)
             if tick is not None and tick.time > 0:
-                server_dt = _dt.datetime.fromtimestamp(tick.time, tz=_dt.timezone.utc)
+                # Lazy broker TZ detection: run once on the first live tick
+                if not _broker_tz_detected:
+                    detect_broker_tz_offset(symbol)
+
+                # Normalize broker local epoch to true UTC epoch
+                normalized_epoch = tick.time - int(_broker_tz_offset_secs)
+                server_dt = _dt.datetime.fromtimestamp(normalized_epoch, tz=_dt.timezone.utc)
                 age_secs  = (_dt.datetime.now(_dt.timezone.utc) - server_dt).total_seconds()
                 if age_secs <= _MAX_TICK_AGE_SECONDS:
-                    log.debug("[TIME] MT5 Server Time: %s", server_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                    log.debug("[TIME] MT5 Normalized UTC: %s", server_dt.strftime("%Y-%m-%d %H:%M:%S"))
                     _mt5_time_fresh = True
                     return server_dt
-                log.warning("[TIME] MT5 tick stale (%.0fs old) — using local UTC", age_secs)
+                log.warning("[TIME] MT5 tick stale (%.0fs old after TZ normalization) — using local UTC", age_secs)
         except Exception:
             pass
     _mt5_time_fresh = False
