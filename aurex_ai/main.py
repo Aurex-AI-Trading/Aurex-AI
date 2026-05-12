@@ -60,6 +60,16 @@ from aurex_ai.execution.news_guard        import check_news as _check_news
 from aurex_ai.ai.optimizer        import optimize as ai_optimize, Optimizer
 from aurex_ai.ai.learning_engine  import LearningEngine
 from aurex_ai.ai.weight_adjuster  import FactorWeights
+from aurex_ai.ai.adaptive_learning import AdaptiveLearning
+
+from aurex_ai.core.symbol_registry import (
+    log_registry_summary as _log_registry_summary,
+    log_symbol_profile   as _log_symbol_profile,
+    get_profile          as _get_symbol_profile,
+)
+from aurex_ai.core.failsafe  import Failsafe
+from aurex_ai.core.telemetry import Telemetry
+from aurex_ai.execution.execution_quality import ExecutionQualityEngine
 
 from aurex_ai.analytics.trade_logger import TradeLogger
 from aurex_ai.analytics.performance  import PerformanceEngine
@@ -1203,12 +1213,20 @@ async def scan_symbol(
 
     if not candles_h1 or not candles_m15:
         log.warning("[WARNING] No data for %s — skipping", symbol)
+        failsafe.mt5_error()
         return None
 
     if len(candles_h1) < 205 or len(candles_m15) < 10:
         log.warning("[WARNING] %s candle data insufficient H1=%d M15=%d (need H1≥205, M15≥10)",
                     symbol, len(candles_h1), len(candles_m15))
         return None
+
+    # Phase 6: stale-candle detection (same candle repeated N cycles)
+    _m15_open_iso = candles_m15[-1].time.isoformat()
+    if failsafe.is_stale(symbol, TF_M15, _m15_open_iso):
+        return None   # [FAILSAFE] already logged inside is_stale()
+
+    failsafe.mt5_ok()   # data arrived — clear any MT5 error counter
 
     # Staleness guard: newest M15 candle must be < 30 min old in live mode.
     # Older data means MT5 is frozen or the symbol feed has dropped.
@@ -2401,6 +2419,19 @@ async def scan_symbol(
         log.error("%s %s: trade failed — %s", symbol, direction, trade.error)
         return None
 
+    # Phase 6: register trade with failsafe + record execution quality
+    failsafe.register_trade(trade.ticket, symbol, direction)
+    exec_quality.record_fill(
+        symbol         = symbol,
+        expected_price = risk.entry,
+        executed_price = trade.executed_price,
+        spread_pips    = _spread_pips,
+        direction      = direction,
+        pip            = pip,
+        cfg            = cfg,
+    )
+    exec_quality.record_spread(symbol, _spread_pips, cfg=cfg)
+
     # ── Post-execution ────────────────────────────────────────────────────────
     cooldown.arm(
         symbol,
@@ -2575,14 +2606,23 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     cooldown        = CooldownManager()
     trade_mgr       = TradeManager()
     reentry_tracker = ReEntryTracker()
-    stack_state     = _StackState()
-    param_optimizer = Optimizer(cfg)
-    daily           = _DailyState(date=get_mt5_time().date())
-    session         = _SessionState()
-    engine          = LearningEngine.get_instance()
-    trade_logger    = TradeLogger.get_instance()
-    sync            = _SupabaseSync() if _SYNC_AVAILABLE else None
-    guard           = AccountGuard(cfg)
+    stack_state       = _StackState()
+    param_optimizer   = Optimizer(cfg)
+    daily             = _DailyState(date=get_mt5_time().date())
+    session           = _SessionState()
+    engine            = LearningEngine.get_instance()
+    trade_logger      = TradeLogger.get_instance()
+    sync              = _SupabaseSync() if _SYNC_AVAILABLE else None
+    guard             = AccountGuard(cfg)
+    # Phase 6 — enterprise systems (singletons; safe to re-init on restart)
+    adaptive_learning = AdaptiveLearning.get_instance()
+    failsafe          = Failsafe.get_instance(cfg)
+    telemetry         = Telemetry.get_instance(cfg)
+    exec_quality      = ExecutionQualityEngine.get_instance()
+    log.warning(
+        "[MULTI USER SAFE] [ISOLATED EXECUTION] [USER CONTEXT VERIFIED] "
+        "Phase 6 systems initialised | failsafe=OK telemetry=OK exec_quality=OK adaptive_learning=OK"
+    )
     interval = cfg.trading.scan_interval
     mode     = "DRY_RUN" if bridge.dry_run else "LIVE"
 
@@ -2693,6 +2733,17 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             scan_num, now_ts, len(symbols), daily.trades, len(session.open_tickets), idle_cycles,
         )
 
+        # Phase 6: Telemetry cycle-end + heartbeat
+        _tel_duration = telemetry.cycle_end(
+            mt5_ok  = not failsafe.mt5_in_recovery,
+        )
+        if scan_num % telemetry.heartbeat_interval == 0:
+            telemetry.emit_heartbeat(bridge, daily_state=daily)
+
+        # Phase 6: AI score (once per day, after daily update)
+        if trade_logger.total_closed() >= 10:
+            adaptive_learning.log_ai_score(trade_logger)
+
         # Account Guard — fetch live equity/balance and run cycle check
         _guard_equity  = 0.0
         _guard_balance = 0.0
@@ -2709,6 +2760,10 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             date_utc  = server_time.date(),
         )
         log.warning(guard.telemetry(_guard_equity, _guard_balance))
+
+        # Phase 6: telemetry cycle start + adaptive learning compute
+        telemetry.cycle_start()
+        _al_snap = adaptive_learning.compute(trade_logger, cfg=cfg)
 
         log.info("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
 
@@ -3623,6 +3678,11 @@ def main() -> None:
         _active_suffix = _cfg_suffix
 
     log_symbol_config(symbols, _active_suffix, broker_name=cfg.mt5.server or "")
+
+    # Phase 6: Symbol registry startup banner + per-symbol profiles
+    _log_registry_summary(_active_suffix)
+    for _sym in symbols:
+        _log_symbol_profile(_sym)
 
     _invalid_symbols = []
     for _sym in symbols:

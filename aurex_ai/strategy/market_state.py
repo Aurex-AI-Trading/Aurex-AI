@@ -6,10 +6,12 @@ preference can adapt instead of applying identical logic to every condition.
 
 States
 ------
-  TRENDING          — clear directional bias; trend continuation entries preferred.
-  RANGING           — oscillating price; execution scaled back, sweeps ignored.
-  VOLATILE_EXPANSION— high-ATR impulsive move (news/spike); size reduced.
-  DEAD              — ATR below threshold; already blocked by main ATR gate.
+  TRENDING              — clear directional bias; trend continuation entries preferred.
+  RANGING               — oscillating price; execution scaled back, sweeps ignored.
+  VOLATILE_EXPANSION    — high-ATR impulsive move (news/spike); size reduced.
+  VOLATILITY_COMPRESSION— ATR contracting < 50% of recent average; breakout imminent.
+  REVERSAL_ENVIRONMENT  — sharp counter-trend move detected; trend bias invalidated.
+  DEAD                  — ATR below threshold; already blocked by main ATR gate.
 
 Classification inputs (all derived from already-computed data in main.py):
   - atr_pips          : current 14-period ATR on M15 in pips
@@ -19,18 +21,18 @@ Classification inputs (all derived from already-computed data in main.py):
 
 Execution multipliers
 ---------------------
-  TRENDING          → 1.00  (full participation — home territory)
-  RANGING           → 0.80  (20% reduction — choppy entries lose frequently)
-  VOLATILE_EXPANSION→ 0.70  (30% reduction — spike risk, wider spreads)
-  DEAD              → 0.00  (already blocked upstream; returned for completeness)
+  TRENDING              → 1.00  (full participation — home territory)
+  RANGING               → 0.80  (20% reduction — choppy entries lose frequently)
+  VOLATILE_EXPANSION    → 0.70  (30% reduction — spike risk, wider spreads)
+  VOLATILITY_COMPRESSION→ 0.75  (25% reduction — low range; breakout not yet confirmed)
+  REVERSAL_ENVIRONMENT  → 0.65  (35% reduction — trend bias invalid; high whipsaw risk)
+  DEAD                  → 0.00  (already blocked upstream; returned for completeness)
 
 Logging tags
 ------------
-  [MARKET STATE]
-  [TRENDING]
-  [RANGING]
-  [LOW QUALITY MARKET]
-  [VOLATILE EXPANSION]
+  [MARKET REGIME]   [TREND REGIME]   [RANGE REGIME]
+  [LOW QUALITY ENVIRONMENT]   [VOLATILE EXPANSION]
+  [VOLATILITY COMPRESSION]    [REVERSAL ENVIRONMENT]
 """
 from __future__ import annotations
 
@@ -156,7 +158,7 @@ def classify(
     )
 
     if atr_pips <= 3.0:
-        log.warning("[MARKET STATE] %s DEAD | atr=%.1f", symbol, atr_pips)
+        log.warning("[MARKET REGIME] %s DEAD [LOW QUALITY ENVIRONMENT] | atr=%.1f", symbol, atr_pips)
         return _DEAD
 
     # ATR-based volatile expansion detection (symbol-class-aware)
@@ -172,6 +174,27 @@ def classify(
 
     range_score = 1.0 - consistency
 
+    # ── ATR compression detection (Phase 6: VOLATILITY_COMPRESSION) ──────────
+    # Compare recent 5-bar ATR average to prior 15-bar ATR average.
+    # Compression < 50% of baseline = market coiling before a breakout.
+    _is_compressed = False
+    if len(candles_m15) >= 20:
+        _recent_ranges = [c.high - c.low for c in candles_m15[-5:]]
+        _prior_ranges  = [c.high - c.low for c in candles_m15[-20:-5]]
+        _recent_avg    = sum(_recent_ranges) / 5
+        _prior_avg     = sum(_prior_ranges)  / 15
+        _is_compressed = _prior_avg > 0 and _recent_avg < _prior_avg * 0.50
+
+    # ── Reversal detection (Phase 6: REVERSAL_ENVIRONMENT) ───────────────────
+    # Detected when a strong trend exists (trend_strength >= threshold) but
+    # recent candle consistency sharply contradicts it — price is fighting the trend.
+    _is_reversal = (
+        trend_strength >= _MIN_TREND_STRENGTH_TRENDING
+        and trend_direction != "neutral"
+        and consistency < _CONSISTENT_RANGING
+        and ema_dev > 1.0    # price significantly displaced against trend EMA
+    )
+
     # ── Classification logic ──────────────────────────────────────────────────
 
     if is_high_atr:
@@ -183,9 +206,38 @@ def classify(
             f"consistency={consistency:.2f}"
         )
         log.warning(
-            "[MARKET STATE] %s [VOLATILE EXPANSION] | atr=%.1f high_threshold=%.0f "
-            "exec_mult=%.2f",
+            "[MARKET REGIME] %s [VOLATILE EXPANSION] [LOW QUALITY ENVIRONMENT] "
+            "| atr=%.1f threshold=%.0f exec_mult=%.2f",
             symbol, atr_pips, _atr_high, exec_mult,
+        )
+
+    elif _is_reversal:
+        # Sharp counter-trend move — trend bias invalidated
+        state     = "REVERSAL_ENVIRONMENT"
+        exec_mult = 0.65
+        reason    = (
+            f"reversal_environment | dir={trend_direction} strength={trend_strength:.0f} "
+            f"consistency={consistency:.2f} ema_dev={ema_dev:.2f}"
+        )
+        log.warning(
+            "[MARKET REGIME] %s [REVERSAL ENVIRONMENT] [LOW QUALITY ENVIRONMENT] "
+            "| strength=%.0f consistency=%.2f ema_dev=%.2f exec_mult=0.65",
+            symbol, trend_strength, consistency, ema_dev,
+        )
+
+    elif _is_compressed:
+        # Low-range coiling — potential breakout but direction unconfirmed
+        state     = "VOLATILITY_COMPRESSION"
+        exec_mult = 0.75
+        reason    = (
+            f"volatility_compression | recent_range={_recent_avg:.5f} "
+            f"prior_range={_prior_avg:.5f} consistency={consistency:.2f}"
+        )
+        log.warning(
+            "[MARKET REGIME] %s [VOLATILITY COMPRESSION] [LOW QUALITY ENVIRONMENT] "
+            "| range_ratio=%.2f exec_mult=0.75",
+            symbol,
+            _recent_avg / _prior_avg if _prior_avg > 0 else 0,
         )
 
     elif trend_direction != "neutral" and trend_strength >= _MIN_TREND_STRENGTH_TRENDING \
@@ -198,8 +250,8 @@ def classify(
             f"consistency={consistency:.2f} ema_dev={ema_dev:.2f}"
         )
         log.warning(
-            "[MARKET STATE] %s [TRENDING] | dir=%s strength=%.0f consistency=%.2f "
-            "ema_dev=%.2f exec_mult=1.00 [CONTINUATION BIAS]",
+            "[MARKET REGIME] [TREND REGIME] %s [TRENDING] | dir=%s strength=%.0f "
+            "consistency=%.2f ema_dev=%.2f exec_mult=1.00 [CONTINUATION BIAS]",
             symbol, trend_direction, trend_strength, consistency, ema_dev,
         )
 
@@ -213,8 +265,8 @@ def classify(
             f"dir={trend_direction}"
         )
         log.warning(
-            "[MARKET STATE] %s [RANGING] [LOW QUALITY MARKET] | "
-            "consistency=%.2f ema_dev=%.2f exec_mult=0.80",
+            "[MARKET REGIME] [RANGE REGIME] %s [RANGING] [LOW QUALITY ENVIRONMENT] "
+            "| consistency=%.2f ema_dev=%.2f exec_mult=0.80",
             symbol, consistency, ema_dev,
         )
 
@@ -227,8 +279,8 @@ def classify(
             f"consistency={consistency:.2f} (below threshold={_CONSISTENT_TRENDING:.2f})"
         )
         log.warning(
-            "[MARKET STATE] %s [TRENDING] (moderate) | consistency=%.2f "
-            "exec_mult=0.90",
+            "[MARKET REGIME] [TREND REGIME] %s [TRENDING] (moderate) | "
+            "consistency=%.2f exec_mult=0.90",
             symbol, consistency,
         )
 

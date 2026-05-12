@@ -10,11 +10,16 @@
 broker_suffix: ".Z"
 
 symbols:
-  - XAUUSD.Z   # Gold — best performer: 44% WR, +204 PnL (vs 25% WR overall)
-  - GBPUSD.Z   # High ATR, strong institutional flow — London session leader
-  - GBPJPY.Z   # High ATR, trend-driven, excels with FVG+OB in London
-  - EURUSD.Z   # Deepest liquidity — good for sweeps when trending
+  # Phase 6: Standardized symbol list. Gold must use XAUUSD (no .Z suffix ever).
+  # Forex pairs use the broker suffix configured in broker_suffix above.
+  - XAUUSD     # Gold — NO .Z suffix. Best performer. High ATR.
+  - EURUSD.Z   # Deepest liquidity — sweeps + trend continuation
+  - GBPUSD.Z   # High ATR, strong institutional flow — London leader
   - USDJPY.Z   # Risk-on gauge; carry pair with clear institutional bias
+  - AUDUSD.Z   # Commodity-correlated; active in Asian crossover
+  - USDCAD.Z   # Oil-correlated; active during NY open
+  - NZDUSD.Z   # Lower ATR pair; conservative execution
+  - USDCHF.Z   # Safe-haven flow; active in London
 
 # ── Risk management ───────────────────────────────────────────
 risk:
@@ -311,4 +316,40 @@ news:
   fomc_size_mult:    0.50    # lot multiplier during FOMC risk window
   avoid_rollover:    false   # rollover is outside session gate — redundant but available
   news_size_mult:    0.50    # generic fallback size reduction during news events
+
+# ── Phase 6: AI Adaptive Learning ────────────────────────────────────────────
+# Controls the AdaptiveLearning engine's rolling-window analysis and
+# confidence modifier generation.  Bounded to prevent over-fitting.
+adaptive_learning:
+  rolling_window_short:   20    # recent trades for short-term factor analysis
+  rolling_window_long:    100   # extended window for trend confirmation
+  symbol_modifier_min:    0.70  # floor: worst-performing symbols get 0.70× confidence
+  symbol_modifier_max:    1.00  # ceiling: no symbol gets more than 1.00× boost
+  session_modifier_min:   0.75  # floor for session-based confidence modifier
+  min_trades_for_modifier: 15   # minimum trades before symbol/session modifier activates
+  drift_guard_pct:        15    # max % deviation from baseline weights before rollback
+
+# ── Phase 6: Execution Quality ────────────────────────────────────────────────
+# Monitors fill quality and degrades trading during poor broker conditions.
+execution_quality:
+  slippage_warn_pips:     2.0   # log [SLIPPAGE DETECTED] above this
+  slippage_block_pips:    5.0   # refuse future trades if avg slippage exceeds this
+  spread_spike_ratio:     2.5   # spread > N× symbol avg → [SPREAD INSTABILITY]
+  quality_window:         20    # trades in rolling quality window
+  min_quality_score:      40    # quality score below this → [EXECUTION HEALTH] warning
+
+# ── Phase 6: Failsafe & Recovery ─────────────────────────────────────────────
+failsafe:
+  stale_candle_threshold: 3     # same candle repeated N times → [FAILSAFE] stale data
+  duplicate_window_sec:   30    # window to detect duplicate ticket submissions
+  mt5_reconnect_attempts: 3     # auto-reconnect tries before raising [RECOVERY ACTIVE]
+  max_cycle_duration_sec: 90    # scan cycle > this → [LATENCY WARNING]
+  execution_lock_timeout: 10    # per-symbol lock timeout (seconds)
+
+# ── Phase 6: Enterprise Telemetry ────────────────────────────────────────────
+telemetry:
+  heartbeat_interval_cycles: 1    # emit [ENTERPRISE HEARTBEAT] every N cycles
+  memory_warn_mb:             500  # [VPS STATUS] warning above this RSS MB
+  cycle_warn_sec:             60   # [LATENCY WARNING] if cycle exceeds this
+  health_score_window:        10   # cycles used to compute rolling health score
 

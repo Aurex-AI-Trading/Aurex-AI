@@ -50,8 +50,18 @@ KNOWN_SUFFIXES: List[str] = [
     ".raw", ".pro", ".ecn", ".std", ".stp", ".cnt", ".Z", ".m", ".r", ".b",
 ]
 
+# Symbols that must NEVER receive a broker suffix, regardless of broker_suffix config.
+# Gold on virtually all MT5 brokers is traded as plain "XAUUSD" without any suffix.
+NO_SUFFIX_SYMBOLS: FrozenSet[str] = frozenset({
+    "XAUUSD", "XAGUSD", "XTIUSD", "GOLD", "SILVER",
+})
+
 # Base symbols Aurex AI trades — broker suffix is applied on top.
-BASE_SYMBOLS: List[str] = ["EURUSD", "GBPUSD", "USDJPY"]
+# Phase 6: expanded to full 8-symbol set; XAUUSD handled via NO_SUFFIX_SYMBOLS.
+BASE_SYMBOLS: List[str] = [
+    "XAUUSD", "EURUSD", "GBPUSD", "USDJPY",
+    "AUDUSD", "USDCAD", "NZDUSD", "USDCHF",
+]
 
 # Retry config for symbol_select failures
 _SELECT_RETRIES    = 3
@@ -98,13 +108,19 @@ def to_broker_symbol(base_or_broker: str, suffix: str) -> str:
     Convert a base or already-suffixed symbol to the canonical broker form.
 
     Idempotent — safe to call even if the symbol already has the suffix.
+    Symbols in NO_SUFFIX_SYMBOLS (e.g. XAUUSD) always return without a suffix
+    regardless of what suffix is passed — gold on MT5 brokers is never suffixed.
 
     Examples:
         to_broker_symbol("EURUSD",   ".Z") → "EURUSD.Z"
         to_broker_symbol("EURUSD.Z", ".Z") → "EURUSD.Z"  (no double suffix)
         to_broker_symbol("EURUSD.m", ".Z") → "EURUSD.Z"  (replaces wrong suffix)
+        to_broker_symbol("XAUUSD",   ".Z") → "XAUUSD"    (gold — suffix suppressed)
+        to_broker_symbol("XAUUSD.Z", ".Z") → "XAUUSD"    (strips wrong suffix from gold)
     """
     base = strip_suffix(base_or_broker)
+    if base.upper() in NO_SUFFIX_SYMBOLS:
+        return base.upper()
     return add_suffix(base, suffix)
 
 
@@ -346,7 +362,7 @@ def validate_symbol(
             return False, f"zero_prices: {symbol} bid={tick.bid} ask={tick.ask}"
 
     log.info(
-        "[SYMBOL MAPPER] %s validated OK | trade_mode=%d",
+        "[SYMBOL VERIFIED] [SYMBOL EXECUTION READY] %s | trade_mode=%d",
         symbol, trade_mode,
     )
     return True, ""
@@ -364,7 +380,7 @@ def log_symbol_config(
     """
     bases = get_base_symbols(broker_symbols)
     log.warning(
-        "\n"
+        "[SYMBOL INIT] [MARKET WATCH SYNC]\n"
         "  ┌──────────────────────────────────────────────────┐\n"
         "  │           SYMBOL CONFIGURATION                    │\n"
         "  ├──────────────────────────────────────────────────┤\n"

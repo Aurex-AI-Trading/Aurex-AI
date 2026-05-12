@@ -192,23 +192,33 @@ class WeightAdjuster:
 
         if changes:
             log.warning(
-                "[LEARNING] Component-weight update | changes=%s | "
-                "trades=%d wr=%.1f%% pf=%.2f",
+                "[AI LEARNING] [WEIGHT ADAPTED] Component-weight update | changes=%s | "
+                "trades=%d wr=%.1f%% pf=%.2f | [STRATEGY EVOLUTION]",
                 changes, n_closed,
                 report.win_rate * 100,
                 report.profit_factor,
             )
             self._save()
-            log.info(
-                "[LEARNING] New weights — trend=%d liq=%d fvg=%d fib=%d ema=%d conf=%d ob=%d",
+            log.warning(
+                "[AI LEARNING] New weights | trend=%d liq=%d fvg=%d fib=%d ema=%d conf=%d ob=%d"
+                " | [OPTIMIZATION APPLIED]",
                 self._weights.trend, self._weights.liquidity, self._weights.fvg,
                 self._weights.fibonacci, self._weights.ema, self._weights.confirmation,
                 self._weights.order_block,
             )
+            # Highlight factors with large deltas as detected edges
+            strong = {k: v for k, v in report.component_deltas.items() if abs(v) > 1.0}
+            if strong:
+                log.warning(
+                    "[EDGE DETECTED] [AI LEARNING] High-signal factors: %s | "
+                    "[FACTOR PERFORMANCE] deltas=%s",
+                    list(strong.keys()),
+                    {k: f"{v:+.3f}" for k, v in strong.items()},
+                )
         else:
             log.info(
-                "[LEARNING] Component check: no adjustment (deltas within thresholds) "
-                "trades=%d", n_closed
+                "[AI LEARNING] Component check: no adjustment (deltas within thresholds) "
+                "trades=%d [SAFE ADAPTATION]", n_closed
             )
 
     # ── Legacy mode (daily, setup-type keyword matching) ─────────────────────
@@ -275,12 +285,13 @@ class WeightAdjuster:
 
         if changes:
             log.warning(
-                "[LEARNING] Legacy weight update | changes=%s | trades=%d wr=%.1f%%",
+                "[AI LEARNING] [WEIGHT ADAPTED] Legacy update | changes=%s | "
+                "trades=%d wr=%.1f%% | [AUTO OPTIMIZATION]",
                 changes, total_trades, overall_wr * 100,
             )
             self._save()
         else:
-            log.info("[LEARNING] Legacy weight check: no adjustment needed")
+            log.info("[AI LEARNING] Legacy check: no adjustment needed [SAFE ADAPTATION]")
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -304,7 +315,7 @@ class WeightAdjuster:
                     loaded.validate()
                     return loaded
                 except ValueError:
-                    log.warning("[LEARNING] Loaded weights invalid — resetting to defaults")
+                    log.warning("[AI LEARNING] Loaded weights invalid — resetting to defaults [SAFE ADAPTATION]")
             except Exception as exc:
                 log.warning("Failed to load weights: %s — using defaults", exc)
         return FactorWeights()
