@@ -63,11 +63,11 @@ scoring:
     ema:          10   # unchanged
     confirmation: 10   # unchanged
   thresholds:
-    tier1:        60   # score >= tier1  → EXECUTE   (1.00× lot)
-    tier2:        50   # score >= tier2  → CONDITIONAL (0.50× lot)
-    tier3:        35   # score >= tier3  → TIER3     (0.25× lot)  was 40
+    tier1:        80   # Phase 10: raised from 60 — genuine A+ institutional setup
+    tier2:        70   # Phase 10: raised from 50 — solid 2-factor confirmation required
+    tier3:        55   # Phase 10: raised from 35 — blocked by min_execution_tier anyway
     # score < tier3 → SKIP
-  min_confidence:  50  # pre-filter floor: reject markets below 50 confidence score
+  min_confidence:  60  # Phase 10: raised from 50 — minimum market-readiness bar
 
 # ── Timeframes ────────────────────────────────────────────────
 timeframes:
@@ -100,9 +100,9 @@ strategy:
   min_wick_ratio:        0.40  # wick must be ≥40% of candle range (Phase 2: relaxed from 0.55)
 
   # Core score minimum (applied before bonus factors count)
-  # Prevents setups where OB/breakout/structure bonuses inflate a weak core past execution thresholds.
+  # Prevents bonus inflation rescuing a fundamentally weak signal.
   # core_score = trend + liquidity + fvg + fib + ema + confirmation (0-100, no bonuses)
-  min_core_score:        35    # trades with core < 35 are rejected regardless of bonus score
+  min_core_score:        45    # Phase 10: raised from 35 — need trend + at least 2 factors
 
   # ATR-based SL/TP multipliers (used by risk_manager.calculate)
   sl_atr_mult: 1.5    # SL = entry ± ATR(14) × this (1.5 ATR covers ~95% of normal moves)
@@ -232,23 +232,25 @@ testing:
 
 # ── Session management ────────────────────────────────────────
 session:
-  # London-NY overlap (13:00-15:59 UTC) data shows 0% win rate and -116 ZAR loss
-  # across 4 trades. This 3-hour window sees US news events (13:30 UTC), London
-  # position unwinding, and directional confusion as NY tries to establish trend.
-  # Result: false breakouts, wide spreads, whipsaw action.
-  block_overlap:        true   # block all new entries 13:00–15:59 UTC
-  overlap_start_hour:   13     # inclusive
-  overlap_end_hour:     16     # exclusive (16:00 = first allowed NY pure hour)
-  # Phase 5: Session quality multipliers (size penalties)
-  london_quality:       1.00   # full participation 07-13 UTC (highest institutional flow)
-  newyork_quality:      0.90   # slight reduction 16-21 UTC (post-overlap lower liquidity)
-  # [Phase 7] Session intelligence: confidence threshold adjustments
-  # Raises the bar during statistically weaker periods.
-  # London core (09-13 UTC): prime institutional window — no adjustment (base threshold)
-  # London open (07-09 UTC): spreads wide, volatility spiking — +3 confidence required
-  # NY pure   (16-21 UTC): lower liquidity, more choppy — +4 confidence required
-  london_open_conf_penalty:  3    # extra confidence pts required 07:00-08:59 UTC
-  newyork_conf_penalty:      4    # extra confidence pts required 16:00-20:59 UTC
+  # Phase 10: Analytics-driven session tuning.
+  # Live data: best_session=overlap (13-16 UTC), worst=london (07-13 UTC).
+  # overlap was previously blocked — that was counterproductive. Fixed.
+  # London produces the most false breakouts; confidence bar is raised.
+  # Overlap + NY are the priority execution windows.
+  block_overlap:        false  # Phase 10: UNBLOCKED — overlap is the best session
+  overlap_start_hour:   13     # kept for reference
+  overlap_end_hour:     16     # kept for reference
+  # Session quality multipliers (lot size adjustment)
+  london_quality:       0.85   # Phase 10: reduced — London is worst-performing session
+  newyork_quality:      0.95   # NY pure (16-21 UTC) — solid institutional flow
+  overlap_quality:      1.00   # overlap (13-16 UTC) — best session per live analytics
+  # Session confidence threshold adjustments (extra pts required)
+  london_open_conf_penalty:  6    # Phase 10: raised from 3 — noisiest window
+  newyork_conf_penalty:      2    # Phase 10: reduced from 4 — NY performs well
+  overlap_conf_bonus:        0    # overlap: no extra penalty needed
+  # Anti-overtrading session controls
+  session_loss_halt:    2      # pause new entries after N losses in same session
+  min_reentry_minutes:  30     # minimum gap between same-symbol same-direction entries
 
 # ── Per-symbol minimum confidence thresholds [Phase 8] ───────────────────────
 # Applied on top of mode.min_confidence. The stricter value wins.
@@ -256,11 +258,15 @@ session:
 # Gold strictest: extreme ATR + frequent false breaks demand highest gate.
 # High-ATR FX pairs carry elevated noise — stricter threshold required.
 per_symbol:
-  XAUUSD:   72    # Gold — strictest gate; extreme volatility and false breakouts
-  GBPJPY:   68    # Highest ATR cross — hardest directional predictability
-  GBPUSD:   68    # High-ATR GBP cable — wide spreads, London-dominated
-  USDJPY:   66    # Yen carry pair — risk-on/off driven; needs macro alignment
-  EURUSD:   66    # Deepest liquidity — still needs strong institutional signal
+  # Phase 10: Updated floors based on live WR analytics.
+  # XAUUSD: best performer (44.4% WR) — keep strictest gate to preserve quality.
+  # EURUSD/USDJPY: worst performers (12-15% WR) — significantly raised.
+  # GBPJPY/GBPUSD: moderate — raised to maintain quality bar.
+  XAUUSD:   72    # Gold — 44.4% WR; keep strict; widest ATR requires strong confirmation
+  GBPJPY:   70    # Highest ATR cross — raised from 68; needs cleaner structure
+  GBPUSD:   70    # GBP cable — raised from 68; London session noise filter
+  USDJPY:   74    # Phase 10: raised from 66 — only 12.5% WR; needs macro-grade alignment
+  EURUSD:   74    # Phase 10: raised from 66 — only 15.4% WR; needs institutional quality only
 
 # ── Trading mode gate presets ─────────────────────────────────
 # These override the individual strategy/risk/scoring values at runtime.
@@ -283,32 +289,39 @@ per_symbol:
 
 modes:
   normal:
-    # ── Institutional Normal: 5-symbol focused set (Phase 8) ─────────────────
-    # "Normal" sits between aggressive and conservative.
-    # Higher quality gate than aggressive; more adaptive than conservative.
-    # Confidence floor is 68 (forex) — well above retail noise level.
-    # Gold handled separately via per_symbol.XAUUSD=72.
-    # Tier 1 requires a genuinely strong institutional setup (score ≥72).
-    # Tier 2 allows solid but sub-elite setups (score ≥65) at half lot.
-    # Tier 3 blocked — only institutional quality executes.
-    min_confidence:       68     # base forex confidence floor (gold uses per_symbol=72)
-    min_atr_pips:         6.0    # minimum volatility — below this is a dead market
-    atr_optimal_max_pips: 30     # above 30 pips = news/spike territory — size-reduce
-    min_core_score:       42.0   # core must clear 42 before bonuses count
-    min_execution_tier:   2      # Tier 1+2 only; Tier 3 (0.25× lot) blocked
-    tier1:                72     # A+ setup: full institutional confluence required
-    tier2:                65     # B+ setup: solid but not elite; half lot
-    tier3:                52     # blocked by min_execution_tier=2 anyway
+    # ── Institutional Normal: Phase 10 Performance Optimization ──────────────
+    # Analytics: WR=16% DD=-85% → aggressive quality filtering required.
+    # Strongest factors: order_block, trend, fibonacci (per analytics).
+    # Weakest factor: breakout (demoted to minor confirmation only).
+    # Session: overlap=best, london=worst → session weights adjusted.
+    # Tier thresholds raised to eliminate low-quality Tier-2 trades.
+    # min_core_score raised: bonuses cannot rescue a weak core signal.
+    min_confidence:       70     # Phase 10: raised from 68 — base forex floor
+    min_atr_pips:         8.0    # Phase 10: raised from 6 — need real volatility
+    atr_optimal_max_pips: 35     # slightly wider — XAUUSD benefits from higher ATR
+    min_core_score:       48.0   # Phase 10: raised from 42 — trend+OB+Fib minimum
+    min_execution_tier:   2      # Tier 1+2 only; Tier 3 blocked
+    tier1:                80     # Phase 10: raised from 72 — A+ institutional only
+    tier2:                70     # Phase 10: raised from 65 — must have 2+ aligned factors
+    tier3:                55     # blocked by min_execution_tier=2
+    # Minimum vote count before tier check (set in confluence/decision logic)
+    min_votes_tier1:      2      # Tier 1 needs ≥2 directional votes
+    min_votes_tier2:      1      # Tier 2 needs ≥1 directional vote
+    # Ranging market blocks for weak symbols
+    block_ranging_symbols: true  # hard-block EURUSD/USDJPY in RANGING regime
     weights:
-      # Trend continuation + pullback focus (same as aggressive but with FX-biased balance).
-      # A trend+sweep+FVG setup scores ~86; trend+fib+ema scores ~68 (Tier 2 eligible).
-      # Strong BUY setups need sweep OR FVG confirmation — SELL slightly more lenient.
-      trend:        38   # primary driver — directional bias is the strongest edge
-      liquidity:    20   # sweep confirms institutional entry; secondary to trend
-      fvg:           8   # valid in London/NY; secondary to pullback structure
-      fibonacci:    18   # elevated — golden zone pullback is core entry signal
-      ema:          12   # elevated — EMA proximity is the continuation entry zone
-      confirmation:  4   # candle pattern confirms, doesn't lead
+      # Phase 10: Rebalanced to reflect live analytics.
+      # Strongest: trend, order_block (scored via OB bonus), fibonacci.
+      # OB bonus cap raised in confluence.py; breakout demoted.
+      # A premium trend+OB+Fib setup scores ~88 (clear Tier 1).
+      # A trend+Fib-only setup scores ~72 (low Tier 1 / high Tier 2).
+      # Breakout alone cannot reach Tier 2 — must be confluence-confirmed.
+      trend:        40   # Phase 10: raised from 38 — primary analytical edge
+      liquidity:    18   # sweep: secondary institutional confirmation
+      fvg:           8   # valid in overlap/NY; doesn't need to dominate
+      fibonacci:    20   # Phase 10: raised from 18 — golden zone is core entry signal
+      ema:          10   # EMA proximity: continuation zone timing
+      confirmation:  4   # candle pattern: confirms, never leads
 
   aggressive:
     # ── Quality-Aggressive: small account survivability (R500/$30) ────────────
@@ -412,13 +425,17 @@ news:
 # Controls the AdaptiveLearning engine's rolling-window analysis and
 # confidence modifier generation.  Bounded to prevent over-fitting.
 adaptive_learning:
-  rolling_window_short:   20    # recent trades for short-term factor analysis
-  rolling_window_long:    100   # extended window for trend confirmation
-  symbol_modifier_min:    0.70  # floor: worst-performing symbols get 0.70× confidence
-  symbol_modifier_max:    1.00  # ceiling: no symbol gets more than 1.00× boost
-  session_modifier_min:   0.75  # floor for session-based confidence modifier
-  min_trades_for_modifier: 15   # minimum trades before symbol/session modifier activates
-  drift_guard_pct:        15    # max % deviation from baseline weights before rollback
+  rolling_window_short:   15    # Phase 10: reduced from 20 — faster response to trend
+  rolling_window_long:    80    # Phase 10: reduced from 100 — more responsive
+  symbol_modifier_min:    0.65  # Phase 10: lowered from 0.70 — punish losers harder
+  symbol_modifier_max:    1.05  # Phase 10: allow slight bonus for proven symbols
+  session_modifier_min:   0.70  # Phase 10: lowered from 0.75 — session learning stricter
+  session_modifier_max:   1.05  # new: allow slight bonus for best session (overlap)
+  min_trades_for_modifier: 10   # Phase 10: reduced from 15 — activate learning faster
+  drift_guard_pct:        20    # Phase 10: raised from 15 — allow more adaptation
+  # Weight decay for losing setup types (applied per scan cycle after trade close)
+  weight_decay_on_loss:   0.97  # multiply factor weight by this after a loss with that factor
+  weight_recover_on_win:  1.01  # recover factor weight slightly after a win
 
 # ── Phase 6: Execution Quality ────────────────────────────────────────────────
 # Monitors fill quality and degrades trading during poor broker conditions.

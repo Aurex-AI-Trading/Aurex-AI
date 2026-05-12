@@ -1335,34 +1335,75 @@ async def scan_symbol(
         )
         return None
 
-    # ── London-NY overlap block ───────────────────────────────────────────────
-    # Historical data: 13:00-15:59 UTC produces 0% win rate.
-    # This window sees US news events (13:30 UTC), London position unwinding,
-    # and directional confusion as both sessions compete for control.
-    _sess_cfg    = getattr(cfg, "session", None)
+    # ── Phase 10: Session-loss halt ──────────────────────────────────────────
+    # If N consecutive losses occurred in this session/day, pause new entries.
+    # Uses the _session_losses counter updated after every trade close.
+    _sess_cfg        = getattr(cfg, "session", None)
+    _sess_loss_halt  = int(getattr(_sess_cfg, "session_loss_halt", 2))
+    _today_str       = current_time.strftime("%Y-%m-%d")
+    if _session_date != _today_str:
+        # New UTC day — reset session loss counter
+        _session_losses = 0
+        _session_date   = _today_str
+    if _session_losses >= _sess_loss_halt:
+        log.info(
+            "[SESSION HALT] %s — %d session losses reached limit of %d "
+            "→ no new entries until next UTC day",
+            symbol, _session_losses, _sess_loss_halt,
+        )
+        return None
+
+    # ── Phase 10: Anti-overtrading: minimum re-entry gap ─────────────────────
+    # Prevent clustered entries on the same symbol (e.g. chasing after a quick loss).
+    _min_reentry = int(getattr(_sess_cfg, "min_reentry_minutes", 30))
+    _last_ts     = _last_entry_ts.get(symbol)
+    if _last_ts is not None:
+        _elapsed_min = (current_time - _last_ts).total_seconds() / 60.0
+        if _elapsed_min < _min_reentry:
+            log.info(
+                "[ANTI-OVERTRADING] %s — last entry %.0f min ago (min=%d min) → skip",
+                symbol, _elapsed_min, _min_reentry,
+            )
+            return None
+
+    # ── London-NY overlap gate (Phase 10: unblocked — overlap is BEST session)
     _block_ov    = bool(getattr(_sess_cfg, "block_overlap", False))
     _ov_start    = int(getattr(_sess_cfg,  "overlap_start_hour", 13))
     _ov_end      = int(getattr(_sess_cfg,  "overlap_end_hour",   16))
     if _block_ov and _ov_start <= _utc_hour < _ov_end:
         log.info(
-            "[BLOCKED] %s — London-NY overlap blocked (UTC=%02d, %02d:00-%02d:00 excluded)",
-            symbol, _utc_hour, _ov_start, _ov_end,
+            "[BLOCKED] %s — overlap blocked via config (UTC=%02d)",
+            symbol, _utc_hour,
         )
         return None
 
-    # ── Session quality multiplier (Phase 5) ──────────────────────────────────
-    # London (7-13 UTC): full institutional flow — no reduction.
-    # NY pure (16-21 UTC): slightly lower liquidity post-overlap — configurable.
-    _sess_cfg_p5 = getattr(cfg, "session", None)
-    if 16 <= _utc_hour < 21:
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "newyork_quality", 0.90))
+    # ── Session quality multiplier (Phase 10: analytics-driven) ─────────────
+    # Live analytics: overlap (13-16 UTC) = BEST session, London = WORST.
+    # Overlap now allowed (block_overlap=false); session multipliers adjusted.
+    _sess_cfg_p5    = getattr(cfg, "session", None)
+    _ov_start_hour  = int(getattr(_sess_cfg_p5, "overlap_start_hour", 13))
+    _ov_end_hour    = int(getattr(_sess_cfg_p5, "overlap_end_hour",   16))
+    if _ov_start_hour <= _utc_hour < _ov_end_hour:
+        # London-NY overlap — best session per analytics
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "overlap_quality", 1.00))
+        log.info(
+            "[SESSION FILTER] %s OVERLAP session UTC=%d quality=%.0f%% [BEST SESSION]",
+            symbol, _utc_hour, _session_quality_mult * 100,
+        )
+    elif 16 <= _utc_hour < 21:
+        # NY pure session
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "newyork_quality", 0.95))
         log.info(
             "[SESSION FILTER] %s NY session UTC=%d quality=%.0f%%",
             symbol, _utc_hour, _session_quality_mult * 100,
         )
     else:
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "london_quality",  1.00))
-        log.info("[HIGH LIQUIDITY SESSION] %s London session UTC=%d", symbol, _utc_hour)
+        # London session — worst per analytics; apply reduced multiplier
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "london_quality", 0.85))
+        log.info(
+            "[SESSION FILTER] %s London session UTC=%d quality=%.0f%% [WORST SESSION]",
+            symbol, _utc_hour, _session_quality_mult * 100,
+        )
 
     # ── News guard (Phase 5) ──────────────────────────────────────────────────
     # Blocks NFP window (1st Friday 13:30 UTC ±15/30 min) and reduces size during
@@ -1799,6 +1840,17 @@ async def scan_symbol(
     )
     _market_mult = _market_state.exec_mult   # 1.00/0.90/0.80/0.70/0.00
 
+    # Phase 10: Hard block when market regime produces exec_mult=0.0
+    # Covers: DEAD (atr<=3) and RANGING on weak symbols (EURUSD/USDJPY).
+    # This prevents the pipeline from progressing to strategy + risk calcs.
+    if _market_mult == 0.0:
+        log.warning(
+            "[BLOCKED] %s — market regime HARD BLOCK | state=%s reason=%s",
+            symbol, _market_state.state, _market_state.reason,
+        )
+        _log_rejected(symbol, f"REGIME_BLOCK_{_market_state.state}", atr=atr_pips)
+        return None
+
     # ── H1 trend bias + M5 entry timing ─────────────────────────────────────
     # H1 defines macro direction. M5 EMA20 is the entry timing signal.
     # Three outcomes: aligned (full size), near/recovering (size penalty), misaligned (skip).
@@ -2061,12 +2113,17 @@ async def scan_symbol(
     )
 
     # ── Decision ──────────────────────────────────────────────────────────────
+    # Phase 10: Pass min_votes thresholds from config (default: T1≥2 votes, T2≥1)
+    _min_votes_t1 = int(getattr(mode, "min_votes_tier1", 2))
+    _min_votes_t2 = int(getattr(mode, "min_votes_tier2", 1))
     decision = decide(
         symbol,
         confluence,
-        exec_thresh  = thresholds.tier1,
-        cond_thresh  = thresholds.tier2,
-        tier3_thresh = thresholds.tier3,
+        exec_thresh      = thresholds.tier1,
+        cond_thresh      = thresholds.tier2,
+        tier3_thresh     = thresholds.tier3,
+        min_votes_tier1  = _min_votes_t1,
+        min_votes_tier2  = _min_votes_t2,
     )
     decision.confidence = float(confidence.total)
 
@@ -2999,6 +3056,15 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     scan_num    = 0
     idle_cycles = 0
 
+    # Phase 10: Anti-overtrading state — session-loss counter and entry timer.
+    # _session_losses: counts losses in the current UTC-date-session window.
+    # _session_date:   the date string when session_losses was last reset.
+    # _last_entry_ts:  {symbol → datetime} — timestamp of most recent entry per symbol.
+    # Used to enforce min_reentry_minutes and session_loss_halt rules.
+    _session_losses: int   = 0
+    _session_date:   str   = ""
+    _last_entry_ts:  dict  = {}   # symbol → datetime of last entry
+
     while not _SHUTDOWN.is_set():
         scan_num    = scan_num + 1
         t_start     = asyncio.get_event_loop().time()
@@ -3185,6 +3251,8 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 if result is not None:
                     signals_generated += 1
                     trades_this_cycle += 1
+                    # Phase 10: Record entry timestamp for anti-overtrading gate
+                    _last_entry_ts[sym] = server_time
             except Exception as exc:
                 log.error("[ERROR] symbol=%s error=%s", sym, exc, exc_info=True)
 
@@ -3336,6 +3404,22 @@ def _check_live_outcomes(
             # Account Guard — update persistent loss streak + halted state
             if guard is not None:
                 guard.record_trade_outcome(won=won, pnl=profit)
+
+            # Phase 10: Session-loss counter — increments on loss, resets on win
+            if not won:
+                _session_losses += 1
+                log.warning(
+                    "[SESSION LOSS] %s — session losses=%d (halt at %d)",
+                    meta.get("symbol", "?"), _session_losses,
+                    int(getattr(getattr(cfg, "session", None), "session_loss_halt", 2)),
+                )
+            else:
+                if _session_losses > 0:
+                    log.info(
+                        "[SESSION RECOVERY] %s — win cleared session loss streak (was=%d)",
+                        meta.get("symbol", "?"), _session_losses,
+                    )
+                _session_losses = 0
 
             # Record into learning engine for weight + threshold adaptation
             engine.record_outcome(

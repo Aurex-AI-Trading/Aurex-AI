@@ -1,5 +1,5 @@
 """
-Aurex AI Signature Strategy — Confluence Engine
+Aurex AI Signature Strategy — Confluence Engine  (Phase 10: Strategy Optimization)
 
 Aggregates all module scores into a single 0–115 score and resolves
 the trade direction through weighted voting.
@@ -14,16 +14,24 @@ Core weight allocation (sums to 100, dynamically adjusted by WeightAdjuster):
 
 Bonus factors (on top of core 100):
   order_block  = 0–15  (OBResult.score)
-  breakout     = 0–12  (BreakoutResult.score)
+  breakout     = 0–4   (Phase 10: demoted from 6/12 — weakest analytical factor)
 
-Direction resolution (weighted voting):
-  Trend:  strength × 2  — primary driver
-  Sweep:  strength × 1  — standard confirmation
-  FVG:    score    × 0.5 — secondary confirmation
+Direction resolution (weighted voting) — Phase 10:
+  Trend:       strength × 2.0  — primary driver
+  Sweep:       strength × 1.0  — institutional confirmation
+  OB:          score    × 0.8  — NEW: strongest bonus factor; added to vote
+  FVG:         score    × 0.4  — secondary confirmation (reduced from 0.5)
+  Structure:   score    × 0.3  — NEW: BOS direction added as minor voter
 
   Direction = side with higher weighted score.
   Tie-break: raw vote count → trend direction → NONE (all signals absent).
   Trend fallback: if weighted vote yields NONE but trend is non-neutral, trend wins.
+
+Phase 10 change rationale:
+  Live analytics show order_block and fibonacci are the STRONGEST factors (highest
+  win-rate correlation). Breakout is the WEAKEST. Adding OB to direction voting
+  ensures institutional zones drive direction, not just trend momentum.
+  Reducing breakout cap prevents fake breakout setups from inflating weak signals.
 """
 from __future__ import annotations
 
@@ -75,17 +83,23 @@ class ConfluenceResult:
 # ── Weighted direction resolution ────────────────────────────────────────────
 
 def _resolve_direction(
-    trend: TrendResult,
-    sweep: SweepResult,
-    fvg:   FVGResult,
+    trend:           TrendResult,
+    sweep:           SweepResult,
+    fvg:             FVGResult,
+    ob_score:        float = 0.0,
+    ob_direction:    str   = "none",
+    structure_score: float = 0.0,
+    structure_dir:   str   = "none",
 ) -> tuple[str, int, int]:
     """
     Resolve trade direction via weighted scoring.
 
-    Weights:
-      Trend  = strength × 2   (primary driver — range 0–50)
-      Sweep  = strength × 1   (standard — range 0–20)
-      FVG    = score × 0.5    (confirmation — range 0–10)
+    Phase 10 weights (extended voting pool):
+      Trend     = strength × 2.0   (primary driver — range 0–50)
+      Sweep     = strength × 1.0   (institutional confirmation — range 0–20)
+      OB        = score × 0.8      (NEW: strongest bonus; institutional zone — range 0–12)
+      FVG       = score × 0.4      (secondary confirmation — range 0–8)
+      Structure = score × 0.3      (BOS direction as minor voter — range 0–7.5)
 
     Resolution order:
       1. Higher weighted score wins.
@@ -106,22 +120,40 @@ def _resolve_direction(
         sell_w += trend.strength * 2.0
         sell   += 1
 
-    # Sweep — standard weight (1×)
+    # Sweep — institutional confirmation (1×)
     if sweep.detected:
         if sweep.sweep_type == "buy_side":
-            buy_w += sweep.strength
+            buy_w += sweep.strength * 1.0
             buy   += 1
         elif sweep.sweep_type == "sell_side":
-            sell_w += sweep.strength
+            sell_w += sweep.strength * 1.0
             sell   += 1
 
-    # FVG — confirmation weight (0.5×)
+    # OB — Phase 10 NEW: strongest bonus factor added to voting (0.8×)
+    if ob_score > 0:
+        if ob_direction == "bullish":
+            buy_w += ob_score * 0.8
+            buy   += 1
+        elif ob_direction == "bearish":
+            sell_w += ob_score * 0.8
+            sell   += 1
+
+    # FVG — secondary confirmation (0.4×, reduced from 0.5)
     if fvg.present and fvg.active_zone is not None:
         if fvg.active_zone.bullish:
-            buy_w += fvg.score * 0.5
+            buy_w += fvg.score * 0.4
             buy   += 1
         else:
-            sell_w += fvg.score * 0.5
+            sell_w += fvg.score * 0.4
+            sell   += 1
+
+    # Structure — BOS direction as minor voter (0.3×)
+    if structure_score > 0:
+        if structure_dir in ("buy", "bullish"):
+            buy_w += structure_score * 0.3
+            buy   += 1
+        elif structure_dir in ("sell", "bearish"):
+            sell_w += structure_score * 0.3
             sell   += 1
 
     # No signals at all
@@ -184,7 +216,15 @@ def combine(
     Returns:
         ConfluenceResult with direction, scores, and structured analysis log.
     """
-    direction, buy_votes, sell_votes = _resolve_direction(trend, sweep, fvg)
+    # Phase 10: Pass OB and structure into direction voting so the strongest
+    # factors (OB, structure) actively shape the direction, not just boost score.
+    direction, buy_votes, sell_votes = _resolve_direction(
+        trend, sweep, fvg,
+        ob_score        = ob_score,
+        ob_direction    = ob_direction,
+        structure_score = structure_score,
+        structure_dir   = structure_direction,
+    )
 
     # Trend override: weighted vote can only return NONE when all signals are
     # absent (buy_w = sell_w = 0).  If trend is non-neutral, use it directly
@@ -224,12 +264,14 @@ def combine(
         (direction == "SELL" and breakout_direction == "bearish")
     )
     ob_pts = _scale(ob_score, _DEF["order_block"], w["order_block"]) if ob_aligned else 0.0
-    # Breakout demoted to secondary confirmation — capped at 6 (was 12).
-    # Primary edge is trend continuation + pullback (OB/Fib); breakout confirms but doesn't lead.
-    bo_pts = max(0.0, min(6.0, breakout_score)) if bo_aligned else 0.0
+    # Phase 10: Breakout demoted further — capped at 4 (was 6, original 12).
+    # Breakout is the WEAKEST analytical factor per live analytics.
+    # It only adds minor confirmation when OB or Fib is already present;
+    # on its own it cannot push a weak setup past execution thresholds.
+    bo_pts = max(0.0, min(4.0, breakout_score)) if bo_aligned else 0.0
     if bo_pts > 0 and bo_aligned:
         log.info(
-            "[BREAKOUT SECONDARY] %s — breakout +%.1f (capped at 6) [CONTINUATION PRIORITY]",
+            "[BREAKOUT SECONDARY] %s — breakout +%.1f (capped at 4) [WEAKEST FACTOR]",
             symbol, bo_pts,
         )
 
@@ -245,18 +287,42 @@ def combine(
     fvg_label    = "yes" if fvg.present else "no"
     sweep_label  = sweep.sweep_type if sweep.detected else "none"
 
-    # Determine tier label for display (thresholds mirrored from settings.yaml)
+    # Determine tier label for display (Phase 10 thresholds)
     if direction != "NONE":
-        if total >= 60:
+        if total >= 80:
             tier_label = "-> TRADE (Tier 1)"
-        elif total >= 50:
+        elif total >= 70:
             tier_label = "-> TRADE (Tier 2)"
-        elif total >= 35:
+        elif total >= 55:
             tier_label = "-> TRADE (Tier 3)"
         else:
             tier_label = "-> SKIP"
     else:
         tier_label = "-> SKIP (no consensus)"
+
+    # Phase 10: [TRADE QUALITY] structured diagnostic log — emitted before analysis block.
+    # Quantifies setup quality across all institutional factors for telemetry.
+    _trend_quality   = "STRONG" if t_score >= 20  else ("MODERATE" if t_score >= 12 else "WEAK")
+    _ob_quality      = "PRESENT" if ob_pts > 0     else "ABSENT"
+    _fib_quality     = "GOLDEN" if fib.continuation_aligned else ("ZONE" if fi_score > 0 else "ABSENT")
+    _sweep_quality   = sweep.sweep_type if sweep.detected else "none"
+    _setup_type      = (
+        "OB+TREND+FIB" if (ob_pts > 0 and fi_score > 0 and t_score >= 12) else
+        "OB+TREND"     if (ob_pts > 0 and t_score >= 12) else
+        "TREND+FIB"    if (fi_score > 0 and t_score >= 12) else
+        "TREND+SWEEP"  if (l_score > 0 and t_score >= 12) else
+        "TREND_ONLY"   if t_score >= 12 else
+        "MIXED"
+    )
+    log.warning(
+        "[TRADE QUALITY] %s setup=%s dir=%s score=%.1f "
+        "trend=%s(%.1f) ob=%s(%.1f) fib=%s(%.1f) sweep=%s(%.1f) "
+        "votes=%dB/%dS core=%.1f",
+        symbol, _setup_type, direction, total,
+        _trend_quality, t_score, _ob_quality, ob_pts,
+        _fib_quality, fi_score, _sweep_quality, l_score,
+        buy_votes, sell_votes, core,
+    )
 
     analysis = (
         f"\n[ANALYSIS] {symbol}\n"

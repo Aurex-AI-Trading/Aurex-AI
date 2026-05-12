@@ -50,11 +50,15 @@ _ATR_HIGH_FOREX = 25.0   # forex pairs: ATR > 25 pips = volatile expansion
 _ATR_HIGH_GOLD  = 200.0  # XAUUSD: ATR > 200 pips = volatile expansion
 
 # Trend strength gate: minimum TrendResult.strength to call it TRENDING
-_MIN_TREND_STRENGTH_TRENDING = 10.0
+_MIN_TREND_STRENGTH_TRENDING = 12.0   # Phase 10: raised from 10 — stricter TRENDING gate
 
 # Directional consistency: fraction of candles making H/H-L or L/H-L in trend direction
-_CONSISTENT_TRENDING = 0.55   # ≥55% of recent bars agree with trend direction
-_CONSISTENT_RANGING  = 0.40   # ≤40% → market is oscillating without conviction
+_CONSISTENT_TRENDING = 0.58   # Phase 10: raised from 0.55 — stricter trending gate
+_CONSISTENT_RANGING  = 0.42   # Phase 10: raised from 0.40 — catch more ranging conditions
+
+# Symbols where RANGING state triggers a hard block (exec_mult=0.0)
+# rather than a soft size reduction. These pairs have only 12-15% WR in chop.
+_RANGE_BLOCK_SYMBOLS = {"EURUSD", "USDJPY"}
 
 
 @dataclass
@@ -257,18 +261,31 @@ def classify(
 
     elif consistency <= _CONSISTENT_RANGING or \
             (trend_direction == "neutral" and ema_dev < 0.5):
-        # Ranging: low directional consistency or neutral trend with price near EMA
-        state     = "RANGING"
-        exec_mult = 0.80
-        reason    = (
+        # Phase 10: Symbol-aware RANGING block.
+        # EURUSD and USDJPY have only 12-15% WR in ranging conditions.
+        # For these weak symbols, RANGING = hard block (exec_mult=0.0).
+        # All other symbols get the standard 20% size reduction.
+        _sym_upper = symbol.upper()
+        _is_weak   = any(w in _sym_upper for w in _RANGE_BLOCK_SYMBOLS)
+        state      = "RANGING"
+        exec_mult  = 0.0 if _is_weak else 0.80
+        reason     = (
             f"ranging | consistency={consistency:.2f} ema_dev={ema_dev:.2f} "
-            f"dir={trend_direction}"
+            f"dir={trend_direction} | {'HARD_BLOCK(weak_symbol)' if _is_weak else 'size_reduced'}"
         )
-        log.warning(
-            "[MARKET REGIME] [RANGE REGIME] %s [RANGING] [LOW QUALITY ENVIRONMENT] "
-            "| consistency=%.2f ema_dev=%.2f exec_mult=0.80",
-            symbol, consistency, ema_dev,
-        )
+        if _is_weak:
+            log.warning(
+                "[MARKET REGIME] [RANGE REGIME] %s [RANGING] [HARD BLOCK] "
+                "| consistency=%.2f ema_dev=%.2f exec_mult=0.0 "
+                "[WEAK SYMBOL — NO TRADES IN RANGE]",
+                symbol, consistency, ema_dev,
+            )
+        else:
+            log.warning(
+                "[MARKET REGIME] [RANGE REGIME] %s [RANGING] [LOW QUALITY ENVIRONMENT] "
+                "| consistency=%.2f ema_dev=%.2f exec_mult=0.80",
+                symbol, consistency, ema_dev,
+            )
 
     else:
         # Moderate trend — partially directional but not confirmed

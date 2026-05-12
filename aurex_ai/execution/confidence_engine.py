@@ -34,48 +34,74 @@ from aurex_ai.core.logger import get_logger
 
 log = get_logger("execution.confidence")
 
-MIN_TRADE_CONFIDENCE = 40   # [Phase 7] base pre-filter raised from 30; use get_confidence_threshold() for adaptive
+MIN_TRADE_CONFIDENCE = 50   # Phase 10: raised from 40 — base pre-filter floor
 
-# Per-symbol minimum confidence thresholds [Phase 8]
-# Applied independently of mode.min_confidence — the stricter gate wins.
-# Matches settings.yaml per_symbol section exactly.
-# Key: strip all broker suffixes before lookup (XAUUSD, not XAUUSD.Z).
+# Per-symbol minimum confidence thresholds — Phase 10
+# Synced with settings.yaml per_symbol section.
+# EURUSD/USDJPY raised significantly: live WR 12-15% demands much stricter pre-filter.
+# XAUUSD: best performer (44.4% WR); strictest gate preserved.
 _SYMBOL_CONF_FLOOR: dict = {
-    "XAUUSD": 72,   # Gold — extreme ATR + frequent false breaks; strictest institutional gate
-    "GBPJPY": 68,   # Highest ATR cross; hardest directional predictability
-    "GBPUSD": 68,   # High-ATR GBP cable; wide spreads + London-dominated flow
-    "USDJPY": 66,   # Yen carry pair; risk-on/off driven; needs macro alignment
-    "EURUSD": 66,   # Deepest FX liquidity; still needs strong institutional signal
+    "XAUUSD": 72,   # Gold — 44.4% WR; widest ATR; strictest institutional gate preserved
+    "GBPJPY": 70,   # Phase 10: raised from 68 — highest ATR cross; needs cleaner structure
+    "GBPUSD": 70,   # Phase 10: raised from 68 — GBP cable; London session noise filter
+    "USDJPY": 74,   # Phase 10: raised from 66 — only 12.5% WR; macro-grade required
+    "EURUSD": 74,   # Phase 10: raised from 66 — only 15.4% WR; institutional quality only
 }
 
+# Symbols classified as "weak" (low WR) — apply extra ranging/compression block
+_WEAK_SYMBOLS = {"EURUSD", "USDJPY"}
 
-def get_confidence_threshold(utc_hour: int = -1, atr_pips: float = 0.0) -> int:
+
+def get_confidence_threshold(
+    utc_hour:   int   = -1,
+    atr_pips:   float = 0.0,
+    symbol:     str   = "",
+    market_state: str = "",
+) -> int:
     """
     Return an adaptive minimum confidence threshold for market state.
 
-    Used as a secondary gate alongside mode.min_confidence and per-symbol
-    thresholds.  Raises bar for dead or off-hours markets.
+    Phase 10: Extended with market regime awareness and symbol-specific
+    ranging penalties. Raises bar for dead, off-hours, or ranging markets.
 
     Args:
-        utc_hour:  Current UTC hour (0-23).  Pass -1 when unknown.
-        atr_pips:  Recent ATR in pips for the symbol being evaluated.
+        utc_hour:     Current UTC hour (0-23). Pass -1 when unknown.
+        atr_pips:     Recent ATR in pips for the symbol being evaluated.
+        symbol:       Instrument name (for weak-symbol ranging penalty).
+        market_state: Market regime string ("RANGING", "TRENDING", etc.)
 
     Returns:
-        Threshold integer in the range [40, 58].
+        Threshold integer in the range [50, 75].
     """
-    base = MIN_TRADE_CONFIDENCE   # 40
+    base = MIN_TRADE_CONFIDENCE   # 50
 
     # Off-hours penalty: Asian / dead session demands a higher bar.
-    # London/NY sessions keep base unchanged.
     if utc_hour >= 0:
         if not (7 <= utc_hour < 21):
-            base += 8    # off-hours dead session
+            base += 10   # Phase 10: raised from 8
 
-    # Volatility penalty: flat market deserves a hard gate.
+    # Volatility penalty: flat market is a hard gate.
     if atr_pips < 5.0:
-        base += 10   # near-dead volatility; was 7
+        base += 12   # Phase 10: raised from 10
+    elif atr_pips < 8.0:
+        base += 5    # Phase 10: new — below healthy volatility floor
 
-    return max(40, min(58, base))
+    # Phase 10: Ranging market penalty for weak symbols.
+    # EURUSD/USDJPY in RANGING state need a massive confidence boost
+    # because they have only 12-15% WR on trend-following entries in chop.
+    _sym_base = symbol.upper().strip()
+    for suffix in (".Z", ".M", ".ECN", ".PRO", ".STP"):
+        if _sym_base.endswith(suffix):
+            _sym_base = _sym_base[: -len(suffix)]
+            break
+    if _sym_base in _WEAK_SYMBOLS and market_state in ("RANGING", "VOLATILITY_COMPRESSION"):
+        base += 15   # effectively blocks these in ranging — needs score near 90+
+        log.debug(
+            "[CONFIDENCE] %s RANGING penalty +15 (weak symbol in range market)",
+            symbol,
+        )
+
+    return max(50, min(85, base))
 
 
 def get_symbol_confidence_threshold(
@@ -274,12 +300,13 @@ def _entry_score(price: float, candles_m15: List[Candle]) -> int:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def compute_confidence(
-    symbol:      str,
-    candles_m15: List[Candle],
-    candles_h1:  Optional[List[Candle]],
-    price:       float,
-    atr_pips:    float,
-    pip:         float,
+    symbol:       str,
+    candles_m15:  List[Candle],
+    candles_h1:   Optional[List[Candle]],
+    price:        float,
+    atr_pips:     float,
+    pip:          float,
+    market_state: str = "",
 ) -> ConfidenceScore:
     """
     Compute a 0-100 confidence score for a symbol.
@@ -295,23 +322,32 @@ def compute_confidence(
 
     total = t + m + s + v + e
 
-    # Dead-market cap: when ATR is below the dead-market floor, the market is
-    # sleeping.  Even good trend/entry components can score 45+ on a flat chart.
-    # Cap the score so a sleeping market cannot clear the adaptive threshold,
-    # which in Asian+flat-ATR conditions rises to 40 (30+3+7).
-    # DEAD_CAP=35 < 40 → guaranteed rejection in Asian flat markets.
-    # DEAD_CAP=35 > 32 → still allows borderline London/NY flat markets through.
-    _ATR_DEAD = 5.0
-    _DEAD_CAP = 35
-    _dead_capped = False
+    # Dead-market cap: ATR below floor → cap so sleeping markets are always rejected.
+    _ATR_DEAD  = 5.0
+    _DEAD_CAP  = 40    # Phase 10: raised from 35 — stricter dead-market gate
+    _cap_label = ""
     if atr_pips < _ATR_DEAD and total > _DEAD_CAP:
-        _dead_capped = True
-        total = _DEAD_CAP
+        total     = _DEAD_CAP
+        _cap_label = " [dead-cap]"
+
+    # Phase 10: Ranging-market cap for weak symbols (EURUSD, USDJPY).
+    # These pairs in ranging/compression conditions produce only 12-15% WR.
+    # Cap their confidence score so they cannot clear the per-symbol floor.
+    _sym_base = symbol.upper().strip()
+    for suffix in (".Z", ".M", ".ECN", ".PRO", ".STP"):
+        if _sym_base.endswith(suffix):
+            _sym_base = _sym_base[: -len(suffix)]
+            break
+    if _sym_base in _WEAK_SYMBOLS and market_state in ("RANGING", "VOLATILITY_COMPRESSION"):
+        _RANGE_CAP = 62   # below EURUSD/USDJPY floor of 74 → guaranteed rejection
+        if total > _RANGE_CAP:
+            total     = _RANGE_CAP
+            _cap_label = " [range-cap]"
 
     log.warning(
         "[CONFIDENCE] %s = %d%s "
-        "(trend=%d mom=%d struct=%d vol=%d entry=%d atr=%.1f)",
-        symbol, total, " [dead-cap]" if _dead_capped else "",
-        t, m, s, v, e, atr_pips,
+        "(trend=%d mom=%d struct=%d vol=%d entry=%d atr=%.1f regime=%s)",
+        symbol, total, _cap_label,
+        t, m, s, v, e, atr_pips, market_state or "unknown",
     )
     return ConfidenceScore(total=total, trend=t, momentum=m, structure=s, volatility=v, entry=e)
