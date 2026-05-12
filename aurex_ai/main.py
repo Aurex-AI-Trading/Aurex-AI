@@ -1212,7 +1212,15 @@ async def scan_symbol(
     candles_m5  = await feed.get_candles(symbol, TF_M5,  cfg.timeframes.m5_candles)
 
     if not candles_h1 or not candles_m15:
-        log.warning("[WARNING] No data for %s — skipping", symbol)
+        log.warning(
+            "[SYMBOL ERROR] No candle data for %s — check broker symbol or MT5 feed "
+            "| h4=%d h1=%d m15=%d m5=%d",
+            symbol,
+            len(candles_h4) if candles_h4 else 0,
+            len(candles_h1) if candles_h1 else 0,
+            len(candles_m15) if candles_m15 else 0,
+            len(candles_m5) if candles_m5 else 0,
+        )
         failsafe.mt5_error()
         return None
 
@@ -1220,6 +1228,11 @@ async def scan_symbol(
         log.warning("[WARNING] %s candle data insufficient H1=%d M15=%d (need H1≥205, M15≥10)",
                     symbol, len(candles_h1), len(candles_m15))
         return None
+
+    log.debug(
+        "[MT5 DATA OK] %s | h4=%d h1=%d m15=%d m5=%d candles loaded",
+        symbol, len(candles_h4), len(candles_h1), len(candles_m15), len(candles_m5),
+    )
 
     # Phase 6: stale-candle detection (same candle repeated N cycles)
     _m15_open_iso = candles_m15[-1].time.isoformat()
@@ -3689,13 +3702,13 @@ def main() -> None:
         _ok, _reason = validate_symbol(_sym, _mt5_mod if not bridge.dry_run else None)
         if not _ok:
             log.error(
-                "[STARTUP] Symbol %s failed pre-trade validation: %s — "
-                "this symbol will be skipped by the scan loop",
+                "[SYMBOL ERROR] [STARTUP] %s failed pre-trade validation: %s — "
+                "symbol will be skipped by the scan loop",
                 _sym, _reason,
             )
             _invalid_symbols.append(_sym)
         else:
-            log.warning("[STARTUP] Symbol %s → validated OK", _sym)
+            log.warning("[SYMBOL VALIDATED] [STARTUP] %s → broker symbol validated OK", _sym)
 
     if _invalid_symbols and not bridge.dry_run:
         log.warning(

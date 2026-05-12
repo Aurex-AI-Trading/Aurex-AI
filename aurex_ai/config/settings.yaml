@@ -39,7 +39,7 @@ risk:
                                # On R500 lots will floor at volume_min (0.01) regardless —
                                # dynamic mode still applies composite quality multipliers.
                                # Set > 0 only for hard-fixed lot (disables all dynamic sizing).
-  max_sl_pips:         100     # SL cap raised to 100 for XAUUSD.Z and GBPJPY.Z compatibility.
+  max_sl_pips:         100     # SL cap raised to 100 for XAUUSD and GBPJPY.Z compatibility.
                                # Gold M15 ATR×1.5 ≈ 15-75 pips (0.1 pip); GBPJPY ≈ 60-120 pips.
                                # Dollar risk is controlled by max_trade_risk_pct not pip count.
                                # Set to 0 to disable.
