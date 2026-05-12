@@ -2251,7 +2251,7 @@ def _reconcile_open_db_trades(bridge: MT5Bridge, trade_logger) -> int:
         trade_logger.log_close(
             ticket           = ticket,
             result           = result,
-            profit_usd       = profit,
+            profit_zar       = profit,
             pips             = pips,
             duration_minutes = 0,
             closed_at        = now_ts,
@@ -2728,7 +2728,7 @@ def _check_live_outcomes(
                 TradeLogger.get_instance().log_close(
                     ticket           = ticket,
                     result           = _result_str,
-                    profit_usd       = round(profit, 2),
+                    profit_zar       = round(profit, 2),
                     pips             = _pips,
                     duration_minutes = _duration,
                     closed_at        = (current_time or get_mt5_time()).isoformat(),

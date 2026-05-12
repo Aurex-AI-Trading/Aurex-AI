@@ -37,7 +37,7 @@ Schema (trades table):
   closed_at        TEXT                 — ISO-8601 (NULL while open)
   result           TEXT                 — OPEN | WIN | LOSS | BREAKEVEN
   pips             REAL
-  profit_usd       REAL
+  profit_zar       REAL
   duration_minutes INTEGER
 """
 from __future__ import annotations
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at          TEXT,
     result             TEXT    DEFAULT 'OPEN',
     pips               REAL    DEFAULT 0.0,
-    profit_usd         REAL    DEFAULT 0.0,
+    profit_zar         REAL    DEFAULT 0.0,
     duration_minutes   INTEGER DEFAULT 0
 )
 """
@@ -123,7 +123,7 @@ class TradeRecord:
     closed_at:          str          = ""
     result:             str          = "OPEN"
     pips:               float        = 0.0
-    profit_usd:         float        = 0.0
+    profit_zar:         float        = 0.0
     duration_minutes:   int          = 0
 
 
@@ -134,7 +134,7 @@ class TradeLogger:
     Usage:
         tl = TradeLogger.get_instance()
         tl.log_open(ticket=12345, signal_id="EURUSD.Z-7", ...)
-        tl.log_close(ticket=12345, result="WIN", profit_usd=42.5, pips=28.0)
+        tl.log_close(ticket=12345, result="WIN", profit_zar=42.5, pips=28.0)
     """
 
     _instance: Optional["TradeLogger"] = None
@@ -225,7 +225,7 @@ class TradeLogger:
         self,
         ticket:           int,
         result:           str,           # "WIN" | "LOSS" | "BREAKEVEN"
-        profit_usd:       float  = 0.0,
+        profit_zar:       float  = 0.0,
         pips:             float  = 0.0,
         duration_minutes: int    = 0,
         closed_at:        Optional[str] = None,
@@ -233,12 +233,12 @@ class TradeLogger:
         ts = closed_at or _now_iso()
         try:
             if self._use_sqlite:
-                self._sqlite_close(ticket, result, profit_usd, pips, duration_minutes, ts)
+                self._sqlite_close(ticket, result, profit_zar, pips, duration_minutes, ts)
             else:
-                self._json_close(ticket, result, profit_usd, pips, duration_minutes, ts)
+                self._json_close(ticket, result, profit_zar, pips, duration_minutes, ts)
             log.info(
                 "[TRADE LOG] CLOSE ticket=%d result=%s profit=%.2f pips=%.1f dur=%dm",
-                ticket, result, profit_usd, pips, duration_minutes,
+                ticket, result, profit_zar, pips, duration_minutes,
             )
         except Exception as exc:
             log.error("[TRADE LOG] log_close failed: %s", exc)
@@ -304,6 +304,10 @@ class TradeLogger:
             with sqlite3.connect(str(_DB_PATH)) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(_CREATE_SQL)
+                # Rename legacy profit_usd column to profit_zar if it exists
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+                if "profit_usd" in cols and "profit_zar" not in cols:
+                    conn.execute("ALTER TABLE trades RENAME COLUMN profit_usd TO profit_zar")
                 conn.commit()
             return True
         except Exception as exc:
@@ -328,7 +332,7 @@ class TradeLogger:
         duration: int, ts: str,
     ) -> None:
         sql = (
-            "UPDATE trades SET result=?, profit_usd=?, pips=?, "
+            "UPDATE trades SET result=?, profit_zar=?, pips=?, "
             "duration_minutes=?, closed_at=? WHERE ticket=?"
         )
         with self._lock:
@@ -377,7 +381,7 @@ class TradeLogger:
             for r in records:
                 if r.get("ticket") == ticket:
                     r["result"]           = result
-                    r["profit_usd"]       = round(profit, 2)
+                    r["profit_zar"]       = round(profit, 2)
                     r["pips"]             = round(pips, 1)
                     r["duration_minutes"] = duration
                     r["closed_at"]        = ts

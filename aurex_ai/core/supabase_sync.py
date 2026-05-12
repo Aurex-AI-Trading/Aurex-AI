@@ -223,7 +223,7 @@ class SupabaseSync:
             "opened_at":  t.get("opened_at") or None,
         }
         if status == "closed":
-            payload["pnl_zar"]   = round(float(t.get("profit_usd", 0.0) or 0.0), 2)
+            payload["pnl_zar"]   = round(float(t.get("profit_zar", 0.0) or 0.0), 2)
             payload["pnl_pips"]  = round(float(t.get("pips",        0.0) or 0.0), 2)
             payload["closed_at"] = t.get("closed_at") or None
         # trades.mt5_ticket has no UNIQUE constraint — use check-then-insert/update
@@ -258,7 +258,7 @@ class SupabaseSync:
                 "losing_trades":    losses,
                 "gross_profit":     0.0,
                 "gross_loss":       0.0,
-                "total_pnl":        round(report.total_pnl_usd, 2),
+                "total_pnl":        round(report.total_pnl_zar, 2),
                 "max_drawdown_pct": round(abs(report.max_drawdown_pct), 4),
                 "best_trade":       0.0,
                 "worst_trade":      0.0,

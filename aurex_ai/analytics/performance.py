@@ -9,7 +9,7 @@ Metrics:
   avg_rr            — mean realised R:R of winning trades only (logged as avg_win_rr)
   profit_factor     — gross_profit / |gross_loss| (> 1.0 is profitable)
   max_drawdown_pct  — largest peak-to-trough equity drawdown as a %
-  total_pnl_usd     — cumulative net profit/loss
+  total_pnl_zar     — cumulative net profit/loss
   trades_per_day    — closed trades / active trading days
   best_session      — session with highest win rate (≥ 5 trades)
   best_direction    — BUY or SELL with higher win rate (≥ 5 trades)
@@ -58,7 +58,7 @@ class PerformanceReport:
     avg_rr:            float        = 0.0
     profit_factor:     float        = 0.0     # > 1.0 = profitable
     max_drawdown_pct:  float        = 0.0     # negative value
-    total_pnl_usd:     float        = 0.0
+    total_pnl_zar:     float        = 0.0
     trades_per_day:    float        = 0.0
     best_session:      str          = ""
     worst_session:     str          = ""
@@ -74,7 +74,7 @@ class PerformanceReport:
         lines = [
             f"[PERFORMANCE] trades={self.total_closed} wr={self.win_rate:.1%} "
             f"avg_win_rr={self.avg_rr:.2f} pf={self.profit_factor:.2f} "
-            f"pnl={self.total_pnl_usd:.2f} dd={self.max_drawdown_pct:.1f}%",
+            f"pnl={self.total_pnl_zar:.2f} dd={self.max_drawdown_pct:.1f}%",
             f"             best_session={self.best_session or 'n/a'} "
             f"best_dir={self.best_direction or 'n/a'} "
             f"best_setup={self.best_setup or 'n/a'}",
@@ -133,9 +133,9 @@ class PerformanceEngine:
         losses = [t for t in all_closed if t.get("result") in ("LOSS", "BREAKEVEN")]
 
         report.win_rate      = len(wins) / len(all_closed)
-        gross_profit         = sum(t.get("profit_usd", 0.0) for t in wins)
-        gross_loss_abs       = abs(sum(t.get("profit_usd", 0.0) for t in losses))
-        report.total_pnl_usd = gross_profit - gross_loss_abs
+        gross_profit         = sum(t.get("profit_zar", 0.0) for t in wins)
+        gross_loss_abs       = abs(sum(t.get("profit_zar", 0.0) for t in losses))
+        report.total_pnl_zar = gross_profit - gross_loss_abs
         report.profit_factor = (
             round(gross_profit / gross_loss_abs, 2) if gross_loss_abs > 0 else
             round(gross_profit, 2) if gross_profit > 0 else 0.0
@@ -152,7 +152,7 @@ class PerformanceEngine:
         peak    = 0.0
         max_dd  = 0.0
         for t in sorted_by_time:
-            equity += t.get("profit_usd", 0.0)
+            equity += t.get("profit_zar", 0.0)
             if equity > peak:
                 peak = equity
             dd = equity - peak
