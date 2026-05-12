@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from aurex_ai.config.loader import load_settings, Settings
 from aurex_ai.core.logger import configure_logging, get_logger
 from aurex_ai.core.data_feed import DataFeed, TF_M5, TF_H1, TF_H4, TF_M15
-from aurex_ai.core.mt5_bridge import MT5Bridge, SymbolValidation, get_mt5_time, is_mt5_time_fresh, log_time_sync_banner
+from aurex_ai.core.mt5_bridge import MT5Bridge, SymbolValidation, get_mt5_time, is_mt5_time_fresh, log_time_sync_banner, check_time_drift
 
 from aurex_ai.strategy import trend      as trend_mod
 from aurex_ai.strategy import liquidity  as liq_mod
@@ -3030,6 +3030,15 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         )
         if scan_num % telemetry.heartbeat_interval == 0:
             telemetry.emit_heartbeat(bridge, daily_state=daily)
+
+        # Periodic VPS clock drift check — every 240 cycles (~60 min at 15s interval).
+        # Emits [TIME WARNING] / [TIME CRITICAL] if VPS↔MT5 drift exceeds thresholds.
+        # Trading always uses MT5 broker time regardless of drift result.
+        if scan_num % 240 == 0 and symbols:
+            try:
+                check_time_drift(symbol=symbols[0])
+            except Exception:
+                pass
 
         # Phase 6: AI score (once per day, after daily update)
         if trade_logger.total_closed() >= 10:

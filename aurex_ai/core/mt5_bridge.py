@@ -138,6 +138,44 @@ def log_time_sync_banner(symbol: str = "EURUSD.Z") -> float:
     return abs_delta if fresh else 0.0
 
 
+def check_time_drift(symbol: str = "EURUSD.Z") -> float:
+    """
+    Lightweight periodic VPS↔MT5 clock drift check.
+
+    Called every N scan cycles from the main trading loop.  Emits
+    [TIME WARNING] / [TIME CRITICAL] tags without printing the full banner.
+    Returns abs drift in seconds, or 0.0 when MT5 feed is unavailable.
+
+    Thresholds (same as log_time_sync_banner):
+        >= _TIME_WARN_THRESHOLD    (30s)  → [TIME WARNING]
+        >= _TIME_CRITICAL_THRESHOLD(120s) → [TIME CRITICAL]
+    """
+    local_utc = _dt.datetime.now(_dt.timezone.utc)
+    mt5_time  = get_mt5_time(symbol)
+
+    if not is_mt5_time_fresh():
+        return 0.0   # MT5 feed unavailable — cannot measure drift reliably
+
+    drift = abs((mt5_time - local_utc).total_seconds())
+
+    if drift >= _TIME_CRITICAL_THRESHOLD:
+        log.critical(
+            "[TIME CRITICAL] Periodic drift check: VPS clock %.0fs out of sync with MT5. "
+            "Fix: w32tm /resync /force. Trading continues on MT5 broker time.",
+            drift,
+        )
+    elif drift >= _TIME_WARN_THRESHOLD:
+        log.warning(
+            "[TIME WARNING] Periodic drift check: VPS clock %.0fs drift detected. "
+            "NTP should self-correct within the next poll interval.",
+            drift,
+        )
+    else:
+        log.debug("[TIME SYNC] Periodic drift check: %.1fs — OK", drift)
+
+    return drift
+
+
 def get_mt5_time(symbol: str = "EURUSD.Z") -> _dt.datetime:
     """
     Return the current MT5 broker server time as a UTC-aware datetime.
