@@ -229,14 +229,22 @@ def analyze(
     # Adaptive wick threshold: high-ATR environments produce wider candles where
     # wicks are proportionally smaller relative to total range. Lower the threshold
     # so genuine sweep wicks are not filtered out in volatile sessions.
+    # Phase 2: reduced floor values to capture more realistic institutional grabs.
     if atr_pips >= 15:
-        _min_wick = max(0.35, min_wick_ratio - 0.20)
+        _min_wick = max(0.25, min_wick_ratio - 0.15)   # high-vol: very relaxed
     elif atr_pips >= 10:
-        _min_wick = max(0.40, min_wick_ratio - 0.15)
+        _min_wick = max(0.28, min_wick_ratio - 0.12)   # active: relaxed
     elif atr_pips >= 7:
-        _min_wick = max(0.45, min_wick_ratio - 0.10)
+        _min_wick = max(0.30, min_wick_ratio - 0.10)   # moderate: mildly relaxed
+    elif atr_pips >= 4:
+        _min_wick = max(0.32, min_wick_ratio - 0.08)   # low-vol: minor relief
     else:
-        _min_wick = min_wick_ratio
+        _min_wick = min_wick_ratio                       # below 4 pips: full threshold
+
+    log.warning(
+        "[ADAPTIVE SWEEP] %s min_wick=%.2f (base=%.2f adaptive=%.2f atr=%.1f)",
+        symbol, _min_wick, min_wick_ratio, _min_wick, atr_pips,
+    )
 
     sh = _swing_highs(window, swing_window)
     sl = _swing_lows(window,  swing_window)
@@ -352,15 +360,21 @@ def analyze(
                 )
 
     # ── Priority 3: isolated stop-hunt wick on the last candle ────────────────
-    # Minimum wick threshold raised from 0.65 to 0.70 for isolated wicks —
-    # this reduces false positives from normal candle variation.
+    # Phase 2: threshold lowered from 0.70 to 0.55 to capture realistic liquidity
+    # grabs where institutional orders are absorbed without extreme wick extension.
+    # Score is proportional to wick ratio — softer wicks earn lower score (4-7 pts).
 
     last = window[-1]
     uwr  = _upper_wick_ratio(last)
     lwr  = _lower_wick_ratio(last)
 
-    if uwr >= 0.70 and last.close < last.open:
+    if uwr >= 0.55 and last.close < last.open:
         score = min(10.0, 4.0 + uwr * 6.0)
+        _tag = "[SOFT SWEEP DETECTED]" if uwr < 0.65 else "[SWEEP]"
+        log.warning(
+            "%s stop_hunt_upper | level=%.5f wr=%.2f score=%.1f [LIQUIDITY PASS]",
+            _tag, last.high, uwr, score,
+        )
         return SweepResult(
             detected=True, sweep_type="sell_side",
             strength=round(score, 1), swept_level=round(last.high, 5),
@@ -369,8 +383,13 @@ def analyze(
             displacement=False, inducement=False,
         )
 
-    if lwr >= 0.70 and last.close > last.open:
+    if lwr >= 0.55 and last.close > last.open:
         score = min(10.0, 4.0 + lwr * 6.0)
+        _tag = "[SOFT SWEEP DETECTED]" if lwr < 0.65 else "[SWEEP]"
+        log.warning(
+            "%s stop_hunt_lower | level=%.5f wr=%.2f score=%.1f [LIQUIDITY PASS]",
+            _tag, last.low, lwr, score,
+        )
         return SweepResult(
             detected=True, sweep_type="buy_side",
             strength=round(score, 1), swept_level=round(last.low, 5),

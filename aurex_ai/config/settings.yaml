@@ -90,7 +90,7 @@ strategy:
   swing_window:          3     # bars each side to define a swing high/low
   sweep_lookback:        50    # bars to scan for sweep event
   equal_tol_pips:        3     # pip tolerance for "equal" highs/lows
-  min_wick_ratio:        0.55  # wick must be ≥55% of candle range
+  min_wick_ratio:        0.40  # wick must be ≥40% of candle range (Phase 2: relaxed from 0.55)
 
   # Core score minimum (applied before bonus factors count)
   # Prevents setups where OB/breakout/structure bonuses inflate a weak core past execution thresholds.

@@ -1288,14 +1288,28 @@ async def scan_symbol(
         return None
 
     # Mode ATR floor: aggressive=5.0 pips, conservative=10.0 pips.
-    # Below this floor the market is not generating enough movement for clean setups.
+    # Aggressive mode: below floor → size penalty (soft block), not hard rejection.
+    # Conservative mode: hard block maintained (higher-capital protection).
+    _atr_size_penalty = 1.0
     if _min_atr > 0 and atr_pips < _min_atr:
-        log.warning(
-            "[BLOCKED] symbol=%s reason=atr_too_low | atr=%.1f < min=%.1f pips [MODE:%s]",
-            symbol, atr_pips, _min_atr, mode.name.upper(),
-        )
-        _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
-        return None
+        if mode.name == "aggressive":
+            # Soft zone: linearly scale from 0.55x (at dead-market floor) to 1.0x (at mode floor).
+            # atr=4.9, floor=5.0 → penalty=0.98 (nearly full size — appropriate)
+            # atr=4.0, floor=5.0 → penalty=0.80 (meaningful reduction)
+            # atr=3.5, floor=5.0 → penalty=0.70 (well-reduced probe position)
+            _atr_size_penalty = max(0.55, round(atr_pips / _min_atr, 3))
+            log.warning(
+                "[ATR ADAPTIVE] %s atr=%.1f below floor %.1f pips | "
+                "[LOW VOLATILITY PASS] [VOLATILITY SCALING] size=%.0f%% [MODE:%s]",
+                symbol, atr_pips, _min_atr, _atr_size_penalty * 100, mode.name.upper(),
+            )
+        else:
+            log.warning(
+                "[BLOCKED] symbol=%s reason=atr_too_low | atr=%.1f < min=%.1f pips [MODE:%s]",
+                symbol, atr_pips, _min_atr, mode.name.upper(),
+            )
+            _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
+            return None
 
     # ── ATR zone classification ───────────────────────────────────────────────
     # LOW  (< min_atr_pips): already handled above.
@@ -1491,24 +1505,38 @@ async def scan_symbol(
                 )
 
             if _m5_recovering and _m5_gap_atr < 0.80:
-                # Soft pullback: M5 is off EMA20 but already bouncing back in H1 direction.
-                # Classic SMC pullback entry zone — allow with size reduction.
+                # Soft pullback: M5 is off EMA20 but bouncing back in H1 direction.
+                # Classic SMC pullback / trend-continuation entry zone.
                 _m5_size_penalty = 0.75
                 log.info(
-                    "[MTF] %s H1=%s M5=recovering (gap=%.2f ATR, 3-bar move=%+.5f) → 0.75× size",
+                    "[TREND CONTINUATION ALLOWED] %s H1=%s M5=recovering "
+                    "(gap=%.2f ATR, 3-bar move=%+.5f) → 0.75× size [MTF SOFT PASS]",
                     symbol, _h1_sig, _m5_gap_atr, _m5_closes[-1] - _m5_closes[-4],
                 )
-            else:
-                # Genuinely misaligned — M5 trending against H1 with no recovery.
-                log.debug(
-                    "[SKIP] %s H1=%s M5=%s (gap=%.2f ATR recovering=%s) — not aligned",
+            elif _m5_gap_atr < 1.20:
+                # Phase 2: moderate misalignment — apply size penalty, do NOT hard-block.
+                # M5 is counter-trend but only moderately displaced. Many valid pullback
+                # entries look like this — price pulled against the H1 trend slightly.
+                _m5_size_penalty = 0.60
+                log.warning(
+                    "[SOFT FILTER ACTIVE] %s H1=%s M5=%s misaligned (gap=%.2f ATR, no recovery) → "
+                    "[PARTIAL ALIGNMENT] [MTF PARTIAL ALIGNMENT] 60%% size",
                     symbol, _h1_sig,
                     "BUY" if _m5_dir == "bullish" else "SELL",
-                    _m5_gap_atr, _m5_recovering,
+                    _m5_gap_atr,
                 )
-                _log_rejected(symbol, "MTF_M5_NOT_ALIGNED",
-                              confidence=confidence.total, atr=atr_pips)
-                return None
+            else:
+                # Large gap, no recovery — meaningful counter-trend positioning.
+                # Significant size reduction; still allow because the score and
+                # confidence gates already validated the H1 setup.
+                _m5_size_penalty = 0.40
+                log.warning(
+                    "[SOFT FILTER ACTIVE] %s H1=%s M5=%s strongly misaligned (gap=%.2f ATR) → "
+                    "[REDUCED EXPOSURE] [MTF PARTIAL ALIGNMENT] 40%% size",
+                    symbol, _h1_sig,
+                    "BUY" if _m5_dir == "bullish" else "SELL",
+                    _m5_gap_atr,
+                )
     else:
         # Insufficient M5 data — don't block; proceed with a small caution penalty.
         _m5_dir      = "neutral"
@@ -1554,19 +1582,49 @@ async def scan_symbol(
     if _struct_dir == "none" and struct_result.trend_bias != "neutral":
         _struct_dir = struct_result.trend_bias
 
-    # Aggressive-mode continuation fallback: strong directional trend with no
-    # BOS or bias still earns minimum structure credit (5 pts) so that trend-
-    # following continuation trades are not penalised for the absence of a
-    # fresh break.  Only applies when the trend module confirmed direction.
+    # Phase 2: Structure-trend conflict resolution.
+    # When BOS direction contradicts the trend direction, the BOS may represent
+    # a liquidity grab / stop-hunt above/below structure rather than a real reversal.
+    # Prefer the trend_bias reading (first-half vs second-half pattern) when it
+    # agrees with the macro trend — this prevents one rogue BOS from zeroing the
+    # structure bonus on an otherwise valid trend-continuation setup.
+    if struct_result.bos_detected and _struct_dir != "none":
+        _trend_dir_key = "buy" if trend_result.direction == "bullish" else "sell"
+        if _struct_dir != _trend_dir_key and trend_result.direction != "neutral":
+            _bias_agrees = struct_result.trend_bias == _trend_dir_key
+            if _bias_agrees:
+                # Trend bias agrees → override contradictory BOS with bias direction
+                # and cap structure score at 5 (modest contribution, not full BOS bonus)
+                log.warning(
+                    "[STRUCTURE NORMALIZED] %s — BOS(%s) contradicts trend(%s); "
+                    "trend_bias(%s) agrees → using bias | [TREND DOMINANCE] [CONFLICT RESOLVED]",
+                    symbol, _struct_dir, trend_result.direction, struct_result.trend_bias,
+                )
+                _struct_dir   = struct_result.trend_bias
+                _struct_score = 5.0
+            else:
+                # Both BOS and bias contradict the trend — suppress structure bonus entirely
+                # so conflicting signals don't inflate the score artificially.
+                log.info(
+                    "[STRUCTURE NORMALIZED] %s — BOS+bias both contra-trend; "
+                    "structure bonus suppressed | [CONFLICT RESOLVED]",
+                    symbol,
+                )
+                _struct_dir   = "none"
+                _struct_score = 0.0
+
+    # Trend-continuation credit: when no BOS or bias is detected but the trend is
+    # strongly directional, award minimum structure credit to avoid penalising
+    # clean continuation setups for the absence of a fresh break.
     if (mode.name == "aggressive" and _struct_score == 0
             and trend_result.direction != "neutral"
             and trend_result.strength >= 10):
         _cont_dir = "buy" if trend_result.direction == "bullish" else "sell"
         _struct_dir   = _cont_dir
-        _struct_score = 5.0
+        _struct_score = 8.0   # upgraded from 5: trend-continuation deserves stronger credit
         log.info(
-            "[STRUCTURE FALLBACK] %s — trend-continuation credit: dir=%s score=5 "
-            "(trend strength=%.0f, no BOS/bias detected)",
+            "[TREND CONTINUATION MODE] %s — continuation credit: dir=%s score=8 "
+            "(trend strength=%.0f, no BOS/bias detected) | [TREND DOMINANCE]",
             symbol, _cont_dir, trend_result.strength,
         )
 
@@ -1803,16 +1861,32 @@ async def scan_symbol(
         " | ".join(_penalty_labels) if _penalty_labels else "no_penalties",
     )
 
+    # ── Probabilistic quality tier → size modifier ────────────────────────────
+    # Quality classification maps to a continuous size multiplier instead of
+    # binary PASS/BLOCK.  Combined with the tier system and MTF penalties, this
+    # creates 5 distinct exposure bands: elite, strong, moderate, weak, blocked.
+    _quality_size_mult = {"A+": 1.00, "A": 0.90, "B": 0.80, "C": 0.65}.get(_quality, 0.80)
+    log.warning(
+        "[PROBABILISTIC EXECUTION] %s [QUALITY TIER] quality=%s → size=%.0f%% "
+        "[DYNAMIC PARTICIPATION]",
+        symbol, _quality, _quality_size_mult * 100,
+    )
+
+    # Add pullback / OB continuation context tags to help diagnose entry type
+    if _has_ob and _strong_trend:
+        log.info("[OB CONTINUATION] %s — trade aligned with order block + strong trend", symbol)
+    elif fib_result.score > 0 and _strong_trend:
+        log.info("[PULLBACK ENTRY] %s — Fibonacci pullback in strong trend context", symbol)
+
     # ── High-confidence execution bypass ──────────────────────────────────────
-    # When confidence is strong, trend is MTF-aligned, ATR is healthy, and the
-    # setup is quality A or A+, the adjusted score is used for logging only —
-    # not as a rejection gate.  Missing sweep/BOS/confirmation reflects liquidity
-    # detection limits, not a fundamentally bad structural setup.
+    # Phase 2: relaxed from conf>=65+trend_consistent+atr>=5.0 to conf>=60+atr>dead_market.
+    # MTF inconsistency is already penalised by _mtf_h4_size_penalty (30% reduction)
+    # and M5 misalignment by _m5_size_penalty (25-60% reduction).  Blocking high-
+    # confidence setups entirely on top of those penalties is double-punishment.
     _bypass = (
-        confidence.total >= 65
+        confidence.total >= 60
         and decision.tier <= 2
-        and trend_result.consistent
-        and atr_pips >= 5.0
+        and atr_pips > _ATR_DEAD_MARKET   # only absolute dead-market blocks bypass
         and _quality in ("A+", "A")
     )
     if _bypass:
@@ -1875,8 +1949,23 @@ async def scan_symbol(
     )
 
     combined_size_mult = max(0.10, min(1.0, round(
-        decision.size_mult * opt.lot_mult * _mtf_h4_size_penalty * _m5_size_penalty * guard_size_mult, 2
+        decision.size_mult
+        * opt.lot_mult
+        * _mtf_h4_size_penalty
+        * _m5_size_penalty
+        * _atr_size_penalty
+        * _quality_size_mult
+        * guard_size_mult,
+        2,
     )))
+    log.warning(
+        "[EXECUTION SCALING] %s %s | tier=%.2f opt=%.2f mtf_h4=%.2f m5=%.2f "
+        "atr=%.2f quality=%.2f guard=%.2f → combined=%.2f",
+        symbol, direction,
+        decision.size_mult, opt.lot_mult, _mtf_h4_size_penalty,
+        _m5_size_penalty, _atr_size_penalty, _quality_size_mult,
+        guard_size_mult, combined_size_mult,
+    )
 
     _sl_atr_mult = float(getattr(cfg.strategy, "sl_atr_mult", 1.5))
     _cfg_tp_mult = float(getattr(cfg.strategy, "tp_atr_mult", 0.0))
