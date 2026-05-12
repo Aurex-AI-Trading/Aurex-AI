@@ -2,7 +2,7 @@
 Aurex AI — Trade Source Classification
 
 Defines the canonical TradeSource enum and detection helpers that classify
-every trade as AI_AUTO, MANUAL, HYBRID, or BACKTEST.
+every trade as AI_AUTO, MANUAL, HYBRID, PAPER_AI, or BACKTEST.
 
 This is the foundation of the trade-attribution architecture.  Every component
 that records, analyses, or learns from trades reads the source from here.
@@ -16,7 +16,22 @@ Definitions
               in the trade logger.
   HYBRID   — AI-generated signal that was manually confirmed, lot-adjusted, or
               SL/TP-modified by the user before execution.
+  PAPER_AI — simulated trade from the Phase 12 shadow engine; never sent to MT5.
+              Uses live market data and identical strategy logic.  Stored for
+              accelerated AI research without capital risk.
   BACKTEST — trade produced during walk-forward backtesting (dry_run + backtest flag).
+
+Learning Weights  (Phase 12)
+-----------------------------
+  Live AI trades dominate learning; paper/shadow trades supplement at lower weight;
+  manual trades NEVER influence AI weights.
+
+  AI_AUTO  = 1.00 — full weight (production live trades)
+  HYBRID   = 0.60 — partial weight (AI signal, human modified)
+  BACKTEST = 0.50 — moderate weight (clean simulated fills)
+  PAPER_AI = 0.35 — lower weight (live prices, simulated fills)
+  REJECTED = 0.15 — minimal weight (hypothetical outcome only)
+  MANUAL   = 0.00 — never learned from
 
 Detection Logic
 ---------------
@@ -29,11 +44,13 @@ Detection Logic
      a populated signal_id → AI_AUTO.  Tickets not in the trade_logger → MANUAL.
   4. HYBRID path:  Set explicitly by the caller when a human modifies an AI signal
      before execution.  Not auto-detected (requires explicit operator action).
+  5. PAPER_AI path:  Set explicitly by the shadow engine; stored in paper_trades
+     table, never in the live trades table.
 
 Learning Isolation
 ------------------
-  ONLY AI_AUTO (and optionally HYBRID) trades feed:
-    - LearningEngine.record_outcome()
+  ONLY AI_AUTO, HYBRID, and PAPER_AI trades feed:
+    - LearningEngine.record_outcome() (PAPER_AI at reduced weight)
     - PerformanceTracker.record_trade()
     - AdaptiveLearning.compute() windows
     - WeightAdjuster drift tracking
@@ -43,12 +60,13 @@ Learning Isolation
 
 Tags emitted
 ------------
-  [TRADE SOURCE]  [MANUAL DETECTED]  [AI AUTO]  [LEARNING BLOCKED — MANUAL]
+  [TRADE SOURCE]  [MANUAL DETECTED]  [AI AUTO]  [PAPER TRADE]
+  [LEARNING BLOCKED — MANUAL]
 """
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Dict, Optional
 
 
 # ── Canonical magic number emitted on every Aurex order ───────────────────────
@@ -63,11 +81,14 @@ class TradeSource(Enum):
     AI_AUTO  = "AI_AUTO"    # fully autonomous Aurex execution
     MANUAL   = "MANUAL"     # user-opened / external EA
     HYBRID   = "HYBRID"     # AI signal + manual modification
+    PAPER_AI = "PAPER_AI"   # shadow engine simulated trade (Phase 12)
     BACKTEST = "BACKTEST"   # walk-forward backtest mode
 
     def is_learnable(self) -> bool:
-        """Return True if this source should feed the AI learning engine."""
-        return self in (TradeSource.AI_AUTO, TradeSource.HYBRID)
+        return self in (TradeSource.AI_AUTO, TradeSource.HYBRID, TradeSource.PAPER_AI)
+
+    def learning_weight(self) -> float:
+        return LEARNING_WEIGHTS.get(self.value, 0.0)
 
     def label(self) -> str:
         return self.value
@@ -77,10 +98,28 @@ class TradeSource(Enum):
 AI_AUTO  = TradeSource.AI_AUTO.value
 MANUAL   = TradeSource.MANUAL.value
 HYBRID   = TradeSource.HYBRID.value
+PAPER_AI = TradeSource.PAPER_AI.value
 BACKTEST = TradeSource.BACKTEST.value
 
-ALL_SOURCES: tuple = (AI_AUTO, MANUAL, HYBRID, BACKTEST)
-LEARNABLE_SOURCES: tuple = (AI_AUTO, HYBRID)
+ALL_SOURCES: tuple = (AI_AUTO, MANUAL, HYBRID, PAPER_AI, BACKTEST)
+
+# Primary live sources — feed full-weight learning
+LIVE_LEARNABLE_SOURCES: frozenset = frozenset({AI_AUTO, HYBRID})
+
+# All sources that contribute to learning (at varying weights)
+LEARNABLE_SOURCES: frozenset = frozenset({AI_AUTO, HYBRID, PAPER_AI})
+
+# ── Phase 12: Tiered learning weights per source ──────────────────────────────
+# Live AI trades dominate; paper/shadow supplement at reduced weight.
+# MANUAL = 0.00 — never learned from under any circumstances.
+LEARNING_WEIGHTS: Dict[str, float] = {
+    AI_AUTO:    1.00,
+    HYBRID:     0.60,
+    BACKTEST:   0.50,
+    PAPER_AI:   0.35,
+    "REJECTED": 0.15,   # hypothetical outcome signals (SignalStore)
+    MANUAL:     0.00,
+}
 
 
 # ── Detection helpers ─────────────────────────────────────────────────────────
@@ -138,11 +177,17 @@ def is_learnable_source(source: str) -> bool:
     return source in LEARNABLE_SOURCES
 
 
+def get_learning_weight(source: str) -> float:
+    """Return the learning weight (0.0–1.0) for a given source string."""
+    return LEARNING_WEIGHTS.get(source, 0.0)
+
+
 def source_label(source: str) -> str:
     """Return a human-readable label for use in log tags."""
     return {
         AI_AUTO:  "[AI AUTO]",
         MANUAL:   "[MANUAL]",
         HYBRID:   "[HYBRID]",
+        PAPER_AI: "[PAPER AI]",
         BACKTEST: "[BACKTEST]",
     }.get(source, f"[{source}]")

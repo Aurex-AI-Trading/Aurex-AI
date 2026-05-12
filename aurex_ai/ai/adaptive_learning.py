@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from aurex_ai.core.logger import get_logger
+from aurex_ai.core.trade_source import LEARNING_WEIGHTS
 
 log = get_logger("ai.adaptive_learning")
 
@@ -345,10 +346,26 @@ class AdaptiveLearning:
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _win_rate(trades: list) -> float:
+    """
+    Compute weighted win rate using Phase 12 tiered learning weights.
+
+    AI_AUTO trades count at full weight (1.0); PAPER_AI at 0.35; MANUAL at 0.0.
+    This ensures live AI trades dominate the learning signal while paper trades
+    supplement it without distorting the true performance picture.
+    """
     if not trades:
         return 0.0
-    wins = sum(1 for t in trades if t.get("result") == "WIN")
-    return wins / len(trades)
+    total_weight = 0.0
+    win_weight   = 0.0
+    for t in trades:
+        src    = t.get("trade_source", "AI_AUTO") or "AI_AUTO"
+        w      = LEARNING_WEIGHTS.get(src, 1.0)
+        total_weight += w
+        if t.get("result") == "WIN":
+            win_weight += w
+    if total_weight <= 0:
+        return 0.0
+    return win_weight / total_weight
 
 
 def _group_by(

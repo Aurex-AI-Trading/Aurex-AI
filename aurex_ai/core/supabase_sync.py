@@ -89,6 +89,7 @@ class SupabaseSync:
             self._sync_daily_analytics(trade_logger, user_id)
             self._sync_ai_analytics(trade_logger, user_id)
             self._sync_sample_status(trade_logger, user_id)
+            self._sync_signal_intelligence(trade_logger, user_id)
         except Exception as exc:
             log.debug("[SYNC] sync_all error: %s", exc)
 
@@ -315,6 +316,61 @@ class SupabaseSync:
             }, conflict="user_id")
         except Exception as exc:
             log.debug("[SYNC] _sync_sample_status error: %s", exc)
+
+    def _sync_signal_intelligence(self, trade_logger: Any, user_id: str) -> None:
+        """
+        Sync Phase 12 signal intelligence metrics to Supabase.
+
+        Required table (create once):
+        CREATE TABLE ai_signal_intelligence (
+            user_id                TEXT,
+            snapshot_date          DATE,
+            total_signals          INT,
+            executed_count         INT,
+            rejected_count         INT,
+            exec_win_rate          FLOAT,
+            false_negative_rate    FLOAT,
+            false_positive_rate    FLOAT,
+            missed_opportunities   INT,
+            successful_rejections  INT,
+            near_band_count        INT,
+            near_band_win_rate     FLOAT,
+            paper_trade_count      INT,
+            paper_win_rate         FLOAT,
+            paper_expectancy       FLOAT,
+            computed_at            TIMESTAMPTZ,
+            PRIMARY KEY (user_id, snapshot_date)
+        );
+        """
+        try:
+            from aurex_ai.analytics.signal_store import SignalStore
+            store   = SignalStore.get_instance()
+            metrics = store.get_filter_effectiveness(window=500)
+            if not metrics or metrics.get("total_signals", 0) < 5:
+                return
+
+            paper_stats = trade_logger.get_paper_trade_stats(window=200)
+
+            self._upsert("ai_signal_intelligence", {
+                "user_id":               user_id,
+                "snapshot_date":         datetime.now(timezone.utc).date().isoformat(),
+                "total_signals":         metrics.get("total_signals", 0),
+                "executed_count":        metrics.get("executed_count", 0),
+                "rejected_count":        metrics.get("rejected_count", 0),
+                "exec_win_rate":         round(metrics.get("exec_win_rate", 0.0), 4),
+                "false_negative_rate":   round(metrics.get("false_negative_rate", 0.0), 4),
+                "false_positive_rate":   round(metrics.get("false_positive_rate", 0.0), 4),
+                "missed_opportunities":  metrics.get("missed_opportunities", 0),
+                "successful_rejections": metrics.get("successful_rejections", 0),
+                "near_band_count":       metrics.get("near_band_count", 0),
+                "near_band_win_rate":    round(metrics.get("near_band_win_rate", 0.0), 4),
+                "paper_trade_count":     paper_stats.get("n", 0),
+                "paper_win_rate":        round(paper_stats.get("win_rate", 0.0), 4),
+                "paper_expectancy":      round(paper_stats.get("expectancy", 0.0), 4),
+                "computed_at":           _now_iso(),
+            }, conflict="user_id,snapshot_date")
+        except Exception as exc:
+            log.debug("[SYNC] _sync_signal_intelligence error: %s", exc)
 
     def _push_trade(self, t: Dict, user_id: str, status: str) -> None:
         ticket = t.get("ticket")

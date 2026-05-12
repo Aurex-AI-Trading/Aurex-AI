@@ -54,7 +54,7 @@ from typing import Dict, List, Optional
 
 from aurex_ai.core.logger import get_logger
 from aurex_ai.core.trade_source import (
-    AI_AUTO, MANUAL, HYBRID, BACKTEST,
+    AI_AUTO, MANUAL, HYBRID, BACKTEST, PAPER_AI,
     classify_from_signal_id,
 )
 
@@ -98,6 +98,35 @@ CREATE TABLE IF NOT EXISTS trades (
     trade_source       TEXT    DEFAULT 'AI_AUTO',
     strategy_version   TEXT    DEFAULT 'LEGACY'
 )
+"""
+
+_CREATE_PAPER_SQL = """
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol           TEXT    NOT NULL,
+    direction        TEXT    NOT NULL,
+    tier             INTEGER DEFAULT 2,
+    setup_type       TEXT    DEFAULT '',
+    confidence       REAL    DEFAULT 0,
+    entry_price      REAL    DEFAULT 0,
+    sl_price         REAL    DEFAULT 0,
+    tp_price         REAL    DEFAULT 0,
+    lot_size         REAL    DEFAULT 1.0,
+    atr_pips         REAL    DEFAULT 0,
+    utc_hour         INTEGER DEFAULT 0,
+    session          TEXT    DEFAULT '',
+    market_state     TEXT    DEFAULT '',
+    opened_at        TEXT    NOT NULL,
+    closed_at        TEXT,
+    result           TEXT    DEFAULT 'OPEN',
+    pnl_r            REAL    DEFAULT 0,
+    mae              REAL    DEFAULT 0,
+    mfe              REAL    DEFAULT 0,
+    duration_mins    INTEGER DEFAULT 0,
+    strategy_version TEXT    DEFAULT 'AI_FORWARD_V2'
+);
+CREATE INDEX IF NOT EXISTS idx_paper_symbol ON paper_trades(symbol);
+CREATE INDEX IF NOT EXISTS idx_paper_result ON paper_trades(result);
 """
 
 
@@ -508,6 +537,82 @@ class TradeLogger:
         except Exception:
             return False
 
+    # ── Paper trade (Phase 12 shadow engine) ──────────────────────────────────
+
+    def log_paper_trade(
+        self,
+        symbol:           str,
+        direction:        str,
+        tier:             int   = 2,
+        setup_type:       str   = "",
+        confidence:       float = 0.0,
+        entry_price:      float = 0.0,
+        sl_price:         float = 0.0,
+        tp_price:         float = 0.0,
+        lot_size:         float = 1.0,
+        atr_pips:         float = 0.0,
+        utc_hour:         int   = 0,
+        session:          str   = "",
+        market_state:     str   = "",
+        opened_at:        str   = "",
+        closed_at:        str   = "",
+        result:           str   = "OPEN",
+        pnl_r:            float = 0.0,
+        mae:              float = 0.0,
+        mfe:              float = 0.0,
+        duration_mins:    int   = 0,
+        strategy_version: str   = "AI_FORWARD_V2",
+    ) -> None:
+        """Persist a completed paper trade to the paper_trades table."""
+        if not self._use_sqlite:
+            return
+        try:
+            with self._lock:
+                with sqlite3.connect(str(_DB_PATH)) as conn:
+                    conn.execute("""
+                        INSERT INTO paper_trades (
+                            symbol, direction, tier, setup_type, confidence,
+                            entry_price, sl_price, tp_price, lot_size, atr_pips,
+                            utc_hour, session, market_state,
+                            opened_at, closed_at, result, pnl_r, mae, mfe,
+                            duration_mins, strategy_version
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        symbol, direction, tier, setup_type, confidence,
+                        entry_price, sl_price, tp_price, lot_size, atr_pips,
+                        utc_hour, session, market_state,
+                        opened_at, closed_at, result, pnl_r, mae, mfe,
+                        duration_mins, strategy_version,
+                    ))
+                    conn.commit()
+        except Exception as exc:
+            log.debug("[PAPER TRADE LOG] insert error: %s", exc)
+
+    def get_paper_trade_stats(self, window: int = 100) -> Dict:
+        """Return basic win rate and expectancy for recent paper trades."""
+        if not self._use_sqlite:
+            return {}
+        try:
+            rows = self._sqlite_query(
+                "SELECT result, pnl_r FROM paper_trades "
+                "WHERE result IN ('WIN','LOSS') "
+                "ORDER BY id DESC LIMIT ?",
+                (window,),
+            )
+            if not rows:
+                return {"n": 0}
+            wins   = [r for r in rows if r["result"] == "WIN"]
+            losses = [r for r in rows if r["result"] == "LOSS"]
+            total  = len(wins) + len(losses)
+            avg_rr = sum(r["pnl_r"] for r in rows) / total if total else 0.0
+            return {
+                "n":          total,
+                "win_rate":   len(wins) / total if total else 0.0,
+                "expectancy": round(avg_rr, 3),
+            }
+        except Exception:
+            return {}
+
     # ── SQLite backend ────────────────────────────────────────────────────────
 
     def _init_db(self) -> bool:
@@ -557,6 +662,12 @@ class TradeLogger:
                             "SELECT COUNT(*) FROM trades"
                         ).fetchone()[0],
                     )
+
+                # Phase 12: paper_trades table for shadow engine data
+                for stmt in _CREATE_PAPER_SQL.strip().split(";"):
+                    s = stmt.strip()
+                    if s:
+                        conn.execute(s)
 
                 conn.commit()
             return True

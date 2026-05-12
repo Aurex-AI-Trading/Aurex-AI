@@ -88,6 +88,10 @@ from aurex_ai.core.trade_source import (
 )
 from aurex_ai.execution.correlation_engine import CorrelationEngine
 from aurex_ai.analytics.strategy_version import StrategyVersionManager, CURRENT_VERSION as _CURRENT_VERSION
+from aurex_ai.analytics.signal_store import SignalStore, SignalRecord, compute_band, BAND_ABOVE
+from aurex_ai.execution.shadow_engine import ShadowEngine
+from aurex_ai.analytics.signal_analytics import SignalAnalytics
+from aurex_ai.analytics.event_logger import EventLogger, StructuralEvent, EVT_OB, EVT_FVG, EVT_LIQ_SWEEP
 
 try:
     from aurex_ai.api.server import (
@@ -2227,6 +2231,48 @@ async def scan_symbol(
 
     direction = decision.direction
 
+    # ── Phase 12: Signal Intelligence tracking ────────────────────────────────
+    # Log every non-SKIP signal so we can measure filter effectiveness.
+    # _sig_id is threaded through all gates; rejection reason updated at each gate.
+    _sig_id: int = 0
+    try:
+        _sig_band, _sig_dist = compute_band(decision.score, float(thresholds.tier2))
+        _sig_store = SignalStore.get_instance()
+        _sig_id = _sig_store.log_signal(SignalRecord(
+            symbol          = symbol,
+            direction       = direction,
+            signal_score    = round(decision.score, 1),
+            confidence      = float(confidence.total),
+            utc_hour        = current_time.hour,
+            session         = (
+                "london"   if 7  <= current_time.hour < 13 else
+                "overlap"  if 13 <= current_time.hour < 16 else
+                "newyork"  if 16 <= current_time.hour < 22 else "asian"
+            ),
+            setup_type      = _derive_setup_type(
+                fvg_result.present, ob_result.present,
+                sweep_result.detected, bo_result.detected and bo_result.score >= 9.0,
+            ),
+            market_state    = getattr(_market_state, "state", ""),
+            atr_pips        = atr_pips,
+            spread_pips     = 0.0,
+            trend_strength  = float(getattr(trend_result, "strength", 0.0)),
+            executed        = False,
+            confidence_band = _sig_band,
+            band_distance_pts = _sig_dist,
+            strategy_version = _CURRENT_VERSION,
+        ))
+    except Exception:
+        _sig_id = 0
+
+    def _sig_reject(reason: str) -> None:
+        """Helper: mark this signal rejected in SignalStore (non-fatal)."""
+        if _sig_id:
+            try:
+                SignalStore.get_instance().mark_rejected(_sig_id, reason)
+            except Exception:
+                pass
+
     # ── BUY confirmation gate (Phase 8) ──────────────────────────────────────
     # BUY trades require at least one institutional signal: sweep, FVG, or OB.
     # SELL trades skip this gate — live performance data shows SELL outperforms BUY.
@@ -2247,6 +2293,7 @@ async def scan_symbol(
             )
             _log_rejected(symbol, "BUY_NO_INSTITUTIONAL_CONFIRM",
                           confidence=decision.confidence, atr=atr_pips)
+            _sig_reject("BUY_NO_INSTITUTIONAL_CONFIRM")
             return None
 
     # ── Core score gate ───────────────────────────────────────────────────────
@@ -2261,6 +2308,7 @@ async def scan_symbol(
         )
         _log_rejected(symbol, "CORE_SCORE_TOO_LOW",
                       confidence=decision.confidence, atr=atr_pips)
+        _sig_reject("CORE_SCORE_TOO_LOW")
         return None
 
     # ── Tier filter ───────────────────────────────────────────────────────────
@@ -2274,6 +2322,7 @@ async def scan_symbol(
         )
         _log_rejected(symbol, "TIER_BELOW_MINIMUM",
                       confidence=decision.confidence, atr=atr_pips)
+        _sig_reject("TIER_BELOW_MINIMUM")
         return None
 
     # ── Score integrity: prevent inflation from missing institutional signals ──
@@ -2284,6 +2333,7 @@ async def scan_symbol(
             symbol, confluence.buy_votes, confluence.sell_votes,
         )
         _log_rejected(symbol, "SPLIT_VOTES", confidence=decision.confidence, atr=atr_pips)
+        _sig_reject("SPLIT_VOTES")
         return None
 
     # ── Score integrity: soft moderation layer ───────────────────────────────
@@ -2462,6 +2512,7 @@ async def scan_symbol(
         )
         _log_rejected(symbol, "SCORE_ADJUSTED_BELOW_THRESHOLD",
                       confidence=decision.confidence, atr=atr_pips)
+        _sig_reject("SCORE_ADJUSTED_BELOW_THRESHOLD")
         return None
 
     # Tier downgrade: step Tier 1 → Tier 2 when adjusted score is below tier1.
@@ -2488,6 +2539,7 @@ async def scan_symbol(
         _log_rejected(symbol, "FILTER_CONFLICT", confidence=decision.confidence, atr=atr_pips)
         log.debug("%s %s: on cooldown (%.0f s remaining) after decision",
                   symbol, direction, cooldown.remaining(symbol, direction))
+        _sig_reject("COOLDOWN")
         return None
 
     # ── Currency correlation / exposure protection (Phase 11: CorrelationEngine) ──
@@ -2501,6 +2553,7 @@ async def scan_symbol(
         if not _corr_result.allowed:
             _log_rejected(symbol, "CORRELATION_BLOCKED",
                           confidence=decision.confidence, atr=atr_pips)
+            _sig_reject("CORRELATION_BLOCKED")
             return None
 
     # ── AI Pre-trade optimizer ────────────────────────────────────────────────
@@ -2820,7 +2873,72 @@ async def scan_symbol(
 
     if not trade.success:
         log.error("%s %s: trade failed — %s", symbol, direction, trade.error)
+        _sig_reject("EXECUTION_FAILED")
         return None
+
+    # Phase 12: mark signal as executed in SignalStore
+    try:
+        if _sig_id:
+            SignalStore.get_instance().mark_executed(_sig_id, trade.ticket)
+        # Also open a parallel shadow trade (PARALLEL mode: shadows all real signals)
+        ShadowEngine.get_instance().open_paper_trade(
+            symbol           = symbol,
+            direction        = direction,
+            tier             = decision.tier,
+            setup_type       = _derive_setup_type(
+                fvg_result.present, ob_result.present,
+                sweep_result.detected, bo_result.detected and bo_result.score >= 9.0,
+            ),
+            confidence       = float(confidence.total),
+            entry_price      = risk.entry,
+            sl_price         = risk.stop_loss,
+            tp_price         = risk.take_profit,
+            lot_size         = risk.lot_size,
+            atr_pips         = atr_pips,
+            utc_hour         = current_time.hour,
+            session          = (
+                "london"  if 7  <= current_time.hour < 13 else
+                "overlap" if 13 <= current_time.hour < 16 else
+                "newyork" if 16 <= current_time.hour < 22 else "asian"
+            ),
+            market_state     = getattr(_market_state, "state", ""),
+            strategy_version = _CURRENT_VERSION,
+        )
+    except Exception:
+        pass
+
+    # Phase 12: log structural events detected in this scan
+    try:
+        _el = EventLogger.get_instance()
+        _evt_session = (
+            "london"  if 7  <= current_time.hour < 13 else
+            "overlap" if 13 <= current_time.hour < 16 else
+            "newyork" if 16 <= current_time.hour < 22 else "asian"
+        )
+        _evt_state = getattr(_market_state, "state", "")
+        if ob_result.present:
+            _el.log_event(StructuralEvent(
+                symbol=symbol, event_type=EVT_OB, direction=direction,
+                utc_hour=current_time.hour, session=_evt_session,
+                market_state=_evt_state, atr_pips=atr_pips,
+                price_level=risk.entry,
+            ))
+        if fvg_result.present:
+            _el.log_event(StructuralEvent(
+                symbol=symbol, event_type=EVT_FVG, direction=direction,
+                utc_hour=current_time.hour, session=_evt_session,
+                market_state=_evt_state, atr_pips=atr_pips,
+                price_level=risk.entry,
+            ))
+        if sweep_result.detected:
+            _el.log_event(StructuralEvent(
+                symbol=symbol, event_type=EVT_LIQ_SWEEP, direction=direction,
+                utc_hour=current_time.hour, session=_evt_session,
+                market_state=_evt_state, atr_pips=atr_pips,
+                price_level=risk.entry,
+            ))
+    except Exception:
+        pass
 
     # Phase 6: register trade with failsafe + record execution quality
     failsafe.register_trade(trade.ticket, symbol, direction)
@@ -3027,9 +3145,19 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     # Phase 11 — correlation engine + strategy version manager
     _correlation_engine = CorrelationEngine(cfg)
     _version_mgr        = StrategyVersionManager.get_instance()
+    # Phase 12 — signal intelligence + shadow engine + analytics
+    _signal_store     = SignalStore.get_instance()
+    _shadow_engine    = ShadowEngine.get_instance(cfg)
+    _signal_analytics = SignalAnalytics(_signal_store)
+    _event_logger     = EventLogger.get_instance()
     log.warning(
         "[MULTI USER SAFE] [ISOLATED EXECUTION] [USER CONTEXT VERIFIED] "
         "Phase 6 systems initialised | failsafe=OK telemetry=OK exec_quality=OK adaptive_learning=OK"
+    )
+    log.warning(
+        "[SIGNAL INTELLIGENCE] Phase 12 systems ready | "
+        "signal_store=OK shadow_engine=%s event_logger=OK",
+        _shadow_engine.mode,
     )
     # Phase 11: AI_FORWARD_V2 baseline banner — shows clean-data sample count at startup
     try:
@@ -3263,6 +3391,34 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 PerformanceEngine.get_sample_status(trade_logger).log_status()
             except Exception:
                 pass
+
+        # Phase 12: Signal intelligence analytics — periodic reports every 100 cycles
+        if scan_num % 100 == 0:
+            try:
+                SignalAnalytics(SignalStore.get_instance()).log_full_report()
+                EventLogger.get_instance().log_expectancy_summary()
+                EventLogger.get_instance().expire_old_events()
+                _shadow_engine.log_stats()
+            except Exception:
+                pass
+
+        # Phase 12: Resolve hypothetical outcomes for rejected signals (every 10 cycles)
+        if scan_num % 10 == 0 and not bridge.dry_run:
+            try:
+                def _get_price(sym):
+                    tick = bridge.get_tick(sym)
+                    if tick is None:
+                        raise ValueError("no tick")
+                    return float(getattr(tick, "bid", 0)), float(getattr(tick, "ask", 0))
+                SignalStore.get_instance().resolve_hypotheticals(_get_price)
+            except Exception:
+                pass
+
+        # Phase 12: Resolve shadow (paper) trades every cycle
+        try:
+            _shadow_engine.resolve_open_trades(bridge, trade_logger)
+        except Exception:
+            pass
 
         log.info("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
 
@@ -3559,6 +3715,16 @@ def _check_live_outcomes(
                 utc_hour     = meta.get("utc_hour"),
                 trade_source = meta.get("trade_source", _AI_AUTO),
             )
+
+            # Phase 12: update signal store outcome for this closed trade
+            try:
+                SignalStore.get_instance().update_executed_outcome(
+                    ticket = ticket,
+                    won    = won,
+                    rr     = float(meta.get("rr", 0.0)),
+                )
+            except Exception:
+                pass
 
             # Arm post-outcome cooldown (extends/reduces based on win/loss)
             cooldown.arm_after_outcome(
