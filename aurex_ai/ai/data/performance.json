@@ -19,10 +19,16 @@
       "total_rr": 25.95
     },
     "GBPUSD.Z": {
-      "trades": 3,
+      "trades": 4,
       "wins": 1,
       "total_pnl": 10.67,
-      "total_rr": 5.99
+      "total_rr": 7.99
+    },
+    "GBPJPY.Z": {
+      "trades": 1,
+      "wins": 1,
+      "total_pnl": 39.99,
+      "total_rr": 2.0
     }
   },
   "tiers": {
@@ -33,10 +39,10 @@
       "total_rr": 17.96
     },
     "1": {
-      "trades": 21,
-      "wins": 5,
-      "total_pnl": 132.95000000000005,
-      "total_rr": 41.98
+      "trades": 23,
+      "wins": 6,
+      "total_pnl": 172.94000000000005,
+      "total_rr": 45.98
     },
     "3": {
       "trades": 3,
@@ -53,10 +59,10 @@
       "total_rr": 25.97
     },
     "newyork": {
-      "trades": 16,
-      "wins": 4,
-      "total_pnl": 190.41,
-      "total_rr": 31.98
+      "trades": 18,
+      "wins": 5,
+      "total_pnl": 230.4,
+      "total_rr": 35.980000000000004
     },
     "overlap": {
       "trades": 4,
@@ -67,10 +73,10 @@
   },
   "setups": {
     "FVG+OB": {
-      "trades": 23,
-      "wins": 6,
-      "total_pnl": 23.309999999999995,
-      "total_rr": 45.98
+      "trades": 25,
+      "wins": 7,
+      "total_pnl": 63.3,
+      "total_rr": 49.98
     },
     "OB+Sweep": {
       "trades": 5,
@@ -98,10 +104,10 @@
     }
   },
   "overall": {
-    "trades": 33,
-    "wins": 8,
-    "total_pnl": 157.31000000000003,
-    "total_rr": 65.94
+    "trades": 35,
+    "wins": 9,
+    "total_pnl": 197.30000000000004,
+    "total_rr": 69.94
   },
-  "last_updated": "2026-05-08T18:20:28+00:00"
+  "last_updated": "2026-05-11T19:04:45+00:00"
 }
