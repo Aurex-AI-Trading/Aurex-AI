@@ -30,7 +30,12 @@ from typing import Dict, List, Optional, Set, Tuple
 from aurex_ai.config.loader import load_settings, Settings
 from aurex_ai.core.logger import configure_logging, get_logger
 from aurex_ai.core.data_feed import DataFeed, TF_M5, TF_H1, TF_H4, TF_M15
-from aurex_ai.core.mt5_bridge import MT5Bridge, SymbolValidation, get_mt5_time, is_mt5_time_fresh, log_time_sync_banner, check_time_drift
+from aurex_ai.core.mt5_bridge import (
+    MT5Bridge, SymbolValidation,
+    get_mt5_time, is_mt5_time_fresh,
+    log_time_sync_banner, check_time_drift,
+    _TIME_BLOCK_THRESHOLD,
+)
 
 from aurex_ai.strategy import trend      as trend_mod
 from aurex_ai.strategy import liquidity  as liq_mod
@@ -4011,16 +4016,31 @@ def main() -> None:
             len(_invalid_symbols), len(symbols), _invalid_symbols,
         )
 
-    # Time-sync validation: log local vs MT5 broker time once at startup.
-    # log_time_sync_banner() returns abs drift in seconds (0.0 when MT5 unavailable).
-    # [TIME WARNING] / [TIME CRITICAL] tags are emitted inside the function.
-    # Trading always uses MT5 time regardless of drift — local clock is never traded on.
+    # ── Time-sync validation ─────────────────────────────────────────────────
+    # log_time_sync_banner() logs the full banner and returns abs drift (seconds).
+    # 0.0 is returned when MT5 feed is not yet live (market closed / pre-connect).
+    # [TIME SYNC VERIFIED] / [TIME WARNING] / [TIME CRITICAL] / [TIME BLOCK] are
+    # emitted inside the function based on drift thresholds.
+    # Trading ALWAYS uses MT5 broker time — local VPS clock is never traded on.
     _startup_drift = log_time_sync_banner(symbol=symbols[0] if symbols else "EURUSD.Z")
-    if _startup_drift >= 120:
+
+    # Hard fail-safe: if MT5 is live AND drift >= _TIME_BLOCK_THRESHOLD (300s),
+    # refuse to start trading.  The operator must either:
+    #   (a) run 'w32tm /resync /force' and restart the bot, OR
+    #   (b) set env var AUREX_OVERRIDE_TIME_CHECK=1 to bypass (emergency only).
+    if is_mt5_time_fresh() and _startup_drift >= _TIME_BLOCK_THRESHOLD:
+        if os.environ.get("AUREX_OVERRIDE_TIME_CHECK", "").strip() not in ("1", "true", "yes"):
+            log.critical(
+                "[TIME BLOCK] Trading startup BLOCKED — VPS clock is %.0fs out of sync "
+                "with MT5 broker time (threshold: %ds). "
+                "Fix: w32tm /resync /force  then restart the bot. "
+                "Emergency bypass: set AUREX_OVERRIDE_TIME_CHECK=1 and restart.",
+                _startup_drift, _TIME_BLOCK_THRESHOLD,
+            )
+            return   # exit run_live() gracefully; bridge.disconnect() runs in finally
         log.warning(
-            "[TIME SYNC] Drift=%.0fs exceeds critical threshold — "
-            "run 'w32tm /resync /force' on the VPS before trading. "
-            "Bot will continue using MT5 broker time.",
+            "[TIME SYNC] AUREX_OVERRIDE_TIME_CHECK=1 set — bypassing %.0fs drift block. "
+            "Fix the VPS clock as soon as possible.",
             _startup_drift,
         )
 
