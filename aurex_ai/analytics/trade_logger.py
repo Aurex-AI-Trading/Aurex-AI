@@ -39,6 +39,7 @@ Schema (trades table):
   pips             REAL
   profit_zar       REAL
   duration_minutes INTEGER
+  trade_source     TEXT                 — AI_AUTO | MANUAL | HYBRID | BACKTEST
 """
 from __future__ import annotations
 
@@ -51,6 +52,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from aurex_ai.core.logger import get_logger
+from aurex_ai.core.trade_source import (
+    AI_AUTO, MANUAL, HYBRID, BACKTEST,
+    classify_from_signal_id,
+)
 
 log = get_logger("analytics.trade_logger")
 
@@ -88,7 +93,8 @@ CREATE TABLE IF NOT EXISTS trades (
     result             TEXT    DEFAULT 'OPEN',
     pips               REAL    DEFAULT 0.0,
     profit_zar         REAL    DEFAULT 0.0,
-    duration_minutes   INTEGER DEFAULT 0
+    duration_minutes   INTEGER DEFAULT 0,
+    trade_source       TEXT    DEFAULT 'AI_AUTO'
 )
 """
 
@@ -125,6 +131,7 @@ class TradeRecord:
     pips:               float        = 0.0
     profit_zar:         float        = 0.0
     duration_minutes:   int          = 0
+    trade_source:       str          = AI_AUTO
 
 
 class TradeLogger:
@@ -135,6 +142,11 @@ class TradeLogger:
         tl = TradeLogger.get_instance()
         tl.log_open(ticket=12345, signal_id="EURUSD.Z-7", ...)
         tl.log_close(ticket=12345, result="WIN", profit_zar=42.5, pips=28.0)
+
+    Trade source:
+        All trades opened by the Aurex pipeline default to AI_AUTO.
+        Manual trades detected from MT5 are recorded with trade_source=MANUAL.
+        Use get_closed_trades_by_source() to query source-specific subsets.
     """
 
     _instance: Optional["TradeLogger"] = None
@@ -178,6 +190,7 @@ class TradeLogger:
         atr_pips:           float        = 0.0,
         utc_hour:           int          = 0,
         opened_at:          Optional[str] = None,
+        trade_source:       str          = AI_AUTO,
     ) -> None:
         rec = TradeRecord(
             ticket             = ticket,
@@ -206,6 +219,7 @@ class TradeLogger:
             utc_hour           = utc_hour,
             opened_at          = opened_at or _now_iso(),
             result             = "OPEN",
+            trade_source       = trade_source,
         )
         try:
             if self._use_sqlite:
@@ -213,11 +227,62 @@ class TradeLogger:
             else:
                 self._json_insert(rec)
             log.info(
-                "[TRADE LOG] OPEN ticket=%d %s %s tier=%d score=%.1f conf=%.0f",
-                ticket, symbol, direction, tier, total_score, confidence,
+                "[TRADE LOG] OPEN ticket=%d %s %s tier=%d score=%.1f conf=%.0f source=%s",
+                ticket, symbol, direction, tier, total_score, confidence, trade_source,
             )
         except Exception as exc:
             log.error("[TRADE LOG] log_open failed: %s", exc)
+
+    # ── Record a detected manual trade ────────────────────────────────────────
+
+    def log_manual_trade(
+        self,
+        ticket:      int,
+        symbol:      str,
+        direction:   str,
+        lot_size:    float       = 0.0,
+        entry_price: float       = 0.0,
+        stop_loss:   float       = 0.0,
+        take_profit: float       = 0.0,
+        opened_at:   Optional[str] = None,
+        utc_hour:    int         = 0,
+    ) -> None:
+        """
+        Record a trade detected in MT5 that was NOT opened by Aurex.
+
+        These are stored for audit/comparison only. They are NEVER fed into
+        the AI learning engine or weight adjuster.
+        """
+        rec = TradeRecord(
+            ticket       = ticket,
+            signal_id    = "",            # no signal_id — distinguishing marker
+            symbol       = symbol,
+            direction    = direction,
+            tier         = 0,             # no tier — manually entered
+            setup_type   = "MANUAL",
+            confidence   = 0.0,
+            total_score  = 0.0,
+            lot_size     = round(lot_size,     2),
+            entry_price  = round(entry_price,  5),
+            stop_loss    = round(stop_loss,    5),
+            take_profit  = round(take_profit,  5),
+            utc_hour     = utc_hour,
+            opened_at    = opened_at or _now_iso(),
+            result       = "OPEN",
+            trade_source = MANUAL,
+        )
+        try:
+            if self._use_sqlite:
+                self._sqlite_insert(rec)
+            else:
+                self._json_insert(rec)
+            log.warning(
+                "[TRADE SOURCE] [MANUAL DETECTED] ticket=%d symbol=%s dir=%s lots=%.2f "
+                "entry=%.5f source=MANUAL [NOT LEARNING-ELIGIBLE]",
+                ticket, symbol, direction, lot_size, entry_price,
+            )
+        except Exception as exc:
+            log.error("[TRADE LOG] log_manual_trade failed: %s", exc)
 
     # ── Close an existing trade ───────────────────────────────────────────────
 
@@ -246,7 +311,7 @@ class TradeLogger:
     # ── Query helpers ─────────────────────────────────────────────────────────
 
     def get_closed_trades(self, limit: int = 50) -> List[Dict]:
-        """Return the most recent `limit` closed trades as dicts, newest first."""
+        """Return the most recent `limit` closed trades (all sources), newest first."""
         try:
             if self._use_sqlite:
                 return self._sqlite_query(
@@ -259,8 +324,45 @@ class TradeLogger:
             log.error("[TRADE LOG] get_closed_trades failed: %s", exc)
             return []
 
+    def get_closed_trades_by_source(
+        self,
+        sources: List[str],
+        limit:   int = 50,
+    ) -> List[Dict]:
+        """
+        Return closed trades filtered to the given source list.
+
+        Args:
+            sources: e.g. ["AI_AUTO"] or ["AI_AUTO", "HYBRID"]
+            limit:   maximum rows to return
+
+        This is the CRITICAL query used by the learning engine and adaptive
+        learning module to ensure MANUAL trades never contaminate AI training.
+        """
+        if not sources:
+            return []
+        try:
+            if self._use_sqlite:
+                placeholders = ",".join("?" * len(sources))
+                return self._sqlite_query(
+                    f"SELECT * FROM trades WHERE result != 'OPEN' "
+                    f"AND trade_source IN ({placeholders}) "
+                    f"ORDER BY closed_at DESC LIMIT ?",
+                    tuple(sources) + (limit,),
+                )
+            # JSON fallback: filter in Python
+            all_closed = self._json_query_closed(limit * 3)
+            return [t for t in all_closed if t.get("trade_source", AI_AUTO) in sources][:limit]
+        except Exception as exc:
+            log.error("[TRADE LOG] get_closed_trades_by_source failed: %s", exc)
+            return []
+
+    def get_ai_closed_trades(self, limit: int = 100) -> List[Dict]:
+        """Convenience: AI_AUTO + HYBRID trades only — safe for learning engine."""
+        return self.get_closed_trades_by_source(["AI_AUTO", "HYBRID"], limit=limit)
+
     def get_open_trades(self) -> List[Dict]:
-        """Return all currently open trades."""
+        """Return all currently open trades (all sources)."""
         try:
             if self._use_sqlite:
                 return self._sqlite_query(
@@ -285,16 +387,45 @@ class TradeLogger:
             log.error("[TRADE LOG] get_all_trades failed: %s", exc)
             return []
 
-    def total_closed(self) -> int:
+    def total_closed(self, sources: Optional[List[str]] = None) -> int:
+        """Return total closed trade count, optionally filtered by source."""
+        try:
+            if self._use_sqlite:
+                if sources:
+                    placeholders = ",".join("?" * len(sources))
+                    rows = self._sqlite_query(
+                        f"SELECT COUNT(*) AS n FROM trades WHERE result != 'OPEN' "
+                        f"AND trade_source IN ({placeholders})",
+                        tuple(sources),
+                    )
+                else:
+                    rows = self._sqlite_query(
+                        "SELECT COUNT(*) AS n FROM trades WHERE result != 'OPEN'", ()
+                    )
+                return int(rows[0]["n"]) if rows else 0
+            all_closed = self._json_query_closed(9999)
+            if sources:
+                all_closed = [t for t in all_closed if t.get("trade_source", AI_AUTO) in sources]
+            return len(all_closed)
+        except Exception:
+            return 0
+
+    def total_ai_closed(self) -> int:
+        """Convenience: count AI_AUTO + HYBRID closed trades."""
+        return self.total_closed(sources=["AI_AUTO", "HYBRID"])
+
+    def is_ticket_known(self, ticket: int) -> bool:
+        """Return True if this MT5 ticket is already in the trade logger."""
         try:
             if self._use_sqlite:
                 rows = self._sqlite_query(
-                    "SELECT COUNT(*) AS n FROM trades WHERE result != 'OPEN'", ()
+                    "SELECT ticket FROM trades WHERE ticket = ?", (ticket,)
                 )
-                return int(rows[0]["n"]) if rows else 0
-            return len(self._json_query_closed(9999))
+                return len(rows) > 0
+            records = self._json_load()
+            return any(r.get("ticket") == ticket for r in records)
         except Exception:
-            return 0
+            return False
 
     # ── SQLite backend ────────────────────────────────────────────────────────
 
@@ -304,10 +435,31 @@ class TradeLogger:
             with sqlite3.connect(str(_DB_PATH)) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(_CREATE_SQL)
-                # Rename legacy profit_usd column to profit_zar if it exists
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+
+                # Migration: profit_usd → profit_zar (legacy column rename)
                 if "profit_usd" in cols and "profit_zar" not in cols:
                     conn.execute("ALTER TABLE trades RENAME COLUMN profit_usd TO profit_zar")
+
+                # Migration: add trade_source (Phase 10 source separation)
+                if "trade_source" not in cols:
+                    conn.execute(
+                        "ALTER TABLE trades ADD COLUMN trade_source TEXT DEFAULT 'AI_AUTO'"
+                    )
+                    # Backfill: classify historical trades by signal_id presence
+                    # Trades with a non-empty signal_id were produced by the pipeline → AI_AUTO
+                    # Trades without a signal_id were externally entered → MANUAL
+                    conn.execute(
+                        "UPDATE trades SET trade_source = 'MANUAL' "
+                        "WHERE (signal_id IS NULL OR signal_id = '') "
+                        "AND trade_source = 'AI_AUTO'"
+                    )
+                    log.warning(
+                        "[TRADE SOURCE MIGRATION] trade_source column added. "
+                        "Existing trades classified by signal_id presence. "
+                        "Empty signal_id → MANUAL, populated → AI_AUTO."
+                    )
+
                 conn.commit()
             return True
         except Exception as exc:
@@ -317,9 +469,9 @@ class TradeLogger:
 
     def _sqlite_insert(self, rec: TradeRecord) -> None:
         d = asdict(rec)
-        cols   = ", ".join(d.keys())
+        cols         = ", ".join(d.keys())
         placeholders = ", ".join("?" * len(d))
-        sql    = f"INSERT OR IGNORE INTO trades ({cols}) VALUES ({placeholders})"
+        sql = f"INSERT OR IGNORE INTO trades ({cols}) VALUES ({placeholders})"
         with self._lock:
             with sqlite3.connect(str(_DB_PATH)) as conn:
                 conn.execute(sql, list(d.values()))
@@ -367,7 +519,6 @@ class TradeLogger:
         with self._lock:
             records = self._json_load()
             records.append(asdict(rec))
-            # Keep most recent 500 entries
             if len(records) > 500:
                 records = records[-500:]
             self._json_save(records)

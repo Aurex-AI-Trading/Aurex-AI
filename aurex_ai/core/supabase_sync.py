@@ -207,20 +207,21 @@ class SupabaseSync:
             return
         tier_raw = t.get("tier")
         payload: Dict[str, Any] = {
-            "user_id":    user_id,
-            "mt5_ticket": ticket,
-            "symbol":     t.get("symbol", ""),
-            "direction":  t.get("direction", "BUY"),
-            "entry_price": t.get("entry_price"),
-            "sl":         t.get("stop_loss"),
-            "tp":         t.get("take_profit"),
-            "lot_size":   t.get("lot_size"),
-            "status":     status,
-            "rr_ratio":   t.get("risk_reward"),
-            "score":      t.get("total_score"),
-            "confidence": t.get("confidence"),
-            "tier":       f"T{tier_raw}" if tier_raw else None,
-            "opened_at":  t.get("opened_at") or None,
+            "user_id":      user_id,
+            "mt5_ticket":   ticket,
+            "symbol":       t.get("symbol", ""),
+            "direction":    t.get("direction", "BUY"),
+            "entry_price":  t.get("entry_price"),
+            "sl":           t.get("stop_loss"),
+            "tp":           t.get("take_profit"),
+            "lot_size":     t.get("lot_size"),
+            "status":       status,
+            "rr_ratio":     t.get("risk_reward"),
+            "score":        t.get("total_score"),
+            "confidence":   t.get("confidence"),
+            "tier":         f"T{tier_raw}" if tier_raw else None,
+            "opened_at":    t.get("opened_at") or None,
+            "trade_source": t.get("trade_source", "AI_AUTO"),
         }
         if status == "closed":
             payload["pnl_zar"]   = round(float(t.get("profit_zar", 0.0) or 0.0), 2)

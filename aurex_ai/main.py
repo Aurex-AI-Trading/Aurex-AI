@@ -81,6 +81,11 @@ from aurex_ai.execution.execution_quality import ExecutionQualityEngine
 
 from aurex_ai.analytics.trade_logger import TradeLogger
 from aurex_ai.analytics.performance  import PerformanceEngine
+from aurex_ai.core.trade_source import (
+    AI_AUTO as _AI_AUTO,
+    MANUAL  as _MANUAL,
+    classify_from_mt5_position as _classify_mt5_pos,
+)
 
 try:
     from aurex_ai.api.server import (
@@ -801,22 +806,23 @@ async def _fallback_pipeline(
     # ── Persist trade open to analytics log ──────────────────────────────────
     try:
         TradeLogger.get_instance().log_open(
-            ticket      = trade.ticket,
-            signal_id   = signal_id,
-            symbol      = symbol,
-            direction   = direction,
-            tier        = 3,
-            setup_type  = f"Fallback-{fb.method}",
-            confidence  = float(confidence_fb.total),
-            total_score = fallback_decision.score,
-            entry_price = risk.entry,
-            stop_loss   = risk.stop_loss,
-            take_profit = risk.take_profit,
-            lot_size    = risk.lot_size,
-            risk_reward = risk.rr_ratio,
-            atr_pips    = atr_pips_fb,
-            utc_hour    = current_time.hour,
-            opened_at   = _opened_at_fb,
+            ticket       = trade.ticket,
+            signal_id    = signal_id,
+            symbol       = symbol,
+            direction    = direction,
+            tier         = 3,
+            setup_type   = f"Fallback-{fb.method}",
+            confidence   = float(confidence_fb.total),
+            total_score  = fallback_decision.score,
+            entry_price  = risk.entry,
+            stop_loss    = risk.stop_loss,
+            take_profit  = risk.take_profit,
+            lot_size     = risk.lot_size,
+            risk_reward  = risk.rr_ratio,
+            atr_pips     = atr_pips_fb,
+            utc_hour     = current_time.hour,
+            opened_at    = _opened_at_fb,
+            trade_source = _AI_AUTO,
         )
     except Exception as _tl_exc:
         log.debug("[TRADE LOG] fallback log_open error: %s", _tl_exc)
@@ -2898,6 +2904,7 @@ async def scan_symbol(
             atr_pips           = atr_pips,
             utc_hour           = current_time.hour,
             opened_at          = current_time.isoformat(),
+            trade_source       = _AI_AUTO,
         )
     except Exception as _tl_exc:
         log.debug("[TRADE LOG] log_open error: %s", _tl_exc)
@@ -3174,6 +3181,36 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 check_time_drift(symbol=symbols[0])
             except Exception:
                 pass
+
+        # Manual trade detection — every 20 cycles (~5 min at 15s interval).
+        # Scans ALL MT5 positions (no magic filter) and logs any non-Aurex positions
+        # so they can be tracked and excluded from AI learning.
+        if not bridge.dry_run and scan_num % 20 == 0:
+            try:
+                _all_pos = bridge.get_all_positions()
+                _tl      = TradeLogger.get_instance()
+                for _pos in _all_pos:
+                    _src = _classify_mt5_pos(_pos["magic"], _pos.get("comment", ""))
+                    if _src == _MANUAL:
+                        _ticket = _pos["ticket"]
+                        if not _tl.is_ticket_known(_ticket):
+                            log.warning(
+                                "[TRADE SOURCE] [MANUAL DETECTED] ticket=%d %s %s "
+                                "lot=%.2f magic=%d comment=%r — recording as MANUAL",
+                                _ticket, _pos["symbol"], _pos["type"],
+                                _pos["volume"], _pos["magic"], _pos.get("comment", ""),
+                            )
+                            _tl.log_manual_trade(
+                                ticket      = _ticket,
+                                symbol      = _pos["symbol"],
+                                direction   = _pos["type"],
+                                lot_size    = _pos["volume"],
+                                entry_price = _pos["price_open"],
+                                stop_loss   = _pos.get("sl", 0.0),
+                                take_profit = _pos.get("tp", 0.0),
+                            )
+            except Exception as _mdet_exc:
+                log.debug("[TRADE SOURCE] manual detect error: %s", _mdet_exc)
 
         # Phase 6: AI score (once per day, after daily update)
         if trade_logger.total_closed() >= 10:
@@ -3484,15 +3521,16 @@ def _check_live_outcomes(
                     )
                 _session_losses = 0
 
-            # Record into learning engine for weight + threshold adaptation
+            # Record into learning engine — MANUAL trades are auto-rejected inside
             engine.record_outcome(
-                symbol     = meta["symbol"],
-                tier       = meta["tier"],
-                setup_type = meta["setup_type"],
-                won        = won,
-                pnl        = profit,
-                rr         = meta["rr"],
-                utc_hour   = meta.get("utc_hour"),
+                symbol       = meta["symbol"],
+                tier         = meta["tier"],
+                setup_type   = meta["setup_type"],
+                won          = won,
+                pnl          = profit,
+                rr           = meta["rr"],
+                utc_hour     = meta.get("utc_hour"),
+                trade_source = meta.get("trade_source", _AI_AUTO),
             )
 
             # Arm post-outcome cooldown (extends/reduces based on win/loss)

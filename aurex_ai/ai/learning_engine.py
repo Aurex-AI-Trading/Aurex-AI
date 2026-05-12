@@ -25,6 +25,7 @@ from typing import Optional
 from aurex_ai.ai.performance_tracker import PerformanceTracker
 from aurex_ai.ai.weight_adjuster import WeightAdjuster, FactorWeights
 from aurex_ai.core.logger import get_logger
+from aurex_ai.core.trade_source import AI_AUTO, is_learnable_source, source_label
 
 log = get_logger("ai.learning_engine")
 
@@ -69,23 +70,38 @@ class LearningEngine:
 
     def record_outcome(
         self,
-        symbol:     str,
-        tier:       int,
-        setup_type: str,
-        won:        bool,
-        pnl:        float = 0.0,
-        rr:         float = 0.0,
-        utc_hour:   Optional[int] = None,
+        symbol:       str,
+        tier:         int,
+        setup_type:   str,
+        won:          bool,
+        pnl:          float = 0.0,
+        rr:           float = 0.0,
+        utc_hour:     Optional[int] = None,
+        trade_source: str = AI_AUTO,
     ) -> None:
-        """Record a closed trade result into the performance database."""
+        """
+        Record a closed trade result into the performance database.
+
+        MANUAL trades are never fed to the learning engine — only AI_AUTO and
+        HYBRID sources update weights, thresholds, and win-rate buckets.
+        """
+        if not is_learnable_source(trade_source):
+            log.info(
+                "[LEARNING BLOCKED — MANUAL] %s tier=%d won=%s pnl=%.2f "
+                "— source=%s excluded from AI learning",
+                symbol, tier, won, pnl, trade_source,
+            )
+            return
+
         self._tracker.record_trade(
-            symbol     = symbol,
-            tier       = tier,
-            setup_type = setup_type,
-            won        = won,
-            pnl        = pnl,
-            rr         = rr,
-            utc_hour   = utc_hour,
+            symbol       = symbol,
+            tier         = tier,
+            setup_type   = setup_type,
+            won          = won,
+            pnl          = pnl,
+            rr           = rr,
+            utc_hour     = utc_hour,
+            trade_source = trade_source,
         )
 
     # ── Daily weight update ───────────────────────────────────────────────────

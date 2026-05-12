@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from aurex_ai.core.mt5_bridge import get_mt5_time
-
+from aurex_ai.core.trade_source import AI_AUTO, is_learnable_source
 from aurex_ai.core.logger import get_logger
 
 log = get_logger("ai.performance_tracker")
@@ -102,14 +102,21 @@ class PerformanceTracker:
 
     def record_trade(
         self,
-        symbol:     str,
-        tier:       int,
-        setup_type: str,
-        won:        bool,
-        pnl:        float = 0.0,
-        rr:         float = 0.0,
-        utc_hour:   Optional[int] = None,
+        symbol:       str,
+        tier:         int,
+        setup_type:   str,
+        won:          bool,
+        pnl:          float = 0.0,
+        rr:           float = 0.0,
+        utc_hour:     Optional[int] = None,
+        trade_source: str = AI_AUTO,
     ) -> None:
+        if not is_learnable_source(trade_source):
+            log.debug(
+                "[LEARNING BLOCKED] record_trade skipped: source=%s symbol=%s",
+                trade_source, symbol,
+            )
+            return
         if utc_hour is None:
             utc_hour = get_mt5_time().hour
         session = _get_session(utc_hour)
@@ -136,8 +143,9 @@ class PerformanceTracker:
         self._save()
 
         log.info(
-            "[LEARNING] trade recorded: %s tier=%d setup=%s won=%s pnl=%.2f rr=%.2f session=%s",
-            symbol, tier, setup_type, won, pnl, rr, session,
+            "[LEARNING] [AI AUTO] trade recorded: %s tier=%d setup=%s won=%s "
+            "pnl=%.2f rr=%.2f session=%s source=%s",
+            symbol, tier, setup_type, won, pnl, rr, session, trade_source,
         )
 
     # ── Query win rates ───────────────────────────────────────────────────────

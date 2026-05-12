@@ -4,6 +4,17 @@ Aurex AI — Performance Analytics Engine
 Computes profitability metrics from the TradeLogger's persistent history.
 Designed to run in-process after each trade close and once at startup.
 
+Source separation (Phase 10):
+  All compute paths now accept an optional `source_filter` parameter so
+  metrics can be computed independently for AI_AUTO, MANUAL, and HYBRID trades.
+
+  compute(trade_logger, source_filter=["AI_AUTO"])  → AI-only metrics
+  compute(trade_logger, source_filter=["MANUAL"])   → Manual-only metrics
+  compute_by_source(trade_logger)                   → {source: PerformanceReport}
+
+  Use the [AI PERFORMANCE], [MANUAL PERFORMANCE], and [HYBRID PERFORMANCE]
+  log tags to distinguish analytics blocks in the logs.
+
 Metrics:
   win_rate          — wins / closed_trades
   avg_rr            — mean realised R:R of winning trades only (logged as avg_win_rr)
@@ -24,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from aurex_ai.core.logger import get_logger
+from aurex_ai.core.trade_source import AI_AUTO, MANUAL, HYBRID, ALL_SOURCES
 
 log = get_logger("analytics.performance")
 
@@ -52,6 +64,7 @@ def _session_for_hour(hour: int) -> str:
 @dataclass
 class PerformanceReport:
     """Snapshot of system performance computed from trade history."""
+    source:             str          = "ALL"     # AI_AUTO | MANUAL | HYBRID | ALL
     total_closed:       int          = 0
     total_open:         int          = 0
     win_rate:           float        = 0.0     # 0.0 – 1.0
@@ -64,25 +77,31 @@ class PerformanceReport:
     worst_session:      str          = ""
     best_direction:     str          = ""
     best_setup:         str          = ""
-    # Phase 5: enhanced analytics
     avg_duration_min:   float        = 0.0     # average trade duration in minutes
     tp_hit_rate:        float        = 0.0     # profitable closes / total closed
-    session_pnl:        Dict[str, float] = field(default_factory=dict)  # P&L by session
-    symbol_win_rates:   Dict[str, float] = field(default_factory=dict)  # WR per symbol
-    symbol_pnl:         Dict[str, float] = field(default_factory=dict)  # PnL per symbol
-    # component_deltas: factor -> (win_avg_score - loss_avg_score)
-    # Positive = this factor scores higher in winning trades
+    session_pnl:        Dict[str, float] = field(default_factory=dict)
+    symbol_win_rates:   Dict[str, float] = field(default_factory=dict)
+    symbol_pnl:         Dict[str, float] = field(default_factory=dict)
     component_deltas:   Dict[str, float] = field(default_factory=dict)
-    # per-session win rate for logging
     session_win_rates:  Dict[str, float] = field(default_factory=dict)
+    expectancy:         float        = 0.0     # avg P&L per trade
+
+    def _source_tag(self) -> str:
+        tag_map = {
+            AI_AUTO: "[AI PERFORMANCE]",
+            MANUAL:  "[MANUAL PERFORMANCE]",
+            HYBRID:  "[HYBRID PERFORMANCE]",
+        }
+        return tag_map.get(self.source, "[PERFORMANCE ANALYTICS]")
 
     def to_log_str(self) -> str:
+        tag = self._source_tag()
         lines = [
-            f"[PERFORMANCE ANALYTICS] trades={self.total_closed} "
+            f"{tag} source={self.source} trades={self.total_closed} "
             f"wr={self.win_rate:.1%} tp_hit={self.tp_hit_rate:.1%} "
             f"avg_win_rr={self.avg_rr:.2f} pf={self.profit_factor:.2f} "
             f"pnl={self.total_pnl_zar:.2f} dd={self.max_drawdown_pct:.1f}% "
-            f"avg_dur={self.avg_duration_min:.0f}min",
+            f"expectancy={self.expectancy:.2f} avg_dur={self.avg_duration_min:.0f}min",
             f"  [STRATEGY METRICS] best_session={self.best_session or 'n/a'} "
             f"worst={self.worst_session or 'n/a'} "
             f"best_dir={self.best_direction or 'n/a'} "
@@ -119,33 +138,52 @@ class PerformanceEngine:
         from aurex_ai.analytics.trade_logger import TradeLogger
         from aurex_ai.analytics.performance  import PerformanceEngine
 
-        report = PerformanceEngine.compute(TradeLogger.get_instance())
-        log.warning(report.to_log_str())
+        # AI-only analytics (learning-clean):
+        ai_report = PerformanceEngine.compute(
+            TradeLogger.get_instance(), source_filter=[AI_AUTO]
+        )
+        log.warning(ai_report.to_log_str())
+
+        # Full source breakdown:
+        by_source = PerformanceEngine.compute_by_source(TradeLogger.get_instance())
     """
 
     @staticmethod
     def compute(
         trade_logger,
-        window: Optional[int] = None,
+        window:        Optional[int]       = None,
+        source_filter: Optional[List[str]] = None,
     ) -> PerformanceReport:
         """
         Compute analytics from the trade log.
 
         Args:
-            trade_logger: TradeLogger instance.
-            window:       If set, only consider the most recent N closed trades.
-                          None = use all closed trades.
+            trade_logger:  TradeLogger instance.
+            window:        If set, only consider the most recent N closed trades.
+                           None = use all closed trades.
+            source_filter: If set, only include trades whose trade_source is in
+                           this list.  e.g. ["AI_AUTO"] for AI-only metrics.
+                           None = include all sources.
 
         Returns:
             PerformanceReport with all metrics filled in.
         """
-        all_closed = trade_logger.get_closed_trades(limit=window or 2000)
+        source_label = source_filter[0] if (source_filter and len(source_filter) == 1) else "ALL"
+
+        if source_filter:
+            all_closed = trade_logger.get_closed_trades_by_source(
+                sources=source_filter, limit=window or 2000
+            )
+        else:
+            all_closed = trade_logger.get_closed_trades(limit=window or 2000)
+
         open_trades = trade_logger.get_open_trades()
 
         if not all_closed:
-            return PerformanceReport(total_open=len(open_trades))
+            return PerformanceReport(source=source_label, total_open=len(open_trades))
 
         report = PerformanceReport(
+            source       = source_label,
             total_closed = len(all_closed),
             total_open   = len(open_trades),
         )
@@ -163,12 +201,16 @@ class PerformanceEngine:
             round(gross_profit, 2) if gross_profit > 0 else 0.0
         )
 
-        # avg_rr: winning trades only (losses have no meaningful realised R:R stored)
+        # Expectancy: average P&L per trade (positive = edge)
+        report.expectancy = round(
+            report.total_pnl_zar / len(all_closed) if all_closed else 0.0, 2
+        )
+
+        # avg_rr: winning trades only
         rr_vals = [t.get("risk_reward", 0.0) for t in wins if t.get("risk_reward", 0.0) > 0]
         report.avg_rr = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else 0.0
 
         # ── Max drawdown (equity curve) ───────────────────────────────────────
-        # Build equity curve from opened_at-sorted trades.
         sorted_by_time = sorted(all_closed, key=lambda t: t.get("opened_at", ""))
         equity  = 0.0
         peak    = 0.0
@@ -180,10 +222,6 @@ class PerformanceEngine:
             dd = equity - peak
             if dd < max_dd:
                 max_dd = dd
-        # When peak > 0: standard peak-to-trough %, capped at -100% (a cumulative equity
-        # drawdown beyond the peak is mathematically possible but has no intuitive meaning
-        # above -100%; capping prevents misleading -279% style displays).
-        # When peak <= 0 (no profitable trades): report -100.0.
         report.max_drawdown_pct = round(
             max(max_dd / peak * 100.0, -100.0) if peak > 0 else (-100.0 if max_dd < 0 else 0.0), 2
         )
@@ -212,8 +250,8 @@ class PerformanceEngine:
 
         report.session_win_rates = {s: round(v, 3) for s, v in session_wr.items()}
         if session_wr:
-            report.best_session  = max(session_wr, key=session_wr.get)  # type: ignore[arg-type]
-            report.worst_session = min(session_wr, key=session_wr.get)  # type: ignore[arg-type]
+            report.best_session  = max(session_wr, key=session_wr.get)   # type: ignore[arg-type]
+            report.worst_session = min(session_wr, key=session_wr.get)   # type: ignore[arg-type]
 
         # ── Best direction ────────────────────────────────────────────────────
         dir_wins:  Dict[str, int] = {}
@@ -223,10 +261,7 @@ class PerformanceEngine:
             dir_total[d] = dir_total.get(d, 0) + 1
             if t.get("result") == "WIN":
                 dir_wins[d] = dir_wins.get(d, 0) + 1
-        dir_wr = {
-            d: dir_wins.get(d, 0) / n
-            for d, n in dir_total.items() if n >= 5
-        }
+        dir_wr = {d: dir_wins.get(d, 0) / n for d, n in dir_total.items() if n >= 5}
         if dir_wr:
             report.best_direction = max(dir_wr, key=dir_wr.get)  # type: ignore[arg-type]
 
@@ -235,19 +270,16 @@ class PerformanceEngine:
         setup_total: Dict[str, int] = {}
         for t in all_closed:
             st = t.get("setup_type", "")
-            if not st:
+            if not st or st == "MANUAL":
                 continue
             setup_total[st] = setup_total.get(st, 0) + 1
             if t.get("result") == "WIN":
                 setup_wins[st] = setup_wins.get(st, 0) + 1
-        setup_wr = {
-            s: setup_wins.get(s, 0) / n
-            for s, n in setup_total.items() if n >= 5
-        }
+        setup_wr = {s: setup_wins.get(s, 0) / n for s, n in setup_total.items() if n >= 5}
         if setup_wr:
             report.best_setup = max(setup_wr, key=setup_wr.get)  # type: ignore[arg-type]
 
-        # ── Phase 5: Average trade duration ──────────────────────────────────
+        # ── Average trade duration ────────────────────────────────────────────
         durations = [
             t.get("duration_minutes", 0)
             for t in all_closed
@@ -255,13 +287,11 @@ class PerformanceEngine:
         ]
         report.avg_duration_min = round(sum(durations) / len(durations), 1) if durations else 0.0
 
-        # ── Phase 5: TP hit rate (profitable closes ÷ total closed) ──────────
-        # Uses profit_zar > 0 as the proxy for "TP hit or runner win".
-        # Breakeven trades (profit_zar ≈ 0) are counted as neutral, not TP.
+        # ── TP hit rate ───────────────────────────────────────────────────────
         tp_hits = sum(1 for t in all_closed if t.get("profit_zar", 0.0) > 0.5)
         report.tp_hit_rate = round(tp_hits / len(all_closed), 3) if all_closed else 0.0
 
-        # ── Phase 5: Session P&L breakdown ───────────────────────────────────
+        # ── Session P&L breakdown ─────────────────────────────────────────────
         session_pnl: Dict[str, float] = {}
         for t in all_closed:
             s   = _session_for_hour(t.get("utc_hour", 12))
@@ -269,7 +299,7 @@ class PerformanceEngine:
             session_pnl[s] = round(session_pnl.get(s, 0.0) + pnl, 2)
         report.session_pnl = session_pnl
 
-        # ── Phase 5: Per-symbol win rate and P&L ─────────────────────────────
+        # ── Per-symbol win rate and P&L ───────────────────────────────────────
         sym_wins:  Dict[str, int]   = {}
         sym_total: Dict[str, int]   = {}
         sym_pnl:   Dict[str, float] = {}
@@ -288,11 +318,57 @@ class PerformanceEngine:
         report.symbol_pnl = sym_pnl
 
         # ── Component score deltas (win vs loss) ──────────────────────────────
-        # Positive delta = factor reliably predicts wins.
-        # Used by WeightAdjuster to nudge weights toward high-signal factors.
         report.component_deltas = _compute_component_deltas(wins, losses)
 
         return report
+
+    @staticmethod
+    def compute_by_source(
+        trade_logger,
+        window: Optional[int] = None,
+    ) -> Dict[str, PerformanceReport]:
+        """
+        Compute separate PerformanceReport for every trade source with data.
+
+        Returns a dict keyed by source string: {"AI_AUTO": ..., "MANUAL": ..., ...}
+        Only includes sources that have at least one closed trade.
+
+        Used for dashboard source comparison and the startup [AI PERFORMANCE] banner.
+        """
+        results: Dict[str, PerformanceReport] = {}
+        for source in (AI_AUTO, MANUAL, HYBRID):
+            n = trade_logger.total_closed(sources=[source])
+            if n == 0:
+                continue
+            results[source] = PerformanceEngine.compute(
+                trade_logger, window=window, source_filter=[source]
+            )
+        return results
+
+    @staticmethod
+    def log_source_comparison(trade_logger, window: Optional[int] = None) -> None:
+        """
+        Emit a full per-source performance breakdown to the log.
+
+        Emits [AI PERFORMANCE], [MANUAL PERFORMANCE], [HYBRID PERFORMANCE] blocks
+        followed by a combined summary.  Call once per day or on-demand.
+        """
+        by_source = PerformanceEngine.compute_by_source(trade_logger, window=window)
+        if not by_source:
+            log.info("[PERFORMANCE] No closed trades to report")
+            return
+
+        for source, report in by_source.items():
+            log.warning(report.to_log_str())
+
+        # Combined summary line
+        all_report = PerformanceEngine.compute(trade_logger, window=window)
+        log.warning(
+            "[PERFORMANCE SUMMARY] ALL SOURCES | trades=%d wr=%.1f%% pf=%.2f pnl=%.2f dd=%.1f%%",
+            all_report.total_closed, all_report.win_rate,
+            all_report.profit_factor, all_report.total_pnl_zar,
+            all_report.max_drawdown_pct,
+        )
 
 
 def _compute_component_deltas(
@@ -314,9 +390,7 @@ def _compute_component_deltas(
             continue
         win_avg  = sum(win_scores)  / max(len(win_scores),  1)
         loss_avg = sum(loss_scores) / max(len(loss_scores), 1)
-        # Normalise by the factor's max scale so all deltas are comparable
         delta = round(win_avg - loss_avg, 3)
-        # Map DB column names to weight adjuster factor keys
         factor = key.replace("_score", "").replace("liquidity", "liquidity")
         if factor == "confirmation":
             factor = "confirmation"

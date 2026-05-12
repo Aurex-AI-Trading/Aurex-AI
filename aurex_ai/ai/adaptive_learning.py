@@ -127,7 +127,8 @@ class AdaptiveLearning:
         since the last computation, to avoid thrashing on every cycle.
         Returns the cached snapshot otherwise.
         """
-        n = trade_logger.total_closed()
+        from aurex_ai.core.trade_source import LEARNABLE_SOURCES
+        n = trade_logger.total_ai_closed()
 
         with self._lock:
             if (
@@ -156,9 +157,13 @@ class AdaptiveLearning:
                 self._last_trade_count = n
             return snap
 
-        # ── Fetch trade windows ───────────────────────────────────────────────
-        short_trades = trade_logger.get_closed_trades(limit=win_short)
-        long_trades  = trade_logger.get_closed_trades(limit=win_long)
+        # ── Fetch AI-only trade windows (never polluted by MANUAL trades) ─────
+        short_trades = trade_logger.get_closed_trades_by_source(
+            sources=list(LEARNABLE_SOURCES), limit=win_short
+        )
+        long_trades  = trade_logger.get_closed_trades_by_source(
+            sources=list(LEARNABLE_SOURCES), limit=win_long
+        )
 
         snap.short_win_rate = _win_rate(short_trades)
         snap.long_win_rate  = _win_rate(long_trades)

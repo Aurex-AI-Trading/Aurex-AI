@@ -857,18 +857,51 @@ class MT5Bridge:
             return []
         return [
             {
-                "ticket":   p.ticket,
-                "symbol":   p.symbol,
-                "type":     "BUY" if p.type == 0 else "SELL",
-                "volume":   p.volume,
+                "ticket":     p.ticket,
+                "symbol":     p.symbol,
+                "type":       "BUY" if p.type == 0 else "SELL",
+                "volume":     p.volume,
                 "price_open": p.price_open,
-                "sl":       p.sl,
-                "tp":       p.tp,
-                "profit":   p.profit,
-                "magic":    p.magic,
+                "sl":         p.sl,
+                "tp":         p.tp,
+                "profit":     p.profit,
+                "magic":      p.magic,
+                "comment":    getattr(p, "comment", ""),
             }
             for p in positions
             if p.magic == self.magic
+        ]
+
+    def get_all_positions(self, symbol: Optional[str] = None) -> List[Dict]:
+        """
+        Return ALL open MT5 positions regardless of magic number.
+
+        Used by the manual trade detector to find positions not opened by Aurex.
+        Includes `magic` and `comment` fields so the caller can classify each
+        position using classify_from_mt5_position().
+        """
+        if not _MT5_AVAILABLE or not self._connected:
+            return []
+        positions = (
+            mt5.positions_get(symbol=symbol) if symbol
+            else mt5.positions_get()
+        )
+        if positions is None:
+            return []
+        return [
+            {
+                "ticket":     p.ticket,
+                "symbol":     p.symbol,
+                "type":       "BUY" if p.type == 0 else "SELL",
+                "volume":     p.volume,
+                "price_open": p.price_open,
+                "sl":         p.sl,
+                "tp":         p.tp,
+                "profit":     p.profit,
+                "magic":      p.magic,
+                "comment":    getattr(p, "comment", ""),
+            }
+            for p in positions
         ]
 
     # ── Order execution ───────────────────────────────────────────────────────

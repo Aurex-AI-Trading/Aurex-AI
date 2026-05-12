@@ -30,6 +30,7 @@ from aurex_ai.core.mt5_bridge import MT5Bridge, OrderResult, get_mt5_time
 from aurex_ai.execution.decision_engine import Decision
 from aurex_ai.execution.risk_manager import RiskResult
 from aurex_ai.core.logger import get_logger
+from aurex_ai.core.trade_source import AI_AUTO
 
 log = get_logger("execution.executor")
 
@@ -92,7 +93,8 @@ class TradeResult:
     dry_run:         bool
     signal_id:       str
     opened_at:       str   # ISO-8601 UTC
-    error:           str = ""
+    error:           str  = ""
+    trade_source:    str  = "AI_AUTO"
 
     @classmethod
     def failed(
@@ -104,7 +106,7 @@ class TradeResult:
             sl_pips=0.0, rr_ratio=0.0, risk_amount=0.0,
             dry_run=dry_run, signal_id=signal_id,
             opened_at=get_mt5_time().isoformat(),
-            error=error,
+            error=error, trade_source=AI_AUTO,
         )
 
 
@@ -200,7 +202,7 @@ async def execute(
     mode      = "DRY_RUN" if bridge.dry_run else "LIVE"
 
     log.warning(
-        "TRADE OPENED (%s) | %s %s | ticket=%d lots=%.2f "
+        "[AI AUTO] TRADE OPENED (%s) | %s %s | ticket=%d lots=%.2f "
         "entry=%.5f sl=%.5f tp=%.5f rr=%.2fR risk=$%.2f",
         mode, symbol, decision.direction,
         order.ticket, risk.lot_size,
@@ -222,6 +224,7 @@ async def execute(
             "signal_id":    signal_id,
             "opened_at":    opened_at,
             "dry_run":      bridge.dry_run,
+            "trade_source": AI_AUTO,
         },
     )
 
@@ -240,4 +243,5 @@ async def execute(
         dry_run        = bridge.dry_run,
         signal_id      = signal_id,
         opened_at      = opened_at,
+        trade_source   = AI_AUTO,
     )
