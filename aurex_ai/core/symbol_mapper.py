@@ -57,10 +57,11 @@ NO_SUFFIX_SYMBOLS: FrozenSet[str] = frozenset({
 })
 
 # Base symbols Aurex AI trades — broker suffix is applied on top.
-# Phase 6: expanded to full 8-symbol set; XAUUSD handled via NO_SUFFIX_SYMBOLS.
+# Phase 8: focused 5-symbol institutional set.
+# Removed low-edge pairs (AUDUSD, USDCAD, NZDUSD, USDCHF); added GBPJPY.
+# XAUUSD handled via NO_SUFFIX_SYMBOLS (never receives broker suffix).
 BASE_SYMBOLS: List[str] = [
-    "XAUUSD", "EURUSD", "GBPUSD", "USDJPY",
-    "AUDUSD", "USDCAD", "NZDUSD", "USDCHF",
+    "XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "GBPJPY",
 ]
 
 # Retry config for symbol_select failures

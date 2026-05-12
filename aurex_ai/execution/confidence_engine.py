@@ -36,19 +36,16 @@ log = get_logger("execution.confidence")
 
 MIN_TRADE_CONFIDENCE = 40   # [Phase 7] base pre-filter raised from 30; use get_confidence_threshold() for adaptive
 
-# Per-symbol minimum confidence thresholds [Phase 7]
+# Per-symbol minimum confidence thresholds [Phase 8]
 # Applied independently of mode.min_confidence — the stricter gate wins.
+# Matches settings.yaml per_symbol section exactly.
 # Key: strip all broker suffixes before lookup (XAUUSD, not XAUUSD.Z).
 _SYMBOL_CONF_FLOOR: dict = {
-    "XAUUSD": 65,   # Gold — extreme ATR + frequent false breaks demand strictest gate
-    "GBPUSD": 63,   # High-ATR GBP cable
-    "GBPJPY": 63,   # High-ATR cross; hardest directional predictability
-    "USDJPY": 61,   # Yen carry; slightly stricter than commodity pairs
-    "EURUSD": 61,   # Deepest FX liquidity; still needs strong signal
-    "AUDUSD": 60,   # Commodity-correlated; standard gate
-    "USDCAD": 60,   # Oil-correlated; standard gate
-    "NZDUSD": 60,   # Lower volatility pair
-    "USDCHF": 60,   # Safe-haven; standard gate
+    "XAUUSD": 72,   # Gold — extreme ATR + frequent false breaks; strictest institutional gate
+    "GBPJPY": 68,   # Highest ATR cross; hardest directional predictability
+    "GBPUSD": 68,   # High-ATR GBP cable; wide spreads + London-dominated flow
+    "USDJPY": 66,   # Yen carry pair; risk-on/off driven; needs macro alignment
+    "EURUSD": 66,   # Deepest FX liquidity; still needs strong institutional signal
 }
 
 

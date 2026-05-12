@@ -10,23 +10,25 @@
 broker_suffix: ".Z"
 
 symbols:
-  # Phase 6: Standardized symbol list. Gold must use XAUUSD (no .Z suffix ever).
+  # Phase 8: Focused 5-symbol institutional set.
+  # Gold must use XAUUSD (NO .Z suffix — stripped by NO_SUFFIX_SYMBOLS guard).
   # Forex pairs use the broker suffix configured in broker_suffix above.
-  - XAUUSD     # Gold — NO .Z suffix. Best performer. High ATR.
-  - EURUSD.Z   # Deepest liquidity — sweeps + trend continuation
-  - GBPUSD.Z   # High ATR, strong institutional flow — London leader
-  - USDJPY.Z   # Risk-on gauge; carry pair with clear institutional bias
-  - AUDUSD.Z   # Commodity-correlated; active in Asian crossover
-  - USDCAD.Z   # Oil-correlated; active during NY open
-  - NZDUSD.Z   # Lower ATR pair; conservative execution
-  - USDCHF.Z   # Safe-haven flow; active in London
+  # Removed low-ATR pairs (AUDUSD, USDCAD, NZDUSD, USDCHF) — insufficient edge.
+  # Added GBPJPY.Z — highest ATR cross; institutional order flow pairs only.
+  - XAUUSD     # Gold — NO .Z suffix. Highest ATR. Strictest confidence gate.
+  - EURUSD.Z   # Deepest FX liquidity — trend continuation + sweep setups
+  - GBPUSD.Z   # High ATR, strong institutional flow — London session leader
+  - USDJPY.Z   # Risk-on/risk-off gauge; carry pair with strong directional bias
+  - GBPJPY.Z   # Highest ATR cross; institutional order flow and momentum
 
 # ── Risk management ───────────────────────────────────────────
 risk:
   risk_pct:            1.0     # % of balance risked per trade (target; floored at vol_min lot)
   min_rr:              2.0     # minimum RR — TP is always ATR×3.0/SL×1.5 = 2.0; floor ensures this
-  max_open_trades:     1       # LIVE CAPITAL PROTECTION: 1 trade at a time
-  max_open_per_symbol: 1       # max concurrent positions per individual symbol
+  max_open_trades:     2       # Phase 8: controlled scaling — 2 simultaneous trades max
+                               # Correlation protection (see correlation: section) prevents
+                               # duplicate directional stacking and currency overexposure.
+  max_open_per_symbol: 1       # max concurrent positions per individual symbol (never stack same pair)
   max_daily_trades:    2       # institutional discipline: 2 high-quality trades > 3 marginal ones
   max_lot_size:        0.05    # safety cap — 0.0 means no cap
   max_daily_loss_pct:  8.0     # halt at 8% daily DD (tighter than 10% — protect capital)
@@ -158,7 +160,7 @@ trading:
   sim_balance:    0.0     # DISABLED — real MT5 account balance used for all calculations.
   # "aggressive" — tuned for small accounts ($29/R500): lower thresholds, higher frequency
   # "conservative" — original production gates: use when scaling to larger capital
-  trading_mode:   aggressive
+  trading_mode:   normal    # Phase 8: institutional "normal" mode — stricter than aggressive
 
 # ── Logging ───────────────────────────────────────────────────
 logging:
@@ -218,9 +220,9 @@ trade_management:
 guard:
   consecutive_loss_halt:   3       # halt all trading after N consecutive losses (resets next UTC day)
   consecutive_loss_reduce: 2       # reduce lot size to 50% at N consecutive losses
-  daily_dd_halt_pct:       4.0     # halt when daily equity drawdown reaches this % (tightened: was 5.0)
-  daily_dd_reduce_pct:     2.0     # reduce to 50% lot when daily DD reaches this % (tightened: was 2.5)
-  total_dd_halt_pct:       10.0    # halt when total equity drawdown from all-time peak reaches this % (was 12.0)
+  daily_dd_halt_pct:       5.0     # Phase 8: 5% max daily drawdown — matches institutional requirement
+  daily_dd_reduce_pct:     2.5     # reduce to 50% lot when daily DD reaches this %
+  total_dd_halt_pct:       15.0    # Phase 8: 15% max account drawdown from peak — safer ceiling
   small_account_balance:   2000.0  # ZAR balance below which small-account conservative limits apply
 
 # ── Testing ───────────────────────────────────────────────────
@@ -248,20 +250,17 @@ session:
   london_open_conf_penalty:  3    # extra confidence pts required 07:00-08:59 UTC
   newyork_conf_penalty:      4    # extra confidence pts required 16:00-20:59 UTC
 
-# ── Per-symbol minimum confidence thresholds [Phase 7] ───────────────────────
-# Applied on top of mode.min_confidence. The higher value wins.
-# Gold requires strictest gate: high ATR + extreme false-break frequency.
-# High-ATR FX pairs require slightly stricter gates than low-volatility pairs.
+# ── Per-symbol minimum confidence thresholds [Phase 8] ───────────────────────
+# Applied on top of mode.min_confidence. The stricter value wins.
+# Only the 5 active institutional symbols are listed.
+# Gold strictest: extreme ATR + frequent false breaks demand highest gate.
+# High-ATR FX pairs carry elevated noise — stricter threshold required.
 per_symbol:
-  XAUUSD:   65    # Gold — very strict; 65 minimum regardless of mode
-  GBPUSD:   63    # High-ATR GBP pair — stricter gate
-  GBPJPY:   63    # High-ATR cross — hardest to predict direction
-  USDJPY:   61    # Yen carry pair — sometimes correlated, slightly stricter
-  EURUSD:   61    # Deepest liquidity — still needs strong confirmation
-  AUDUSD:   60    # Commodity correlated — standard gate
-  USDCAD:   60    # Oil correlated — standard gate
-  NZDUSD:   60    # Lower volatility — standard gate
-  USDCHF:   60    # Safe-haven — standard gate
+  XAUUSD:   72    # Gold — strictest gate; extreme volatility and false breakouts
+  GBPJPY:   68    # Highest ATR cross — hardest directional predictability
+  GBPUSD:   68    # High-ATR GBP cable — wide spreads, London-dominated
+  USDJPY:   66    # Yen carry pair — risk-on/off driven; needs macro alignment
+  EURUSD:   66    # Deepest liquidity — still needs strong institutional signal
 
 # ── Trading mode gate presets ─────────────────────────────────
 # These override the individual strategy/risk/scoring values at runtime.
@@ -283,6 +282,34 @@ per_symbol:
 #   • Tier 1+2 only (tier3 blocked)
 
 modes:
+  normal:
+    # ── Institutional Normal: 5-symbol focused set (Phase 8) ─────────────────
+    # "Normal" sits between aggressive and conservative.
+    # Higher quality gate than aggressive; more adaptive than conservative.
+    # Confidence floor is 68 (forex) — well above retail noise level.
+    # Gold handled separately via per_symbol.XAUUSD=72.
+    # Tier 1 requires a genuinely strong institutional setup (score ≥72).
+    # Tier 2 allows solid but sub-elite setups (score ≥65) at half lot.
+    # Tier 3 blocked — only institutional quality executes.
+    min_confidence:       68     # base forex confidence floor (gold uses per_symbol=72)
+    min_atr_pips:         6.0    # minimum volatility — below this is a dead market
+    atr_optimal_max_pips: 30     # above 30 pips = news/spike territory — size-reduce
+    min_core_score:       42.0   # core must clear 42 before bonuses count
+    min_execution_tier:   2      # Tier 1+2 only; Tier 3 (0.25× lot) blocked
+    tier1:                72     # A+ setup: full institutional confluence required
+    tier2:                65     # B+ setup: solid but not elite; half lot
+    tier3:                52     # blocked by min_execution_tier=2 anyway
+    weights:
+      # Trend continuation + pullback focus (same as aggressive but with FX-biased balance).
+      # A trend+sweep+FVG setup scores ~86; trend+fib+ema scores ~68 (Tier 2 eligible).
+      # Strong BUY setups need sweep OR FVG confirmation — SELL slightly more lenient.
+      trend:        38   # primary driver — directional bias is the strongest edge
+      liquidity:    20   # sweep confirms institutional entry; secondary to trend
+      fvg:           8   # valid in London/NY; secondary to pullback structure
+      fibonacci:    18   # elevated — golden zone pullback is core entry signal
+      ema:          12   # elevated — EMA proximity is the continuation entry zone
+      confirmation:  4   # candle pattern confirms, doesn't lead
+
   aggressive:
     # ── Quality-Aggressive: small account survivability (R500/$30) ────────────
     # "Aggressive" = aggressive filtering, NOT aggressive entry frequency.
@@ -319,6 +346,23 @@ modes:
     tier2:               60     # [Phase 7] raised from 50
     tier3:               48     # blocked by min_execution_tier=2 anyway
     # weights: omitted → learning engine provides adaptive weights
+
+# ── Correlation / currency exposure protection (Phase 8) ─────────────────────
+# Prevents simultaneous trades that double-up on the same currency side.
+# Active when max_open_trades >= 2.  Rules:
+#   max_usd_longs  — max open positions that are net long USD
+#                    (USDJPY BUY, EURUSD SELL, GBPUSD SELL, XAUUSD SELL)
+#   max_usd_shorts — max open positions that are net short USD
+#                    (EURUSD BUY, GBPUSD BUY, USDJPY SELL, XAUUSD BUY)
+#   max_gbp_exposure — max concurrent GBP positions (GBPUSD + GBPJPY)
+#   max_jpy_exposure — max concurrent JPY positions (USDJPY + GBPJPY)
+# With max_open_trades=2, these rules allow exactly ONE trade per currency side.
+correlation:
+  enabled:           true
+  max_usd_longs:     1    # never stack two USD-long positions simultaneously
+  max_usd_shorts:    1    # never stack two USD-short positions simultaneously
+  max_gbp_exposure:  1    # never hold GBPUSD + GBPJPY at the same time
+  max_jpy_exposure:  1    # never hold USDJPY + GBPJPY at the same time
 
 # ── Spread control (Phase 5) ──────────────────────────────────────────────────
 # Early spread/ATR ratio check before running the full confluence pipeline.

@@ -146,6 +146,143 @@ def _derive_setup_type(fvg_present: bool, ob_present: bool, sweep_detected: bool
     return "Trend"
 
 
+def _currency_exposure(symbol: str, direction: str) -> dict:
+    """
+    Return the currency-side exposure flags for a symbol+direction.
+
+    Used by _check_currency_exposure() to detect correlated stacking.
+    Returns a dict with keys: usd_long, usd_short, gbp, jpy — each 0 or 1.
+
+    Logic for the 5-symbol institutional set:
+      XAUUSD  BUY  → USD short (gold rises when USD weakens)
+      XAUUSD  SELL → USD long
+      EURUSD  BUY  → USD short
+      EURUSD  SELL → USD long
+      GBPUSD  BUY  → GBP exposure + USD short
+      GBPUSD  SELL → GBP exposure + USD long
+      USDJPY  BUY  → USD long + JPY exposure
+      USDJPY  SELL → USD short + JPY exposure
+      GBPJPY  BUY  → GBP exposure + JPY exposure
+      GBPJPY  SELL → GBP exposure + JPY exposure
+    """
+    s = symbol.upper()
+    for sfx in (".Z", ".M", ".ECN", ".PRO", ".STP", ".RAW", ".STD"):
+        if s.endswith(sfx):
+            s = s[: -len(sfx)]
+            break
+
+    exp = {"usd_long": 0, "usd_short": 0, "gbp": 0, "jpy": 0}
+
+    if "XAU" in s or "GOLD" in s:
+        if direction == "BUY":
+            exp["usd_short"] = 1
+        else:
+            exp["usd_long"] = 1
+
+    elif s == "EURUSD":
+        if direction == "BUY":
+            exp["usd_short"] = 1
+        else:
+            exp["usd_long"] = 1
+
+    elif s == "GBPUSD":
+        exp["gbp"] = 1
+        if direction == "BUY":
+            exp["usd_short"] = 1
+        else:
+            exp["usd_long"] = 1
+
+    elif s == "USDJPY":
+        exp["jpy"] = 1
+        if direction == "BUY":
+            exp["usd_long"] = 1
+        else:
+            exp["usd_short"] = 1
+
+    elif s == "GBPJPY":
+        exp["gbp"] = 1
+        exp["jpy"] = 1
+
+    return exp
+
+
+def _check_currency_exposure(
+    symbol:         str,
+    direction:      str,
+    open_positions: list,
+    cfg,
+) -> bool:
+    """
+    Block trades that would create correlated currency overexposure.
+
+    Returns True (BLOCK) when adding this symbol+direction would:
+      - Exceed max_usd_longs  (two positions both net long USD)
+      - Exceed max_usd_shorts (two positions both net short USD)
+      - Exceed max_gbp_exposure (GBPUSD + GBPJPY simultaneously)
+      - Exceed max_jpy_exposure (USDJPY + GBPJPY simultaneously)
+
+    Config source: settings.yaml correlation: section.
+    Set correlation.enabled=false to disable all checks.
+    """
+    _corr_cfg  = getattr(cfg, "correlation", None)
+    _enabled   = bool(getattr(_corr_cfg, "enabled", True))
+    if not _enabled or not open_positions:
+        return False
+
+    _max_usd_l = int(getattr(_corr_cfg, "max_usd_longs",    1))
+    _max_usd_s = int(getattr(_corr_cfg, "max_usd_shorts",   1))
+    _max_gbp   = int(getattr(_corr_cfg, "max_gbp_exposure", 1))
+    _max_jpy   = int(getattr(_corr_cfg, "max_jpy_exposure", 1))
+
+    # Tally current exposure from all open positions
+    usd_l = usd_s = gbp = jpy = 0
+    for pos in open_positions:
+        _pos_dir = pos.get("type", "BUY")
+        _pos_sym = pos.get("symbol", "")
+        e = _currency_exposure(_pos_sym, _pos_dir)
+        usd_l += e["usd_long"]
+        usd_s += e["usd_short"]
+        gbp   += e["gbp"]
+        jpy   += e["jpy"]
+
+    # Check if adding the new trade would breach any limit
+    new = _currency_exposure(symbol, direction)
+
+    if new["usd_long"] and (usd_l + 1) > _max_usd_l:
+        log.warning(
+            "[CORRELATION BLOCK] %s %s — USD-long exposure would exceed max=%d "
+            "(current=%d) | [EXPOSURE BALANCED] [CORRELATED OVEREXPOSURE PREVENTED]",
+            symbol, direction, _max_usd_l, usd_l,
+        )
+        return True
+
+    if new["usd_short"] and (usd_s + 1) > _max_usd_s:
+        log.warning(
+            "[CORRELATION BLOCK] %s %s — USD-short exposure would exceed max=%d "
+            "(current=%d) | [EXPOSURE BALANCED] [CORRELATED OVEREXPOSURE PREVENTED]",
+            symbol, direction, _max_usd_s, usd_s,
+        )
+        return True
+
+    if new["gbp"] and (gbp + 1) > _max_gbp:
+        log.warning(
+            "[CORRELATION BLOCK] %s %s — GBP exposure would exceed max=%d "
+            "(current=%d) | [EXPOSURE BALANCED] [CORRELATED OVEREXPOSURE PREVENTED]",
+            symbol, direction, _max_gbp, gbp,
+        )
+        return True
+
+    if new["jpy"] and (jpy + 1) > _max_jpy:
+        log.warning(
+            "[CORRELATION BLOCK] %s %s — JPY exposure would exceed max=%d "
+            "(current=%d) | [EXPOSURE BALANCED] [CORRELATED OVEREXPOSURE PREVENTED]",
+            symbol, direction, _max_jpy, jpy,
+        )
+        return True
+
+    return False
+
+
 def _confidence_weakest(cs) -> str:
     """Return the 2 lowest-scoring confidence components as a formatted string."""
     parts = [
@@ -1101,7 +1238,9 @@ async def scan_symbol(
         "[RISK MODE] %s | mode=%s sl_reduction=%s"
         " | atr_floor=%.1f conf_min=%d tiers=%d/%d/%d tier_floor=%d",
         symbol, mode.name.upper(),
-        "ADAPTIVE" if mode.name == "aggressive" else "HARD_REJECT",
+        ("ADAPTIVE" if mode.name == "aggressive"
+         else "STRICT" if mode.name == "normal"
+         else "HARD_REJECT"),
         mode.min_atr_pips, mode.min_confidence,
         mode.tier1, mode.tier2, mode.tier3, mode.min_execution_tier,
     )
@@ -1243,8 +1382,8 @@ async def scan_symbol(
                     symbol, len(candles_h1), len(candles_m15))
         return None
 
-    log.debug(
-        "[MT5 DATA OK] %s | h4=%d h1=%d m15=%d m5=%d candles loaded",
+    log.warning(
+        "[MT5 DATA OK] [SYMBOL DATA OK] %s | h4=%d h1=%d m15=%d m5=%d candles loaded",
         symbol, len(candles_h4), len(candles_h1), len(candles_m15), len(candles_m5),
     )
 
@@ -1954,6 +2093,28 @@ async def scan_symbol(
 
     direction = decision.direction
 
+    # ── BUY confirmation gate (Phase 8) ──────────────────────────────────────
+    # BUY trades require at least one institutional signal: sweep, FVG, or OB.
+    # SELL trades skip this gate — live performance data shows SELL outperforms BUY.
+    # Rationale: Smart-money buying requires deeper confirmation than selling,
+    # as bearish order flow is more predictable in trending institutional markets.
+    if direction == "BUY" and mode.name in ("normal", "conservative"):
+        _buy_has_sweep = sweep_result.detected
+        _buy_has_fvg   = fvg_result.present and fvg_result.active_zone is not None
+        _buy_has_ob    = ob_result.present
+        if not (_buy_has_sweep or _buy_has_fvg or _buy_has_ob):
+            log.warning(
+                "[BUY CONFIRMATION REQUIRED] %s BUY — no institutional signal "
+                "(sweep=%s fvg=%s ob=%s) — BLOCKED | [SELL BIAS] [CONFIRMATION GATE]",
+                symbol,
+                "yes" if _buy_has_sweep else "no",
+                "yes" if _buy_has_fvg   else "no",
+                "yes" if _buy_has_ob    else "no",
+            )
+            _log_rejected(symbol, "BUY_NO_INSTITUTIONAL_CONFIRM",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
+
     # ── Core score gate ───────────────────────────────────────────────────────
     _min_core = mode.min_core_score
     if _min_core > 0 and confluence.core_score < _min_core:
@@ -2194,6 +2355,16 @@ async def scan_symbol(
         log.debug("%s %s: on cooldown (%.0f s remaining) after decision",
                   symbol, direction, cooldown.remaining(symbol, direction))
         return None
+
+    # ── Currency correlation / exposure protection (Phase 8) ─────────────────
+    # Prevents stacking two positions on the same side of USD, GBP, or JPY.
+    # Only runs in live mode; backtest uses single-symbol sequential evaluation.
+    if not feed._backtest:
+        _corr_open = bridge.get_open_positions()
+        if _check_currency_exposure(symbol, direction, _corr_open, cfg):
+            _log_rejected(symbol, "CORRELATION_BLOCKED",
+                          confidence=decision.confidence, atr=atr_pips)
+            return None
 
     # ── AI Pre-trade optimizer ────────────────────────────────────────────────
     opt = ai_optimize(
@@ -2743,6 +2914,21 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             )
 
     _hf_mode = bool(getattr(getattr(cfg, "testing", None), "high_frequency_mode", False))
+
+    # ── Active symbol log (Phase 8: startup validation) ─────────────────────
+    _mode_name = str(getattr(getattr(cfg, "trading", None), "trading_mode", "normal")).upper()
+    log.warning(
+        "[ACTIVE SYMBOLS] %d symbols loaded | mode=%s | %s",
+        len(symbols), _mode_name, ", ".join(symbols),
+    )
+    for _sym in symbols:
+        _sym_base = _sym.upper().replace(".Z", "").replace(".M", "").replace(".ECN", "")
+        _sym_gold = "XAU" in _sym_base or "GOLD" in _sym_base
+        _sym_note = "gold-no-suffix" if _sym_gold else f"broker={_sym}"
+        log.warning(
+            "[SYMBOL VALIDATED] %s | base=%s %s",
+            _sym, _sym_base, _sym_note,
+        )
 
     # ── Risk config verification (read-only log — no overrides) ─────────────────
     log.warning(
@@ -3891,7 +4077,9 @@ def main() -> None:
         _max_sl,
         getattr(cfg.risk, "max_lot_size", 0.05),
         _startup_mode.min_atr_pips,
-        "ADAPTIVE (aggressive)" if _startup_mode.name == "aggressive" else "HARD_REJECT (conservative)",
+        ("ADAPTIVE (aggressive)" if _startup_mode.name == "aggressive"
+         else "STRICT (normal)" if _startup_mode.name == "normal"
+         else "HARD_REJECT (conservative)"),
         _startup_mode.name.upper(),
         cfg.risk.min_rr,
         cfg.risk.max_daily_loss_pct,
