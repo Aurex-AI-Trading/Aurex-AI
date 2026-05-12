@@ -29,7 +29,7 @@ opened in a previous session will not be re-managed).
 """
 from __future__ import annotations
 
-from typing import Dict, Set
+from typing import Dict, List, Set
 
 from aurex_ai.core.logger import get_logger
 
@@ -39,16 +39,35 @@ log = get_logger("execution.trade_manager")
 _TF_M15 = 15
 
 
+def _ema_simple(values: List[float], period: int) -> List[float]:
+    """Compute EMA without importing strategy modules (avoids circular imports)."""
+    if len(values) < period:
+        return []
+    k   = 2.0 / (period + 1)
+    out = [sum(values[:period]) / period]
+    for v in values[period:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
 class TradeManager:
     """
     Stateful trade manager.  Instantiate once in run_live() and call
     manage() after every scan cycle.
+
+    Phase 5 additions:
+      - Runner momentum monitoring: detects EMA9 slope reversal and ATR exhaustion
+        on winning runners.  Switches to ultra-tight trail (0.30×) when decaying.
+      - [RUNNER ACTIVE] tag when trail fires normally.
+      - [MOMENTUM WEAKENING] / [TREND EXHAUSTION] / [SMART EXIT] when decay detected.
+      - [BREAKEVEN ACTIVE] / [PROFIT LOCKED] on first BE application.
     """
 
     def __init__(self) -> None:
         self._be_done:       Set[int]        = set()   # tickets where BE SL was applied
         self._partial_done:  Set[int]        = set()   # tickets where partial TP was executed
         self._original_risk: Dict[int, float] = {}     # original SL distance per ticket
+        self._momentum_weak: Set[int]        = set()   # tickets with weakening momentum
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -66,7 +85,10 @@ class TradeManager:
         trail_1r5_rr    = float(getattr(tm, "trail_1r5_rr",      1.5))
         trail_2r_rr     = float(getattr(tm, "trail_2r_rr",       2.0))
         trail_mult_1    = float(getattr(tm, "trail_atr_mult_1",  1.0))
-        trail_mult_2    = float(getattr(tm, "trail_atr_mult_2",  0.5))
+        trail_mult_2    = float(getattr(tm, "trail_atr_mult_2",  0.4))
+        # Phase 5: ultra-tight trail when momentum is decaying
+        momentum_trail  = float(getattr(tm, "momentum_decay_trail_mult", 0.30))
+        momentum_check  = bool(getattr(tm, "momentum_check_enabled",     True))
 
         if not be_enabled and not partial_enabled:
             return
@@ -106,12 +128,13 @@ class TradeManager:
                 continue
 
             profit_dist = (current - entry) if direction == "BUY" else (entry - current)
+            profit_r    = profit_dist / risk_dist if risk_dist > 0 else 0.0
 
             # ── +1R: partial TP + break-even ─────────────────────────────────
             if profit_dist >= risk_dist * be_rr:
                 log.debug(
-                    "[TRADE MGMT CHECK] %s ticket=%d profit=%.5f trigger=%.5f",
-                    symbol, ticket, profit_dist, risk_dist * be_rr,
+                    "[TRADE MGMT CHECK] %s ticket=%d profit_r=%.2fR trigger=%.1fR",
+                    symbol, ticket, profit_r, be_rr,
                 )
 
                 if partial_enabled and ticket not in self._partial_done:
@@ -124,6 +147,37 @@ class TradeManager:
             # Trailing requires BE to be active — SL must not still be below entry.
             if ticket in self._be_done and profit_dist >= risk_dist * trail_1r5_rr:
                 atr_mult = trail_mult_2 if profit_dist >= risk_dist * trail_2r_rr else trail_mult_1
+
+                # Phase 5: Runner momentum check — detect EMA slope reversal / ATR exhaustion.
+                # Switch to ultra-tight trail when momentum decays to lock in profits early.
+                if momentum_check:
+                    _weak, _weak_reason = self._check_runner_momentum(
+                        bridge, symbol, direction,
+                    )
+                    if _weak:
+                        atr_mult = momentum_trail  # 0.30× → ultra-tight trail
+                        if ticket not in self._momentum_weak:
+                            self._momentum_weak.add(ticket)
+                            log.warning(
+                                "[MOMENTUM WEAKENING] %s ticket=%d profit=%.2fR | %s "
+                                "→ trail=%.2f× [SMART EXIT] [REVERSAL RISK]",
+                                symbol, ticket, profit_r, _weak_reason, atr_mult,
+                            )
+                    else:
+                        if ticket in self._momentum_weak:
+                            self._momentum_weak.discard(ticket)
+                            log.info(
+                                "[RUNNER ACTIVE] %s ticket=%d profit=%.2fR | momentum "
+                                "recovering [CONTINUATION BIAS]",
+                                symbol, ticket, profit_r,
+                            )
+                        else:
+                            log.info(
+                                "[RUNNER ACTIVE] %s ticket=%d profit=%.2fR | "
+                                "momentum intact trail=%.2f× [PROFIT LOCKED]",
+                                symbol, ticket, profit_r, atr_mult,
+                            )
+
                 self._do_trail(bridge, pos, current, atr_mult)
 
     # ── Break-even ────────────────────────────────────────────────────────────
@@ -148,7 +202,8 @@ class TradeManager:
         if ok:
             self._be_done.add(ticket)
             log.warning(
-                "[TRAIL] BE activated | %s ticket=%d sl=%.5f → entry=%.5f",
+                "[BREAKEVEN ACTIVE] [PROFIT LOCKED] %s ticket=%d sl=%.5f → entry=%.5f "
+                "| risk eliminated [PARTIAL TP]",
                 symbol, ticket, sl, entry,
             )
         else:
@@ -260,6 +315,64 @@ class TradeManager:
         else:
             log.error("[PARTIAL TP FAILED] %s ticket=%d — will retry next cycle", symbol, ticket)
 
+    # ── Runner momentum detection (Phase 5) ───────────────────────────────────
+
+    def _check_runner_momentum(
+        self,
+        bridge:    object,
+        symbol:    str,
+        direction: str,
+    ) -> tuple[bool, str]:
+        """
+        Detect momentum decay in a running winner.
+
+        Algorithm:
+          1. EMA9 slope: compute EMA9 over last 12 M15 closes. If the 3-bar slope
+             is flattening or reversing against the trade direction → weakening.
+          2. ATR compression: if average range of last 3 bars is < 55% of the
+             average range 5-8 bars ago → momentum exhausting.
+
+        Returns:
+          (is_weakening: bool, reason: str)
+        """
+        try:
+            raw = bridge.get_candles_raw(symbol, _TF_M15, 14)
+        except Exception as exc:
+            log.debug("[MOMENTUM] %s candle fetch error: %s", symbol, exc)
+            return False, "data_error"
+
+        if len(raw) < 10:
+            return False, "insufficient_data"
+
+        closes = [c["close"] for c in raw]
+        highs  = [c["high"]  for c in raw]
+        lows   = [c["low"]   for c in raw]
+
+        # EMA9 slope check — 3-bar slope of the EMA9 line
+        ema9 = _ema_simple(closes, 9)
+        if len(ema9) < 4:
+            return False, "ema_insufficient"
+
+        slope = ema9[-1] - ema9[-3]   # 2-bar slope of EMA9
+
+        if direction == "BUY"  and slope < 0.0:
+            return True, f"ema9_declining slope={slope:.6f} [TREND EXHAUSTION]"
+        if direction == "SELL" and slope > 0.0:
+            return True, f"ema9_rising slope={slope:.6f} [TREND EXHAUSTION]"
+
+        # ATR compression check — recent bars much smaller than prior bars
+        n = len(raw)
+        recent_range = sum(highs[i] - lows[i] for i in range(n - 3, n)) / 3
+        prior_range  = sum(highs[i] - lows[i] for i in range(n - 8, n - 5)) / 3
+
+        if prior_range > 0 and recent_range < prior_range * 0.50:
+            return True, (
+                f"atr_compressing recent={recent_range:.5f} prior={prior_range:.5f} "
+                f"[TREND EXHAUSTION]"
+            )
+
+        return False, "momentum_intact"
+
     # ── Housekeeping ──────────────────────────────────────────────────────────
 
     def was_breakeven(self, ticket: int) -> bool:
@@ -272,7 +385,8 @@ class TradeManager:
 
     def clear_closed(self, open_tickets: Set[int]) -> None:
         """Discard tracking state for tickets that are no longer open."""
-        self._be_done      &= open_tickets
-        self._partial_done &= open_tickets
-        self._original_risk = {t: v for t, v in self._original_risk.items()
-                               if t in open_tickets}
+        self._be_done        &= open_tickets
+        self._partial_done   &= open_tickets
+        self._momentum_weak  &= open_tickets
+        self._original_risk   = {t: v for t, v in self._original_risk.items()
+                                 if t in open_tickets}

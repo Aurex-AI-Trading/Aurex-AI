@@ -99,7 +99,17 @@ strategy:
 
   # ATR-based SL/TP multipliers (used by risk_manager.calculate)
   sl_atr_mult: 1.5    # SL = entry ± ATR(14) × this (1.5 ATR covers ~95% of normal moves)
-  tp_atr_mult: 0.0    # 0 = use fixed 3.0× (2.0R target). Override with positive value.
+  tp_atr_mult: 0.0    # 0 = use dynamic RR (Phase 5). Set >0 to override with fixed multiplier.
+
+  # Phase 5: Dynamic RR targeting — realistic TP for better hit frequency
+  # Standard setups: 1.5R TP.  Tier1+TRENDING+conf≥65: 2.0R max.
+  # Exceeding 2.0R is not allowed — wider TP dramatically reduces hit probability.
+  tp_rr_standard:    1.5   # RR target for Tier 2 and general Tier 1 setups
+  tp_rr_high_conf:   2.0   # RR target for confirmed Tier 1 + TRENDING + conf≥65
+
+  # Phase 5: Entry timing — candle exhaustion and EMA overextension detection
+  max_ema21_ext_atr:       2.5    # flag overextension if price > 2.5 ATR from EMA21
+  candle_exhaust_wick_min: 0.65   # wick-to-range ratio indicating exhaustion candle
 
   # Signal strength gate (fallback pipeline only)
   strength_threshold:    0.60  # minimum signal strength; raised by AI optimizer on losses
@@ -194,6 +204,10 @@ trade_management:
   trail_2r_rr:        2.0     # tighten trail at +2R   (ATR × trail_atr_mult_2)
   trail_atr_mult_1:   1.0     # first trail stage multiplier
   trail_atr_mult_2:   0.4     # tighter trail at 2R — lock in more profit; was 0.5
+  # Phase 5: Runner momentum decay protection
+  momentum_decay_trail_mult: 0.30   # ultra-tight trail when EMA slope reverses
+  momentum_ema_period:       9      # M15 EMA period for slope detection
+  momentum_check_enabled:    true   # enable momentum decay monitoring for runners
 
 # ── Account Guard (Phase 1: Risk Stabilization) ───────────────
 guard:
@@ -218,6 +232,9 @@ session:
   block_overlap:        true   # block all new entries 13:00–15:59 UTC
   overlap_start_hour:   13     # inclusive
   overlap_end_hour:     16     # exclusive (16:00 = first allowed NY pure hour)
+  # Phase 5: Session quality multipliers
+  london_quality:       1.00   # full participation 07-13 UTC (highest institutional flow)
+  newyork_quality:      0.90   # slight reduction 16-21 UTC (post-overlap lower liquidity)
 
 # ── Trading mode gate presets ─────────────────────────────────
 # These override the individual strategy/risk/scoring values at runtime.
@@ -274,4 +291,24 @@ modes:
     tier2:               50
     tier3:               35
     # weights: omitted → learning engine provides adaptive weights
+
+# ── Spread control (Phase 5) ──────────────────────────────────────────────────
+# Early spread/ATR ratio check before running the full confluence pipeline.
+# Prevents entries during rollover, news, or symbol-specific spread spikes.
+# A supplementary check — the existing post-risk spread filter still runs.
+spread:
+  max_ratio:    0.20    # spread/ATR > this → size reduced to 60-80%
+  block_ratio:  0.35    # spread/ATR > this → execution blocked entirely
+
+# ── News protection (Phase 5) ─────────────────────────────────────────────────
+# Lightweight protection against high-impact economic releases.
+# No external API required — uses deterministic UTC time patterns.
+news:
+  avoid_nfp:         true    # block NFP window (1st Friday, 13:30 UTC ±window)
+  nfp_window_pre:    15      # minutes before NFP release to start protection
+  nfp_window_post:   30      # minutes after NFP release before resuming
+  avoid_fomc:        true    # reduce size Wednesday 17:45–20:00 UTC (FOMC risk)
+  fomc_size_mult:    0.50    # lot multiplier during FOMC risk window
+  avoid_rollover:    false   # rollover is outside session gate — redundant but available
+  news_size_mult:    0.50    # generic fallback size reduction during news events
 

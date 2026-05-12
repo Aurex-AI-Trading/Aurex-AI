@@ -52,39 +52,61 @@ def _session_for_hour(hour: int) -> str:
 @dataclass
 class PerformanceReport:
     """Snapshot of system performance computed from trade history."""
-    total_closed:      int          = 0
-    total_open:        int          = 0
-    win_rate:          float        = 0.0     # 0.0 – 1.0
-    avg_rr:            float        = 0.0
-    profit_factor:     float        = 0.0     # > 1.0 = profitable
-    max_drawdown_pct:  float        = 0.0     # negative value
-    total_pnl_zar:     float        = 0.0
-    trades_per_day:    float        = 0.0
-    best_session:      str          = ""
-    worst_session:     str          = ""
-    best_direction:    str          = ""
-    best_setup:        str          = ""
+    total_closed:       int          = 0
+    total_open:         int          = 0
+    win_rate:           float        = 0.0     # 0.0 – 1.0
+    avg_rr:             float        = 0.0
+    profit_factor:      float        = 0.0     # > 1.0 = profitable
+    max_drawdown_pct:   float        = 0.0     # negative value
+    total_pnl_zar:      float        = 0.0
+    trades_per_day:     float        = 0.0
+    best_session:       str          = ""
+    worst_session:      str          = ""
+    best_direction:     str          = ""
+    best_setup:         str          = ""
+    # Phase 5: enhanced analytics
+    avg_duration_min:   float        = 0.0     # average trade duration in minutes
+    tp_hit_rate:        float        = 0.0     # profitable closes / total closed
+    session_pnl:        Dict[str, float] = field(default_factory=dict)  # P&L by session
+    symbol_win_rates:   Dict[str, float] = field(default_factory=dict)  # WR per symbol
+    symbol_pnl:         Dict[str, float] = field(default_factory=dict)  # PnL per symbol
     # component_deltas: factor -> (win_avg_score - loss_avg_score)
     # Positive = this factor scores higher in winning trades
-    component_deltas:  Dict[str, float] = field(default_factory=dict)
+    component_deltas:   Dict[str, float] = field(default_factory=dict)
     # per-session win rate for logging
-    session_win_rates: Dict[str, float] = field(default_factory=dict)
+    session_win_rates:  Dict[str, float] = field(default_factory=dict)
 
     def to_log_str(self) -> str:
         lines = [
-            f"[PERFORMANCE] trades={self.total_closed} wr={self.win_rate:.1%} "
+            f"[PERFORMANCE ANALYTICS] trades={self.total_closed} "
+            f"wr={self.win_rate:.1%} tp_hit={self.tp_hit_rate:.1%} "
             f"avg_win_rr={self.avg_rr:.2f} pf={self.profit_factor:.2f} "
-            f"pnl={self.total_pnl_zar:.2f} dd={self.max_drawdown_pct:.1f}%",
-            f"             best_session={self.best_session or 'n/a'} "
+            f"pnl={self.total_pnl_zar:.2f} dd={self.max_drawdown_pct:.1f}% "
+            f"avg_dur={self.avg_duration_min:.0f}min",
+            f"  [STRATEGY METRICS] best_session={self.best_session or 'n/a'} "
+            f"worst={self.worst_session or 'n/a'} "
             f"best_dir={self.best_direction or 'n/a'} "
             f"best_setup={self.best_setup or 'n/a'}",
         ]
+        if self.session_pnl:
+            pnl_str = "  ".join(f"{s}={v:+.1f}" for s, v in self.session_pnl.items())
+            wr_str  = "  ".join(
+                f"{s}={v:.1%}" for s, v in self.session_win_rates.items()
+            )
+            lines.append(f"  [SESSION PERFORMANCE] pnl: {pnl_str}")
+            lines.append(f"  [SESSION PERFORMANCE] wr:  {wr_str}")
+        if self.symbol_pnl:
+            sym_str = "  ".join(
+                f"{s}={v:+.1f}({self.symbol_win_rates.get(s, 0):.0%})"
+                for s, v in self.symbol_pnl.items()
+            )
+            lines.append(f"  [STRATEGY METRICS] symbols: {sym_str}")
         if self.component_deltas:
-            top3 = sorted(self.component_deltas.items(), key=lambda x: x[1], reverse=True)[:3]
+            top3  = sorted(self.component_deltas.items(), key=lambda x: x[1], reverse=True)[:3]
             worst = sorted(self.component_deltas.items(), key=lambda x: x[1])[:1]
             lines.append(
-                f"             top_factors={[k for k,_ in top3]} "
-                f"weakest={[k for k,_ in worst]}"
+                f"  [STRATEGY METRICS] top_factors={[k for k, _ in top3]} "
+                f"weakest={[k for k, _ in worst]}"
             )
         return "\n".join(lines)
 
@@ -224,6 +246,46 @@ class PerformanceEngine:
         }
         if setup_wr:
             report.best_setup = max(setup_wr, key=setup_wr.get)  # type: ignore[arg-type]
+
+        # ── Phase 5: Average trade duration ──────────────────────────────────
+        durations = [
+            t.get("duration_minutes", 0)
+            for t in all_closed
+            if t.get("duration_minutes", 0) > 0
+        ]
+        report.avg_duration_min = round(sum(durations) / len(durations), 1) if durations else 0.0
+
+        # ── Phase 5: TP hit rate (profitable closes ÷ total closed) ──────────
+        # Uses profit_zar > 0 as the proxy for "TP hit or runner win".
+        # Breakeven trades (profit_zar ≈ 0) are counted as neutral, not TP.
+        tp_hits = sum(1 for t in all_closed if t.get("profit_zar", 0.0) > 0.5)
+        report.tp_hit_rate = round(tp_hits / len(all_closed), 3) if all_closed else 0.0
+
+        # ── Phase 5: Session P&L breakdown ───────────────────────────────────
+        session_pnl: Dict[str, float] = {}
+        for t in all_closed:
+            s   = _session_for_hour(t.get("utc_hour", 12))
+            pnl = t.get("profit_zar", 0.0)
+            session_pnl[s] = round(session_pnl.get(s, 0.0) + pnl, 2)
+        report.session_pnl = session_pnl
+
+        # ── Phase 5: Per-symbol win rate and P&L ─────────────────────────────
+        sym_wins:  Dict[str, int]   = {}
+        sym_total: Dict[str, int]   = {}
+        sym_pnl:   Dict[str, float] = {}
+        for t in all_closed:
+            s   = t.get("symbol", "")
+            if not s:
+                continue
+            sym_total[s] = sym_total.get(s, 0) + 1
+            sym_pnl[s]   = round(sym_pnl.get(s, 0.0) + t.get("profit_zar", 0.0), 2)
+            if t.get("result") == "WIN":
+                sym_wins[s] = sym_wins.get(s, 0) + 1
+        report.symbol_win_rates = {
+            s: round(sym_wins.get(s, 0) / n, 3)
+            for s, n in sym_total.items() if n >= 3
+        }
+        report.symbol_pnl = sym_pnl
 
         # ── Component score deltas (win vs loss) ──────────────────────────────
         # Positive delta = factor reliably predicts wins.

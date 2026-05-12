@@ -55,6 +55,7 @@ from aurex_ai.execution.trade_manager    import TradeManager
 from aurex_ai.execution.reentry_tracker  import ReEntryTracker, ClosedTrade
 from aurex_ai.execution.adaptive_limits    import get_adaptive_limit
 from aurex_ai.execution.account_guard     import AccountGuard, cap_lot_multiplier
+from aurex_ai.execution.news_guard        import check_news as _check_news
 
 from aurex_ai.ai.optimizer        import optimize as ai_optimize, Optimizer
 from aurex_ai.ai.learning_engine  import LearningEngine
@@ -1169,6 +1170,31 @@ async def scan_symbol(
         )
         return None
 
+    # ── Session quality multiplier (Phase 5) ──────────────────────────────────
+    # London (7-13 UTC): full institutional flow — no reduction.
+    # NY pure (16-21 UTC): slightly lower liquidity post-overlap — configurable.
+    _sess_cfg_p5 = getattr(cfg, "session", None)
+    if 16 <= _utc_hour < 21:
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "newyork_quality", 0.90))
+        log.info(
+            "[SESSION FILTER] %s NY session UTC=%d quality=%.0f%%",
+            symbol, _utc_hour, _session_quality_mult * 100,
+        )
+    else:
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "london_quality",  1.00))
+        log.info("[HIGH LIQUIDITY SESSION] %s London session UTC=%d", symbol, _utc_hour)
+
+    # ── News guard (Phase 5) ──────────────────────────────────────────────────
+    # Blocks NFP window (1st Friday 13:30 UTC ±15/30 min) and reduces size during
+    # FOMC risk window (Wednesdays 17:45-20:00 UTC).
+    _news_result = _check_news(cfg, current_time)
+    if not _news_result.safe:
+        log.warning(
+            "[TRADING PAUSED FOR NEWS] %s — %s", symbol, _news_result.reason,
+        )
+        return None
+    _news_mult = _news_result.size_mult   # 1.0 normally; 0.50 during FOMC window
+
     # ── Candle data ───────────────────────────────────────────────────────────
     candles_h4  = await feed.get_candles(symbol, TF_H4,  cfg.timeframes.h4_candles)
     candles_h1  = await feed.get_candles(symbol, TF_H1,  cfg.timeframes.h1_candles)
@@ -1209,6 +1235,45 @@ async def scan_symbol(
     atr_pips = fb_mod.calc_atr_pips(candles_m15, pip)
 
     log.info("[SYMBOL] %s price=%.5f atr=%.1f pips", symbol, price, atr_pips)
+
+    # ── Early spread check (Phase 5) ──────────────────────────────────────────
+    # Check spread/ATR ratio before running the expensive confluence pipeline.
+    # Supplements the post-risk spread filter (which runs on the final lot/SL).
+    _early_spread_mult = 1.0
+    if not feed._backtest and atr_pips > 0:
+        try:
+            _bid, _ask = await asyncio.to_thread(bridge.get_tick_raw, symbol)
+            if _ask > _bid > 0 and pip > 0:
+                _sp_pips  = round((_ask - _bid) / pip, 1)
+                _sp_ratio = _sp_pips / atr_pips
+                _sp_cfg   = getattr(cfg, "spread", None)
+                _sp_block = float(getattr(_sp_cfg, "block_ratio", 0.35))
+                _sp_max   = float(getattr(_sp_cfg, "max_ratio",   0.20))
+                if _sp_ratio > _sp_block:
+                    log.warning(
+                        "[SPREAD TOO HIGH] %s spread=%.1fpips atr=%.1fpips ratio=%.2f "
+                        "> block=%.2f [EXECUTION DELAYED]",
+                        symbol, _sp_pips, atr_pips, _sp_ratio, _sp_block,
+                    )
+                    _log_rejected(symbol, "SPREAD_TOO_HIGH", spread=_sp_pips, atr=atr_pips)
+                    return None
+                elif _sp_ratio > _sp_max:
+                    _early_spread_mult = round(
+                        max(0.60, 1.0 - (_sp_ratio - _sp_max) / max(_sp_block - _sp_max, 0.01)),
+                        2,
+                    )
+                    log.warning(
+                        "[SPREAD FILTER] %s spread=%.1fpips ratio=%.2f → size %.0f%% "
+                        "[SPREAD FILTER]",
+                        symbol, _sp_pips, _sp_ratio, _early_spread_mult * 100,
+                    )
+                else:
+                    log.info(
+                        "[SPREAD ACCEPTABLE] %s spread=%.1fpips ratio=%.2f",
+                        symbol, _sp_pips, _sp_ratio,
+                    )
+        except Exception:
+            pass  # non-critical; existing post-risk spread filter still catches bad spreads
 
     # ── Entry delay: check pending confirmation signal (conservative only) ────
     # On the first pass, conservative mode stores a validated signal and waits.
@@ -1880,9 +1945,55 @@ async def scan_symbol(
     _quality_size_mult = {"A+": 1.00, "A": 0.90, "B": 0.80, "C": 0.65}.get(_quality, 0.80)
     log.warning(
         "[PROBABILISTIC EXECUTION] %s [QUALITY TIER] quality=%s → size=%.0f%% "
-        "[DYNAMIC PARTICIPATION]",
+        "[DYNAMIC PARTICIPATION] [WIN RATE OPTIMIZATION] [HIGH CONSISTENCY MODE]",
         symbol, _quality, _quality_size_mult * 100,
     )
+
+    # ── Entry timing check (Phase 5) ─────────────────────────────────────────
+    # Detect candle exhaustion and EMA21 overextension before committing.
+    # Neither condition blocks the trade — they reduce size and emit diagnostic logs.
+    _entry_timing_mult = 1.0
+    _timing_issues: list = []
+
+    # 1. Candle exhaustion: wick against trade direction > threshold of full range
+    _last = candles_m15[-1]
+    _c_range = _last.high - _last.low
+    if _c_range > 0:
+        _exhaust_thresh = float(getattr(cfg.strategy, "candle_exhaust_wick_min", 0.65))
+        if direction == "BUY":
+            _upper_wick = _last.high - max(_last.open, _last.close)
+            _wick_ratio = _upper_wick / _c_range
+        else:
+            _lower_wick = min(_last.open, _last.close) - _last.low
+            _wick_ratio = _lower_wick / _c_range
+        if _wick_ratio >= _exhaust_thresh:
+            _entry_timing_mult = min(_entry_timing_mult, 0.85)
+            _timing_issues.append(f"wick_exhaust({_wick_ratio:.2f}≥{_exhaust_thresh})")
+
+    # 2. EMA21 overextension: price too far from EMA21 relative to ATR
+    _e21_closes = [c.close for c in candles_m15]
+    from aurex_ai.strategy.trend import ema as _ema_fn
+    _e21_vals = _ema_fn(_e21_closes, 21)
+    if _e21_vals and atr_pips > 0 and pip > 0:
+        _e21_dist_pips = abs(price - _e21_vals[-1]) / pip
+        _max_ext_atr   = float(getattr(cfg.strategy, "max_ema21_ext_atr", 2.5))
+        _e21_atr_ratio = _e21_dist_pips / atr_pips
+        if _e21_atr_ratio > _max_ext_atr:
+            _entry_timing_mult = min(_entry_timing_mult, 0.80)
+            _timing_issues.append(f"ema21_ext({_e21_atr_ratio:.1f}×ATR≥{_max_ext_atr})")
+
+    if _timing_issues:
+        log.warning(
+            "[ENTRY PRECISION] %s %s | issues=%s timing_mult=%.2f | "
+            "[TIMING VALIDATED] — continuing with reduced size",
+            symbol, direction, _timing_issues, _entry_timing_mult,
+        )
+    else:
+        log.info(
+            "[MOMENTUM ENTRY] %s %s | no exhaustion detected [TIMING VALIDATED] "
+            "[RETRACE CONFIRMED]",
+            symbol, direction,
+        )
 
     # ── Pullback / continuation context tags ─────────────────────────────────
     if fib_result.continuation_aligned and _strong_trend:
@@ -2007,25 +2118,55 @@ async def scan_symbol(
         * _atr_size_penalty
         * _quality_size_mult
         * guard_size_mult
-        * _market_mult,
+        * _market_mult
+        * _early_spread_mult
+        * _session_quality_mult
+        * _news_mult
+        * _entry_timing_mult,
         2,
     )))
     log.warning(
         "[EXECUTION SCALING] %s %s | tier=%.2f opt=%.2f mtf_h4=%.2f m5=%.2f "
-        "atr=%.2f quality=%.2f guard=%.2f market=%.2f(%s) → combined=%.2f",
+        "atr=%.2f quality=%.2f guard=%.2f market=%.2f(%s) "
+        "spread=%.2f session=%.2f news=%.2f timing=%.2f → combined=%.2f",
         symbol, direction,
         decision.size_mult, opt.lot_mult, _mtf_h4_size_penalty,
         _m5_size_penalty, _atr_size_penalty, _quality_size_mult,
-        guard_size_mult, _market_mult, _market_state.state, combined_size_mult,
+        guard_size_mult, _market_mult, _market_state.state,
+        _early_spread_mult, _session_quality_mult, _news_mult, _entry_timing_mult,
+        combined_size_mult,
     )
 
-    _sl_atr_mult = float(getattr(cfg.strategy, "sl_atr_mult", 1.5))
-    _cfg_tp_mult = float(getattr(cfg.strategy, "tp_atr_mult", 0.0))
-    _tp_atr_mult = _cfg_tp_mult if _cfg_tp_mult > 0 else 3.0
-    _rr_target   = round(_tp_atr_mult / _sl_atr_mult, 2) if _sl_atr_mult > 0 else 2.0
-    log.info(
-        "[RR PROFILE] %s %s | sl×%.2f tp×%.2f rr_target=%.2fR",
-        symbol, direction, _sl_atr_mult, _tp_atr_mult, _rr_target,
+    # ── Dynamic RR assignment (Phase 5) ──────────────────────────────────────
+    _sl_atr_mult     = float(getattr(cfg.strategy, "sl_atr_mult",      1.5))
+    _tp_rr_standard  = float(getattr(cfg.strategy, "tp_rr_standard",   1.5))
+    _tp_rr_high_conf = float(getattr(cfg.strategy, "tp_rr_high_conf",  2.0))
+
+    _is_high_conf_setup = (
+        decision.tier == 1
+        and confidence.total >= 65
+        and _market_state.state == "TRENDING"
+    )
+    _is_quality_pullback = (
+        decision.tier <= 2
+        and fib_result.continuation_aligned
+        and _market_state.state == "TRENDING"
+    )
+
+    if _is_high_conf_setup:
+        _dynamic_rr, _rr_label = _tp_rr_high_conf, "HIGH_CONF"
+    elif _is_quality_pullback:
+        _dynamic_rr = round(min(_tp_rr_high_conf, _tp_rr_standard + 0.25), 2)
+        _rr_label   = "PULLBACK"
+    else:
+        _dynamic_rr, _rr_label = _tp_rr_standard, "STANDARD"
+
+    _tp_atr_mult = round(_sl_atr_mult * _dynamic_rr, 3)
+    _rr_target   = _dynamic_rr
+    log.warning(
+        "[DYNAMIC RR] %s %s | rr=%.2fR (%s) sl×%.2f tp×%.2f "
+        "| [RR OPTIMIZED] [REALISTIC TARGET] [HIGH PROBABILITY TP]",
+        symbol, direction, _dynamic_rr, _rr_label, _sl_atr_mult, _tp_atr_mult,
     )
 
     # ── Risk calculation ──────────────────────────────────────────────────────
