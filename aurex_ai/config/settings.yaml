@@ -363,6 +363,22 @@ correlation:
   max_gbp_exposure:  2    # allow 2 concurrent GBP positions (if re-enabled)
   max_jpy_exposure:  2    # allow 2 concurrent JPY positions (if re-enabled)
 
+# ── Manual Override API (Phase 9) ────────────────────────────────────────────
+# Embedded FastAPI server for live trade control (close, partial, breakeven, pause).
+# Runs in a background daemon thread — failure never crashes the trading engine.
+#
+# Port resolution order: settings.yaml → env vars (API_HOST/API_PORT) → defaults.
+# Default port is 8001 to avoid conflict with the SaaS backend (port 8000).
+# auto_port=true auto-increments to the next free port if 8001 is also busy.
+#
+# Set enabled: false to disable the API entirely (recommended for pure VPS deployments
+# where you do not need manual overrides).
+api:
+  enabled:    true       # false = API will not start; trading unaffected
+  host:       "0.0.0.0"  # bind to all interfaces; use "127.0.0.1" for localhost-only
+  port:       8001        # changed from 8000; SaaS backend occupies 8000
+  auto_port:  true        # auto-increment if port is busy (prevents WinError 10048)
+
 # ── Spread control (Phase 5) ──────────────────────────────────────────────────
 # Early spread/ATR ratio check before running the full confluence pipeline.
 # Prevents entries during rollover, news, or symbol-specific spread spikes.

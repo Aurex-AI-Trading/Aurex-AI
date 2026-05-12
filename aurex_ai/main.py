@@ -76,11 +76,16 @@ from aurex_ai.analytics.trade_logger import TradeLogger
 from aurex_ai.analytics.performance  import PerformanceEngine
 
 try:
-    from aurex_ai.api.server import start_server as _api_start, is_paused as _api_is_paused
+    from aurex_ai.api.server import (
+        start_server as _api_start,
+        stop_server  as _api_stop,
+        is_paused    as _api_is_paused,
+    )
     _API_AVAILABLE = True
 except ImportError:
-    def _api_start(_b, **_kw): pass          # type: ignore[misc]
-    def _api_is_paused() -> bool: return False  # type: ignore[misc]
+    def _api_start(_b, **_kw): pass              # type: ignore[misc]
+    def _api_stop(): pass                         # type: ignore[misc]
+    def _api_is_paused() -> bool: return False    # type: ignore[misc]
     _API_AVAILABLE = False
 
 try:
@@ -2978,7 +2983,12 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
 
     # ── Manual override API ───────────────────────────────────────────────────
     if _API_AVAILABLE and not bridge.dry_run:
-        _api_start(bridge)
+        try:
+            _api_start(bridge, cfg=cfg)
+        except Exception:
+            log.exception(
+                "[API SERVER] Startup exception — trading continues normally."
+            )
 
     scan_num    = 0
     idle_cycles = 0
@@ -3236,6 +3246,13 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         try:
             sync.on_shutdown()
             sync.close()
+        except Exception:
+            pass
+
+    # ── API server graceful shutdown (releases port before process exits) ─────
+    if _API_AVAILABLE:
+        try:
+            _api_stop()
         except Exception:
             pass
 
