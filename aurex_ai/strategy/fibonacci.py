@@ -36,15 +36,17 @@ log = get_logger("strategy.fibonacci")
 
 @dataclass
 class FibResult:
-    impulse_high:  float
-    impulse_low:   float
-    impulse_dir:   str                # "bullish" | "bearish" | "none"
-    levels:        Dict[float, float] # ratio -> retracement price
-    golden_zone:   Tuple[float, float]# (lower_price, upper_price)
-    price_in_zone: bool
-    score:         float              # 0–15
-    nearest_ratio: float              # closest Fibonacci ratio to current price
-    reason:        str
+    impulse_high:        float
+    impulse_low:         float
+    impulse_dir:         str                # "bullish" | "bearish" | "none"
+    levels:              Dict[float, float] # ratio -> retracement price
+    golden_zone:         Tuple[float, float]# (lower_price, upper_price)
+    price_in_zone:       bool
+    score:               float              # 0–15
+    nearest_ratio:       float              # closest Fibonacci ratio to current price
+    reason:              str
+    retrace_depth:       str               # "SHALLOW"|"MODERATE"|"DEEP"|"EXHAUSTED"|"NONE"
+    continuation_aligned: bool             # True when depth is ideal for trend continuation
 
 
 # ── Impulse detection ─────────────────────────────────────────────────────────
@@ -88,6 +90,29 @@ def _compute_levels(start: float, end: float, ratios: List[float]) -> Dict[float
     """
     move = end - start
     return {r: round(end - r * move, 5) for r in ratios}
+
+
+# ── Retracement depth classification ─────────────────────────────────────────
+
+def _retrace_depth(ratio: float) -> str:
+    """
+    Classify how deeply price has retraced into the impulse move.
+
+    < 0.382   SHALLOW   — too early; pullback may not be exhausted.
+    0.382–0.705 MODERATE — golden zone; ideal continuation entry.
+    0.705–0.786 DEEP     — extended retracement; reduced probability.
+    > 0.786   EXHAUSTED — likely reversal, not continuation.
+    0.0       NONE      — no impulse detected.
+    """
+    if ratio == 0.0:
+        return "NONE"
+    if ratio < 0.382:
+        return "SHALLOW"
+    if ratio <= 0.705:
+        return "MODERATE"
+    if ratio <= 0.786:
+        return "DEEP"
+    return "EXHAUSTED"
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -160,7 +185,7 @@ def analyze(
         impulse_high=0.0, impulse_low=0.0, impulse_dir="none",
         levels={}, golden_zone=(0.0, 0.0),
         price_in_zone=False, score=0.0, nearest_ratio=0.0,
-        reason="no_impulse",
+        reason="no_impulse", retrace_depth="NONE", continuation_aligned=False,
     )
 
     if len(candles) < lookback:
@@ -183,22 +208,40 @@ def analyze(
     imp_high       = max(start, end)
     imp_low        = min(start, end)
 
+    retrace_depth       = _retrace_depth(nearest)
+    continuation_aligned = retrace_depth == "MODERATE"
+
     reason = (
         f"impulse_{direction} [{imp_low:.5f}->{imp_high:.5f}] "
         f"golden=[{gz_low:.5f}–{gz_high:.5f}] "
-        f"in_zone={in_zone} nearest={nearest:.3f} score={score:.1f}"
+        f"in_zone={in_zone} nearest={nearest:.3f} depth={retrace_depth} score={score:.1f}"
     )
 
-    log.debug("fib: %s", reason)
+    if score > 0:
+        if continuation_aligned:
+            log.warning(
+                "[FIB CONFLUENCE] %s [RETRACE DEPTH:%s] [FIB CONTINUATION] "
+                "ratio=%.3f in_zone=%s score=%.1f [CONTINUATION BIAS]",
+                symbol, retrace_depth, nearest, in_zone, score,
+            )
+        else:
+            log.info(
+                "[FIB CONFLUENCE] %s [RETRACE DEPTH:%s] ratio=%.3f score=%.1f",
+                symbol, retrace_depth, nearest, score,
+            )
+    else:
+        log.debug("fib: %s", reason)
 
     return FibResult(
-        impulse_high  = round(imp_high,  5),
-        impulse_low   = round(imp_low,   5),
-        impulse_dir   = direction,
-        levels        = levels,
-        golden_zone   = (round(gz_low, 5), round(gz_high, 5)),
-        price_in_zone = in_zone,
-        score         = score,
-        nearest_ratio = nearest,
-        reason        = reason,
+        impulse_high         = round(imp_high,  5),
+        impulse_low          = round(imp_low,   5),
+        impulse_dir          = direction,
+        levels               = levels,
+        golden_zone          = (round(gz_low, 5), round(gz_high, 5)),
+        price_in_zone        = in_zone,
+        score                = score,
+        nearest_ratio        = nearest,
+        reason               = reason,
+        retrace_depth        = retrace_depth,
+        continuation_aligned = continuation_aligned,
     )

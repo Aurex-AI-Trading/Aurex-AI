@@ -41,6 +41,7 @@ from aurex_ai.strategy import order_blocks as ob_mod
 from aurex_ai.strategy import breakout     as bo_mod
 from aurex_ai.strategy import fallback     as fb_mod
 from aurex_ai.strategy import structure    as structure_mod
+from aurex_ai.strategy import market_state as ms_mod
 
 from aurex_ai.execution.scoring_model    import compute_ema_score, compute_confirmation_score
 from aurex_ai.execution.decision_engine  import decide, Decision
@@ -1466,6 +1467,17 @@ async def scan_symbol(
                 )
             return None
 
+    # ── Market condition classification ──────────────────────────────────────
+    _market_state = ms_mod.classify(
+        candles_m15     = candles_m15,
+        atr_pips        = atr_pips,
+        pip             = pip,
+        trend_direction = trend_result.direction,
+        trend_strength  = trend_result.strength,
+        symbol          = symbol,
+    )
+    _market_mult = _market_state.exec_mult   # 1.00/0.90/0.80/0.70/0.00
+
     # ── H1 trend bias + M5 entry timing ─────────────────────────────────────
     # H1 defines macro direction. M5 EMA20 is the entry timing signal.
     # Three outcomes: aligned (full size), near/recovering (size penalty), misaligned (skip).
@@ -1872,11 +1884,50 @@ async def scan_symbol(
         symbol, _quality, _quality_size_mult * 100,
     )
 
-    # Add pullback / OB continuation context tags to help diagnose entry type
-    if _has_ob and _strong_trend:
-        log.info("[OB CONTINUATION] %s — trade aligned with order block + strong trend", symbol)
-    elif fib_result.score > 0 and _strong_trend:
-        log.info("[PULLBACK ENTRY] %s — Fibonacci pullback in strong trend context", symbol)
+    # ── Pullback / continuation context tags ─────────────────────────────────
+    if fib_result.continuation_aligned and _strong_trend:
+        log.warning(
+            "[PULLBACK DETECTED] %s [RETRACE ENTRY] dir=%s depth=%s ratio=%.3f "
+            "| [HEALTHY RETRACEMENT] [ENTRY ZONE VALID] [TREND CONTINUATION]",
+            symbol, direction, fib_result.retrace_depth, fib_result.nearest_ratio,
+        )
+        if _has_ob:
+            log.warning(
+                "[CONTINUATION CONFIRMED] %s — OB + Fib confluence "
+                "| [TREND STACK] [DIRECTIONAL DOMINANCE] [WEIGHTED CONFLUENCE]",
+                symbol,
+            )
+    elif _has_ob and _strong_trend:
+        log.info(
+            "[OB CONTINUATION] %s — order block in strong trend [CONTINUATION BIAS]", symbol
+        )
+
+    if _market_state.state == "TRENDING":
+        log.warning(
+            "[TREND CONTINUATION] %s — market state=%s consistency=%.2f "
+            "[IMPULSE LEG] [DIRECTIONAL DOMINANCE]",
+            symbol, _market_state.state, _market_state.trend_strength,
+        )
+
+    # Flag when breakout is the dominant driver without pullback/OB support
+    if bo_result.score > 0 and not (_has_ob or fib_result.continuation_aligned):
+        log.info(
+            "[BREAKOUT SECONDARY] %s — breakout score=%.1f without OB/Fib pullback "
+            "| [CONTINUATION PRIORITY: trend+pullback preferred]",
+            symbol, bo_result.score,
+        )
+
+    # High-quality entry label (TRENDING market + continuation-aligned pullback + Tier 1)
+    if (
+        _market_state.state == "TRENDING"
+        and fib_result.continuation_aligned
+        and decision.tier == 1
+    ):
+        log.warning(
+            "[ENTRY QUALITY HIGH] %s — TRENDING market + golden-zone pullback + Tier 1 "
+            "| [RR OPTIMIZED] [TP REALISTIC]",
+            symbol,
+        )
 
     # ── High-confidence execution bypass ──────────────────────────────────────
     # Phase 2: relaxed from conf>=65+trend_consistent+atr>=5.0 to conf>=60+atr>dead_market.
@@ -1955,16 +2006,17 @@ async def scan_symbol(
         * _m5_size_penalty
         * _atr_size_penalty
         * _quality_size_mult
-        * guard_size_mult,
+        * guard_size_mult
+        * _market_mult,
         2,
     )))
     log.warning(
         "[EXECUTION SCALING] %s %s | tier=%.2f opt=%.2f mtf_h4=%.2f m5=%.2f "
-        "atr=%.2f quality=%.2f guard=%.2f → combined=%.2f",
+        "atr=%.2f quality=%.2f guard=%.2f market=%.2f(%s) → combined=%.2f",
         symbol, direction,
         decision.size_mult, opt.lot_mult, _mtf_h4_size_penalty,
         _m5_size_penalty, _atr_size_penalty, _quality_size_mult,
-        guard_size_mult, combined_size_mult,
+        guard_size_mult, _market_mult, _market_state.state, combined_size_mult,
     )
 
     _sl_atr_mult = float(getattr(cfg.strategy, "sl_atr_mult", 1.5))

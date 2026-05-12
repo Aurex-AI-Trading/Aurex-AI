@@ -55,12 +55,12 @@ _ADJUST_EVERY = 10
 
 @dataclass
 class FactorWeights:
-    trend:        int = 30   # +5: present across all sessions; primary directional edge
-    liquidity:    int = 25   # +5: sweep detection is the most reliable live signal
-    fvg:          int = 10   # -10: structurally absent in Asian/ranging sessions
-    fibonacci:    int = 15
-    ema:          int = 10
-    confirmation: int = 10
+    trend:        int = 35   # Phase 3: elevated — directional bias is the core edge
+    liquidity:    int = 20   # Phase 3: reduced — sweep confirms but doesn't gate continuation
+    fvg:          int = 10   # absent in Asian/ranging sessions; secondary signal
+    fibonacci:    int = 15   # pullback-to-golden-zone is the primary entry mechanism
+    ema:          int = 13   # Phase 3: elevated — continuation entry proximity matters
+    confirmation: int = 7    # Phase 3: reduced — pattern confirms, doesn't lead
     # bonus factor — not summed to 100, added on top of core score
     order_block:  int = 15
 
@@ -291,12 +291,12 @@ class WeightAdjuster:
                     raw = json.load(f)
                 weights = raw.get("weights", {})
                 loaded = FactorWeights(
-                    trend        = int(weights.get("trend",        30)),
-                    liquidity    = int(weights.get("liquidity",    25)),
+                    trend        = int(weights.get("trend",        35)),
+                    liquidity    = int(weights.get("liquidity",    20)),
                     fvg          = int(weights.get("fvg",          10)),
                     fibonacci    = int(weights.get("fibonacci",    15)),
-                    ema          = int(weights.get("ema",          10)),
-                    confirmation = int(weights.get("confirmation", 10)),
+                    ema          = int(weights.get("ema",          13)),
+                    confirmation = int(weights.get("confirmation",  7)),
                     order_block  = int(weights.get("order_block",  15)),
                 )
                 # Validate on load and reset to defaults if corrupt

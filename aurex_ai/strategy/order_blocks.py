@@ -141,19 +141,26 @@ def analyze(
 
     # ── Score ─────────────────────────────────────────────────────────────────
     if price_in_ob:
-        score = max_score                           # 15: price inside OB
+        raw_score = max_score                       # 15: price inside OB
     elif ob_size > 0 and dist <= ob_size:
-        score = max_score * 0.53                    # 8: price within 1× OB size
+        raw_score = max_score * 0.53                # 8: price within 1× OB size
     else:
-        score = max_score * 0.27                    # 4: OB exists, price far
+        raw_score = max_score * 0.27                # 4: OB exists, price far
 
-    score = round(score, 1)
+    # Freshness decay: OBs tested or revisited many times lose institutional significance.
+    # age_bars = bars since the OB formed; score decays to 55% at 25 bars old.
+    age_bars  = (len(window) - 1) - best_ob.index
+    freshness = max(0.55, 1.0 - age_bars / 25)
+    score     = round(raw_score * freshness, 1)
 
-    log.debug(
-        "OB [%s]: type=%s price_in_ob=%s best=%.5f-%.5f dist_pips=%.1f score=%.1f",
-        symbol, ob_type, price_in_ob,
+    _is_fresh = freshness >= 0.80
+    log.warning(
+        "[ORDER BLOCK VALID] %s | type=%s in_ob=%s fresh=%.2f age=%d "
+        "zone=%.5f-%.5f dist_pips=%.1f score=%.1f%s",
+        symbol, ob_type, price_in_ob, freshness, age_bars,
         best_ob.low, best_ob.high,
         dist / pip_size, score,
+        " [FRESH OB] [HIGH PROBABILITY ZONE]" if _is_fresh else "",
     )
 
     return OBResult(

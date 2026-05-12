@@ -119,7 +119,7 @@ strategy:
 
   # Fibonacci
   fib_lookback:          50
-  fib_min_move_pips:     30    # minimum impulse move to compute fib
+  fib_min_move_pips:     20    # minimum impulse move to compute fib (lowered from 30 — Phase 3)
   fib_ratios:            [0.382, 0.5, 0.618, 0.705, 0.786]
   golden_zone:           [0.5, 0.705]
 
@@ -253,16 +253,16 @@ modes:
     tier2:               52     # B+ setups for half lot execution
     tier3:               42     # blocked by min_execution_tier=2 anyway
     weights:
-      # AI learning engine weights (weights.json) — trend and liquidity dominate.
-      # Fibonacci overweighted in prior config; AI reduces it significantly.
-      # A strong trend + sweep + FVG setup scores ~85; trend-only scores ~55 (below tier2).
+      # Phase 3: trend continuation + pullback system — trend, EMA, Fib dominate.
+      # Liquidity reduced (still valuable but doesn't need to dominate).
+      # A strong trend + sweep + FVG setup scores ~88; trend+fib+ema scores ~69 (Tier 1).
       # Sum = 100.
-      trend:        35   # AI-learned +5: primary driver of profitable trades
-      liquidity:    28   # AI-learned +6: sweep is the strongest institutional signal
-      fvg:           9   # AI-learned -1: valid in London/NY but don't overweight
-      fibonacci:    11   # AI-learned -7: pullback tool only; strong trends break fib levels
-      ema:          11   # AI-learned +1: entry proximity still matters
-      confirmation:  6   # AI-learned -4: candle pattern confirms but doesn't lead
+      trend:        38   # primary driver — directional bias is the strongest edge
+      liquidity:    18   # sweep confirms entry but isn't required for continuation
+      fvg:           8   # valid in London/NY but secondary to pullback structure
+      fibonacci:    16   # elevated — pullback to golden zone is the core entry signal
+      ema:          16   # elevated — EMA proximity is the continuation entry zone
+      confirmation:  4   # candle pattern confirms but doesn't lead; reduced weight
 
   conservative:
     min_confidence:      50

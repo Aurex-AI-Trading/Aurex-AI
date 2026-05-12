@@ -224,7 +224,14 @@ def combine(
         (direction == "SELL" and breakout_direction == "bearish")
     )
     ob_pts = _scale(ob_score, _DEF["order_block"], w["order_block"]) if ob_aligned else 0.0
-    bo_pts = max(0.0, min(12.0, breakout_score)) if bo_aligned else 0.0
+    # Breakout demoted to secondary confirmation — capped at 6 (was 12).
+    # Primary edge is trend continuation + pullback (OB/Fib); breakout confirms but doesn't lead.
+    bo_pts = max(0.0, min(6.0, breakout_score)) if bo_aligned else 0.0
+    if bo_pts > 0 and bo_aligned:
+        log.info(
+            "[BREAKOUT SECONDARY] %s — breakout +%.1f (capped at 6) [CONTINUATION PRIORITY]",
+            symbol, bo_pts,
+        )
 
     struct_aligned = (
         (direction == "BUY"  and structure_direction in ("buy",  "bullish")) or
@@ -262,7 +269,7 @@ def combine(
         f"  ─────────────────────────────────\n"
         f"  Core score:   {core:.1f}\n"
         f"  Order Block:  {ob_direction:<10}  +{ob_pts:5.1f} /{w['order_block']} [BONUS]\n"
-        f"  Breakout:     {breakout_direction:<10}  +{bo_pts:5.1f} /12 [BONUS]\n"
+        f"  Breakout:     {breakout_direction:<10}  +{bo_pts:5.1f} /6 [BONUS][SECONDARY]\n"
         f"  Structure:    {structure_direction:<10}  +{struct_pts:5.1f} /25 [BONUS]\n"
         f"  ─────────────────────────────────\n"
         f"  TOTAL SCORE:  {total:.1f}  {tier_label}\n"
