@@ -86,6 +86,8 @@ from aurex_ai.core.trade_source import (
     MANUAL  as _MANUAL,
     classify_from_mt5_position as _classify_mt5_pos,
 )
+from aurex_ai.execution.correlation_engine import CorrelationEngine
+from aurex_ai.analytics.strategy_version import StrategyVersionManager, CURRENT_VERSION as _CURRENT_VERSION
 
 try:
     from aurex_ai.api.server import (
@@ -806,23 +808,24 @@ async def _fallback_pipeline(
     # ── Persist trade open to analytics log ──────────────────────────────────
     try:
         TradeLogger.get_instance().log_open(
-            ticket       = trade.ticket,
-            signal_id    = signal_id,
-            symbol       = symbol,
-            direction    = direction,
-            tier         = 3,
-            setup_type   = f"Fallback-{fb.method}",
-            confidence   = float(confidence_fb.total),
-            total_score  = fallback_decision.score,
-            entry_price  = risk.entry,
-            stop_loss    = risk.stop_loss,
-            take_profit  = risk.take_profit,
-            lot_size     = risk.lot_size,
-            risk_reward  = risk.rr_ratio,
-            atr_pips     = atr_pips_fb,
-            utc_hour     = current_time.hour,
-            opened_at    = _opened_at_fb,
-            trade_source = _AI_AUTO,
+            ticket            = trade.ticket,
+            signal_id         = signal_id,
+            symbol            = symbol,
+            direction         = direction,
+            tier              = 3,
+            setup_type        = f"Fallback-{fb.method}",
+            confidence        = float(confidence_fb.total),
+            total_score       = fallback_decision.score,
+            entry_price       = risk.entry,
+            stop_loss         = risk.stop_loss,
+            take_profit       = risk.take_profit,
+            lot_size          = risk.lot_size,
+            risk_reward       = risk.rr_ratio,
+            atr_pips          = atr_pips_fb,
+            utc_hour          = current_time.hour,
+            opened_at         = _opened_at_fb,
+            trade_source      = _AI_AUTO,
+            strategy_version  = _CURRENT_VERSION,
         )
     except Exception as _tl_exc:
         log.debug("[TRADE LOG] fallback log_open error: %s", _tl_exc)
@@ -2487,12 +2490,15 @@ async def scan_symbol(
                   symbol, direction, cooldown.remaining(symbol, direction))
         return None
 
-    # ── Currency correlation / exposure protection (Phase 8) ─────────────────
-    # Prevents stacking two positions on the same side of USD, GBP, or JPY.
-    # Only runs in live mode; backtest uses single-symbol sequential evaluation.
+    # ── Currency correlation / exposure protection (Phase 11: CorrelationEngine) ──
+    # Graduated lot-weighted exposure check replaces the binary Phase 8 blocker.
+    # Returns a size_multiplier (0.0–1.0) rather than hard block/allow.
+    _corr_size_mult = 1.0
     if not feed._backtest:
-        _corr_open = bridge.get_open_positions()
-        if _check_currency_exposure(symbol, direction, _corr_open, cfg):
+        _corr_open   = bridge.get_open_positions()
+        _corr_result = _correlation_engine.evaluate(symbol, direction, _corr_open)
+        _corr_size_mult = _corr_result.size_multiplier
+        if not _corr_result.allowed:
             _log_rejected(symbol, "CORRELATION_BLOCKED",
                           confidence=decision.confidence, atr=atr_pips)
             return None
@@ -2525,19 +2531,20 @@ async def scan_symbol(
         * _session_quality_mult
         * _news_mult
         * _pair_atr_size_mult
-        * _entry_timing_mult,
+        * _entry_timing_mult
+        * _corr_size_mult,
         2,
     )))
     log.warning(
         "[EXECUTION SCALING] %s %s | tier=%.2f opt=%.2f mtf_h4=%.2f m5=%.2f "
         "atr=%.2f quality=%.2f guard=%.2f market=%.2f(%s) "
-        "spread=%.2f session=%.2f news=%.2f pair_atr=%.2f timing=%.2f → combined=%.2f",
+        "spread=%.2f session=%.2f news=%.2f pair_atr=%.2f timing=%.2f corr=%.2f → combined=%.2f",
         symbol, direction,
         decision.size_mult, opt.lot_mult, _mtf_h4_size_penalty,
         _m5_size_penalty, _atr_size_penalty, _quality_size_mult,
         guard_size_mult, _market_mult, _market_state.state,
         _early_spread_mult, _session_quality_mult, _news_mult,
-        _pair_atr_size_mult, _entry_timing_mult,
+        _pair_atr_size_mult, _entry_timing_mult, _corr_size_mult,
         combined_size_mult,
     )
 
@@ -2905,6 +2912,7 @@ async def scan_symbol(
             utc_hour           = current_time.hour,
             opened_at          = current_time.isoformat(),
             trade_source       = _AI_AUTO,
+            strategy_version   = _CURRENT_VERSION,
         )
     except Exception as _tl_exc:
         log.debug("[TRADE LOG] log_open error: %s", _tl_exc)
@@ -3012,14 +3020,25 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     sync              = _SupabaseSync() if _SYNC_AVAILABLE else None
     guard             = AccountGuard(cfg)
     # Phase 6 — enterprise systems (singletons; safe to re-init on restart)
-    adaptive_learning = AdaptiveLearning.get_instance()
-    failsafe          = Failsafe.get_instance(cfg)
-    telemetry         = Telemetry.get_instance(cfg)
-    exec_quality      = ExecutionQualityEngine.get_instance()
+    adaptive_learning  = AdaptiveLearning.get_instance()
+    failsafe           = Failsafe.get_instance(cfg)
+    telemetry          = Telemetry.get_instance(cfg)
+    exec_quality       = ExecutionQualityEngine.get_instance()
+    # Phase 11 — correlation engine + strategy version manager
+    _correlation_engine = CorrelationEngine(cfg)
+    _version_mgr        = StrategyVersionManager.get_instance()
     log.warning(
         "[MULTI USER SAFE] [ISOLATED EXECUTION] [USER CONTEXT VERIFIED] "
         "Phase 6 systems initialised | failsafe=OK telemetry=OK exec_quality=OK adaptive_learning=OK"
     )
+    # Phase 11: AI_FORWARD_V2 baseline banner — shows clean-data sample count at startup
+    try:
+        _ai_fwd_count = trade_logger.total_version_closed(
+            version=_CURRENT_VERSION, sources=["AI_AUTO", "HYBRID"]
+        )
+        _version_mgr.log_baseline_banner(ai_forward_count=_ai_fwd_count)
+    except Exception:
+        pass
     interval = cfg.trading.scan_interval
     mode     = "DRY_RUN" if bridge.dry_run else "LIVE"
 
@@ -3236,6 +3255,14 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         # Phase 6: telemetry cycle start + adaptive learning compute
         telemetry.cycle_start()
         _al_snap = adaptive_learning.compute(trade_logger, cfg=cfg)
+
+        # Phase 11: AI sample status — log every 50 cycles so the dashboard can track
+        # when the AI_FORWARD_V2 dataset crosses BUILDING → VALID → MATURE thresholds.
+        if scan_num % 50 == 0:
+            try:
+                PerformanceEngine.get_sample_status(trade_logger).log_status()
+            except Exception:
+                pass
 
         log.info("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
 

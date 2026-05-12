@@ -40,6 +40,7 @@ Schema (trades table):
   profit_zar       REAL
   duration_minutes INTEGER
   trade_source     TEXT                 — AI_AUTO | MANUAL | HYBRID | BACKTEST
+  strategy_version TEXT                 — AI_FORWARD_V2 | LEGACY
 """
 from __future__ import annotations
 
@@ -94,7 +95,8 @@ CREATE TABLE IF NOT EXISTS trades (
     pips               REAL    DEFAULT 0.0,
     profit_zar         REAL    DEFAULT 0.0,
     duration_minutes   INTEGER DEFAULT 0,
-    trade_source       TEXT    DEFAULT 'AI_AUTO'
+    trade_source       TEXT    DEFAULT 'AI_AUTO',
+    strategy_version   TEXT    DEFAULT 'LEGACY'
 )
 """
 
@@ -132,6 +134,7 @@ class TradeRecord:
     profit_zar:         float        = 0.0
     duration_minutes:   int          = 0
     trade_source:       str          = AI_AUTO
+    strategy_version:   str          = "AI_FORWARD_V2"
 
 
 class TradeLogger:
@@ -191,6 +194,7 @@ class TradeLogger:
         utc_hour:           int          = 0,
         opened_at:          Optional[str] = None,
         trade_source:       str          = AI_AUTO,
+        strategy_version:   str          = "AI_FORWARD_V2",
     ) -> None:
         rec = TradeRecord(
             ticket             = ticket,
@@ -220,6 +224,7 @@ class TradeLogger:
             opened_at          = opened_at or _now_iso(),
             result             = "OPEN",
             trade_source       = trade_source,
+            strategy_version   = strategy_version,
         )
         try:
             if self._use_sqlite:
@@ -254,22 +259,23 @@ class TradeLogger:
         the AI learning engine or weight adjuster.
         """
         rec = TradeRecord(
-            ticket       = ticket,
-            signal_id    = "",            # no signal_id — distinguishing marker
-            symbol       = symbol,
-            direction    = direction,
-            tier         = 0,             # no tier — manually entered
-            setup_type   = "MANUAL",
-            confidence   = 0.0,
-            total_score  = 0.0,
-            lot_size     = round(lot_size,     2),
-            entry_price  = round(entry_price,  5),
-            stop_loss    = round(stop_loss,    5),
-            take_profit  = round(take_profit,  5),
-            utc_hour     = utc_hour,
-            opened_at    = opened_at or _now_iso(),
-            result       = "OPEN",
-            trade_source = MANUAL,
+            ticket           = ticket,
+            signal_id        = "",            # no signal_id — distinguishing marker
+            symbol           = symbol,
+            direction        = direction,
+            tier             = 0,             # no tier — manually entered
+            setup_type       = "MANUAL",
+            confidence       = 0.0,
+            total_score      = 0.0,
+            lot_size         = round(lot_size,     2),
+            entry_price      = round(entry_price,  5),
+            stop_loss        = round(stop_loss,    5),
+            take_profit      = round(take_profit,  5),
+            utc_hour         = utc_hour,
+            opened_at        = opened_at or _now_iso(),
+            result           = "OPEN",
+            trade_source     = MANUAL,
+            strategy_version = "LEGACY",     # manual trades never count in AI analytics
         )
         try:
             if self._use_sqlite:
@@ -414,6 +420,81 @@ class TradeLogger:
         """Convenience: count AI_AUTO + HYBRID closed trades."""
         return self.total_closed(sources=["AI_AUTO", "HYBRID"])
 
+    def get_closed_trades_by_version(
+        self,
+        version:  str,
+        sources:  Optional[List[str]] = None,
+        limit:    int = 500,
+    ) -> List[Dict]:
+        """
+        Return closed trades filtered by strategy_version AND optionally source.
+
+        The primary query for AI_FORWARD_V2 learning isolation:
+            get_closed_trades_by_version("AI_FORWARD_V2", ["AI_AUTO", "HYBRID"])
+
+        Args:
+            version:  e.g. "AI_FORWARD_V2" or "LEGACY"
+            sources:  optional list of trade_source values; None = all sources
+            limit:    max rows
+        """
+        try:
+            if self._use_sqlite:
+                if sources:
+                    placeholders = ",".join("?" * len(sources))
+                    return self._sqlite_query(
+                        f"SELECT * FROM trades WHERE result != 'OPEN' "
+                        f"AND strategy_version = ? "
+                        f"AND trade_source IN ({placeholders}) "
+                        f"ORDER BY closed_at DESC LIMIT ?",
+                        (version,) + tuple(sources) + (limit,),
+                    )
+                else:
+                    return self._sqlite_query(
+                        "SELECT * FROM trades WHERE result != 'OPEN' "
+                        "AND strategy_version = ? "
+                        "ORDER BY closed_at DESC LIMIT ?",
+                        (version, limit),
+                    )
+            # JSON fallback
+            all_closed = self._json_query_closed(limit * 3)
+            filtered   = [
+                t for t in all_closed
+                if t.get("strategy_version", "LEGACY") == version
+                and (sources is None or t.get("trade_source", AI_AUTO) in sources)
+            ]
+            return filtered[:limit]
+        except Exception as exc:
+            log.error("[TRADE LOG] get_closed_trades_by_version failed: %s", exc)
+            return []
+
+    def total_version_closed(
+        self,
+        version: str,
+        sources: Optional[List[str]] = None,
+    ) -> int:
+        """Count closed trades for a strategy version, optionally source-filtered."""
+        try:
+            if self._use_sqlite:
+                if sources:
+                    placeholders = ",".join("?" * len(sources))
+                    rows = self._sqlite_query(
+                        f"SELECT COUNT(*) AS n FROM trades WHERE result != 'OPEN' "
+                        f"AND strategy_version = ? "
+                        f"AND trade_source IN ({placeholders})",
+                        (version,) + tuple(sources),
+                    )
+                else:
+                    rows = self._sqlite_query(
+                        "SELECT COUNT(*) AS n FROM trades WHERE result != 'OPEN' "
+                        "AND strategy_version = ?",
+                        (version,),
+                    )
+                return int(rows[0]["n"]) if rows else 0
+            trades = self.get_closed_trades_by_version(version, sources, limit=9999)
+            return len(trades)
+        except Exception:
+            return 0
+
     def is_ticket_known(self, ticket: int) -> bool:
         """Return True if this MT5 ticket is already in the trade logger."""
         try:
@@ -446,9 +527,6 @@ class TradeLogger:
                     conn.execute(
                         "ALTER TABLE trades ADD COLUMN trade_source TEXT DEFAULT 'AI_AUTO'"
                     )
-                    # Backfill: classify historical trades by signal_id presence
-                    # Trades with a non-empty signal_id were produced by the pipeline → AI_AUTO
-                    # Trades without a signal_id were externally entered → MANUAL
                     conn.execute(
                         "UPDATE trades SET trade_source = 'MANUAL' "
                         "WHERE (signal_id IS NULL OR signal_id = '') "
@@ -458,6 +536,26 @@ class TradeLogger:
                         "[TRADE SOURCE MIGRATION] trade_source column added. "
                         "Existing trades classified by signal_id presence. "
                         "Empty signal_id → MANUAL, populated → AI_AUTO."
+                    )
+
+                # Migration: add strategy_version (Phase 11 baseline reset)
+                if "strategy_version" not in cols:
+                    conn.execute(
+                        "ALTER TABLE trades ADD COLUMN strategy_version TEXT DEFAULT 'LEGACY'"
+                    )
+                    # All pre-existing trades are LEGACY — they were recorded under
+                    # experimental strategy versions and must not contaminate AI_FORWARD_V2
+                    # analytics or learning windows.  New trades are stamped at log_open().
+                    conn.execute(
+                        "UPDATE trades SET strategy_version = 'LEGACY'"
+                    )
+                    log.warning(
+                        "[AI BASELINE RESET] strategy_version column added. "
+                        "All %d existing trades marked LEGACY — excluded from "
+                        "AI_FORWARD_V2 learning and analytics.",
+                        conn.execute(
+                            "SELECT COUNT(*) FROM trades"
+                        ).fetchone()[0],
                     )
 
                 conn.commit()

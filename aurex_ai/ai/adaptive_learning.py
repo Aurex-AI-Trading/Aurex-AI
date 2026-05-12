@@ -128,7 +128,12 @@ class AdaptiveLearning:
         Returns the cached snapshot otherwise.
         """
         from aurex_ai.core.trade_source import LEARNABLE_SOURCES
-        n = trade_logger.total_ai_closed()
+        from aurex_ai.analytics.strategy_version import CURRENT_VERSION as _CURR_VER
+        # Count ONLY AI_FORWARD_V2 learnable trades — legacy trades are excluded
+        n = trade_logger.total_version_closed(
+            version=_CURR_VER,
+            sources=list(LEARNABLE_SOURCES),
+        )
 
         with self._lock:
             if (
@@ -157,12 +162,19 @@ class AdaptiveLearning:
                 self._last_trade_count = n
             return snap
 
-        # ── Fetch AI-only trade windows (never polluted by MANUAL trades) ─────
-        short_trades = trade_logger.get_closed_trades_by_source(
-            sources=list(LEARNABLE_SOURCES), limit=win_short
+        # ── Fetch AI_FORWARD_V2 trade windows (clean baseline, no legacy) ───
+        # Double-filtered: strategy_version=AI_FORWARD_V2 AND source=AI_AUTO/HYBRID
+        # This ensures neither LEGACY trades nor MANUAL trades contaminate the
+        # rolling factor analysis and symbol/session modifier computation.
+        short_trades = trade_logger.get_closed_trades_by_version(
+            version=_CURR_VER,
+            sources=list(LEARNABLE_SOURCES),
+            limit=win_short,
         )
-        long_trades  = trade_logger.get_closed_trades_by_source(
-            sources=list(LEARNABLE_SOURCES), limit=win_long
+        long_trades  = trade_logger.get_closed_trades_by_version(
+            version=_CURR_VER,
+            sources=list(LEARNABLE_SOURCES),
+            limit=win_long,
         )
 
         snap.short_win_rate = _win_rate(short_trades)

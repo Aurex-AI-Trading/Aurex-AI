@@ -36,6 +36,9 @@ from typing import Dict, List, Optional
 
 from aurex_ai.core.logger import get_logger
 from aurex_ai.core.trade_source import AI_AUTO, MANUAL, HYBRID, ALL_SOURCES
+from aurex_ai.analytics.strategy_version import (
+    CURRENT_VERSION, MIN_VALID_SAMPLE, SampleStatus,
+)
 
 log = get_logger("analytics.performance")
 
@@ -151,26 +154,33 @@ class PerformanceEngine:
     @staticmethod
     def compute(
         trade_logger,
-        window:        Optional[int]       = None,
-        source_filter: Optional[List[str]] = None,
+        window:           Optional[int]       = None,
+        source_filter:    Optional[List[str]] = None,
+        version_filter:   Optional[str]       = None,
     ) -> PerformanceReport:
         """
         Compute analytics from the trade log.
 
         Args:
-            trade_logger:  TradeLogger instance.
-            window:        If set, only consider the most recent N closed trades.
-                           None = use all closed trades.
-            source_filter: If set, only include trades whose trade_source is in
-                           this list.  e.g. ["AI_AUTO"] for AI-only metrics.
-                           None = include all sources.
+            trade_logger:   TradeLogger instance.
+            window:         Most recent N closed trades (None = all).
+            source_filter:  Filter by trade_source list. e.g. ["AI_AUTO"].
+            version_filter: Filter by strategy_version. e.g. "AI_FORWARD_V2".
+                            When set, only trades with this version are included.
+                            Use this to get clean Phase 11+ metrics only.
 
         Returns:
             PerformanceReport with all metrics filled in.
         """
         source_label = source_filter[0] if (source_filter and len(source_filter) == 1) else "ALL"
 
-        if source_filter:
+        if version_filter:
+            all_closed = trade_logger.get_closed_trades_by_version(
+                version=version_filter,
+                sources=source_filter,
+                limit=window or 2000,
+            )
+        elif source_filter:
             all_closed = trade_logger.get_closed_trades_by_source(
                 sources=source_filter, limit=window or 2000
             )
@@ -344,6 +354,43 @@ class PerformanceEngine:
                 trade_logger, window=window, source_filter=[source]
             )
         return results
+
+    @staticmethod
+    def compute_ai_forward(
+        trade_logger,
+        window: Optional[int] = None,
+    ) -> PerformanceReport:
+        """
+        Compute AI_FORWARD_V2-only performance metrics.
+
+        This is the PRIMARY analytics call for the Phase 11 clean baseline.
+        Only includes AI_AUTO + HYBRID trades tagged strategy_version=AI_FORWARD_V2.
+        Historical LEGACY trades are completely excluded.
+
+        Returns a PerformanceReport with source="AI_AUTO" reflecting only
+        post-Phase-11 forward-test data.
+        """
+        return PerformanceEngine.compute(
+            trade_logger,
+            window         = window,
+            source_filter  = [AI_AUTO, HYBRID],
+            version_filter = CURRENT_VERSION,
+        )
+
+    @staticmethod
+    def get_sample_status(trade_logger) -> SampleStatus:
+        """
+        Return the statistical validity state for the AI_FORWARD_V2 dataset.
+
+        Reads the count of AI_AUTO + HYBRID closed trades in the current version
+        and returns a SampleStatus reflecting how close we are to MIN_VALID_SAMPLE.
+        Call this once per cycle to emit [AI SAMPLE STATUS].
+        """
+        n = trade_logger.total_version_closed(
+            version=CURRENT_VERSION,
+            sources=[AI_AUTO, HYBRID],
+        )
+        return SampleStatus.from_n(n)
 
     @staticmethod
     def log_source_comparison(trade_logger, window: Optional[int] = None) -> None:

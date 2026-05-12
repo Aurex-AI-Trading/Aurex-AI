@@ -87,6 +87,8 @@ class SupabaseSync:
             self._sync_bot_heartbeat(user_id)
             self._sync_trades(trade_logger, user_id)
             self._sync_daily_analytics(trade_logger, user_id)
+            self._sync_ai_analytics(trade_logger, user_id)
+            self._sync_sample_status(trade_logger, user_id)
         except Exception as exc:
             log.debug("[SYNC] sync_all error: %s", exc)
 
@@ -200,6 +202,119 @@ class SupabaseSync:
                 self._push_trade(t, user_id, status="closed")
         except Exception as exc:
             log.debug("[SYNC] _sync_trades error: %s", exc)
+
+    # ── AI analytics dashboard ────────────────────────────────────────────────
+
+    def _sync_ai_analytics(self, trade_logger: Any, user_id: str) -> None:
+        """
+        Sync AI_FORWARD_V2 performance breakdown to Supabase.
+
+        Pushes one row per (trade_source, strategy_version) combination
+        to the `ai_analytics_snapshot` table so the dashboard can render:
+          • AI-only WR, PF, expectancy, DD
+          • Source comparison (AI_AUTO vs MANUAL vs HYBRID)
+          • Symbol / session / setup breakdowns (from component_deltas + symbol_pnl)
+
+        Table schema (create once in Supabase dashboard):
+          CREATE TABLE IF NOT EXISTS ai_analytics_snapshot (
+            user_id          UUID NOT NULL,
+            snapshot_date    DATE NOT NULL,
+            strategy_version TEXT NOT NULL DEFAULT 'AI_FORWARD_V2',
+            trade_source     TEXT NOT NULL DEFAULT 'ALL',
+            total_trades     INTEGER,
+            win_rate         NUMERIC(6,4),
+            profit_factor    NUMERIC(8,4),
+            total_pnl        NUMERIC(12,2),
+            max_dd_pct       NUMERIC(6,2),
+            expectancy       NUMERIC(10,2),
+            avg_rr           NUMERIC(6,3),
+            best_session     TEXT,
+            best_setup       TEXT,
+            computed_at      TIMESTAMPTZ,
+            PRIMARY KEY (user_id, snapshot_date, strategy_version, trade_source)
+          );
+        """
+        try:
+            from aurex_ai.analytics.performance import PerformanceEngine
+            from aurex_ai.analytics.strategy_version import CURRENT_VERSION
+            from aurex_ai.core.trade_source import AI_AUTO, MANUAL, HYBRID
+
+            today = datetime.now(timezone.utc).date().isoformat()
+
+            # AI_FORWARD_V2 report (primary clean-baseline panel)
+            ai_report = PerformanceEngine.compute_ai_forward(trade_logger)
+            self._upsert("ai_analytics_snapshot", {
+                "user_id":          user_id,
+                "snapshot_date":    today,
+                "strategy_version": CURRENT_VERSION,
+                "trade_source":     "AI_FORWARD",
+                "total_trades":     ai_report.total_closed,
+                "win_rate":         round(ai_report.win_rate,       4),
+                "profit_factor":    round(max(0.0, ai_report.profit_factor), 4),
+                "total_pnl":        round(ai_report.total_pnl_zar,  2),
+                "max_dd_pct":       round(abs(ai_report.max_drawdown_pct), 4),
+                "expectancy":       round(ai_report.expectancy,     2),
+                "avg_rr":           round(ai_report.avg_rr,         3),
+                "best_session":     ai_report.best_session or None,
+                "best_setup":       ai_report.best_setup   or None,
+                "computed_at":      _now_iso(),
+            }, conflict="user_id,snapshot_date,strategy_version,trade_source")
+
+            # Source comparison (ALL sources, legacy-inclusive)
+            for src in (AI_AUTO, MANUAL, HYBRID):
+                n = trade_logger.total_closed(sources=[src])
+                if n == 0:
+                    continue
+                src_report = PerformanceEngine.compute(trade_logger, source_filter=[src], window=200)
+                self._upsert("ai_analytics_snapshot", {
+                    "user_id":          user_id,
+                    "snapshot_date":    today,
+                    "strategy_version": "ALL",
+                    "trade_source":     src,
+                    "total_trades":     src_report.total_closed,
+                    "win_rate":         round(src_report.win_rate,       4),
+                    "profit_factor":    round(max(0.0, src_report.profit_factor), 4),
+                    "total_pnl":        round(src_report.total_pnl_zar,  2),
+                    "max_dd_pct":       round(abs(src_report.max_drawdown_pct), 4),
+                    "expectancy":       round(src_report.expectancy,     2),
+                    "avg_rr":           round(src_report.avg_rr,         3),
+                    "best_session":     src_report.best_session or None,
+                    "best_setup":       src_report.best_setup   or None,
+                    "computed_at":      _now_iso(),
+                }, conflict="user_id,snapshot_date,strategy_version,trade_source")
+        except Exception as exc:
+            log.debug("[SYNC] _sync_ai_analytics error: %s", exc)
+
+    def _sync_sample_status(self, trade_logger: Any, user_id: str) -> None:
+        """
+        Sync AI_FORWARD_V2 sample validity status to Supabase.
+
+        Table schema (create once in Supabase dashboard):
+          CREATE TABLE IF NOT EXISTS ai_sample_status (
+            user_id          UUID NOT NULL PRIMARY KEY,
+            strategy_version TEXT NOT NULL,
+            sample_n         INTEGER,
+            status           TEXT,
+            confidence_pct   NUMERIC(5,1),
+            min_valid_sample INTEGER DEFAULT 100,
+            updated_at       TIMESTAMPTZ
+          );
+        """
+        try:
+            from aurex_ai.analytics.performance import PerformanceEngine
+            from aurex_ai.analytics.strategy_version import MIN_VALID_SAMPLE
+            ss = PerformanceEngine.get_sample_status(trade_logger)
+            self._upsert("ai_sample_status", {
+                "user_id":          user_id,
+                "strategy_version": ss.strategy_version,
+                "sample_n":         ss.n,
+                "status":           ss.status,
+                "confidence_pct":   ss.confidence_pct,
+                "min_valid_sample": MIN_VALID_SAMPLE,
+                "updated_at":       _now_iso(),
+            }, conflict="user_id")
+        except Exception as exc:
+            log.debug("[SYNC] _sync_sample_status error: %s", exc)
 
     def _push_trade(self, t: Dict, user_id: str, status: str) -> None:
         ticket = t.get("ticket")

@@ -134,6 +134,26 @@ class LearningEngine:
                     sym, v["trades"], v["win_rate"] * 100,
                 )
 
+        # Gate: only adapt weights once we have BUILDING-level AI_FORWARD_V2 data.
+        # Prevents premature weight drift on noise from a tiny sample.
+        try:
+            from aurex_ai.analytics.strategy_version import SampleStatus, CURRENT_VERSION
+            from aurex_ai.analytics.trade_logger import TradeLogger
+            _n = TradeLogger.get_instance().total_version_closed(
+                version=CURRENT_VERSION, sources=["AI_AUTO", "HYBRID"]
+            )
+            _sample = SampleStatus.from_n(_n)
+            if not _sample.allow_weight_adaptation:
+                log.info(
+                    "[LEARNING] Weight adaptation deferred — "
+                    "AI_FORWARD_V2 sample too small (n=%d < 20). "
+                    "Accumulating clean data before adapting weights.",
+                    _n,
+                )
+                return
+        except Exception:
+            pass   # if check fails, allow adaptation to proceed
+
         self._adjuster.update_from_performance(self._tracker)
 
     # ── Dynamic thresholds ────────────────────────────────────────────────────

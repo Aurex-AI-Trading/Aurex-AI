@@ -66,18 +66,119 @@ log = get_logger("core.symbol_registry")
 # notes:        human-readable rationale for profile settings
 
 SYMBOL_CONFIG: Dict[str, dict] = {
+    # ── Phase 11: XAUUSD Institutional Intelligence Profile ──────────────────
+    # Gold is an entirely different animal from FX crosses.  It is driven by:
+    #   • USD macro flow (DXY inverse correlation)
+    #   • Real-yield differentials (rates/inflation)
+    #   • Safe-haven positioning (risk-on/off)
+    #   • Central bank demand (structural support)
+    #   • CPI / NFP / FOMC event risk (hard blocks required)
+    #
+    # Key edges that work on XAUUSD:
+    #   • Trend continuation in macro-trending regimes (Fed pivot, USD weakness)
+    #   • Order block sweeps — gold respects OB zones because institutions
+    #     protect their structural fill levels very cleanly
+    #   • FVG fills in London/NY — gold carries deep imbalances that fill fast
+    #   • Liquidity sweeps of swing highs/lows before reversal continuation
+    #   • Displacement candles + FVG = highest-confidence gold entries
+    #
+    # Key risks that destroy alpha:
+    #   • Pure breakouts above swing highs — stop raids are extremely common
+    #   • Asian session — thin gold market; wide spread; no institutional flow
+    #   • FOMC/CPI/NFP spike sessions — ATR spikes to 50-80+ pips; untradeable
+    #   • RANGING regime — gold can fake-range before violent continuation
+    #
+    # pip_size = 0.1 means: $2.00 price move = 20 pips.
+    # M15 ATR typical ranges:
+    #   Dead/overnight  : $0.50–1.20 = 5-12 pips
+    #   Normal London   : $1.20–2.50 = 12-25 pips (ideal floor)
+    #   Active NY       : $2.50–5.00 = 25-50 pips (sweet spot)
+    #   News spike      : $5.00–8.00 = 50-80 pips (elevated; reduce size)
+    #   FOMC/CPI spike  : $8.00+    = 80+ pips (hard block)
     "XAUUSD": {
+        # ── Core registry fields ──────────────────────────────────────────────
         "no_suffix":          True,          # gold NEVER uses broker suffix
-        "type":               "gold",
-        "volatility":         "high",
-        "atr_profile":        "expanded",    # ATR 5-100 pips on M15; normal forex is 5-30
-        "rr_standard":        1.5,
-        "rr_high_conf":       2.0,
+        "type":               "commodity",   # not forex — macro/safe-haven instrument
+        "volatility":         "very_high",   # highest dollar-pip value of any instrument
+        "atr_profile":        "expanded",    # M15 ATR 5-80 pips (pip_size=0.1)
+        "rr_standard":        1.5,           # 1:1.5 minimum for gold setups
+        "rr_high_conf":       2.5,           # displacement+OB setups: 1:2.5 target
         "spread_warn_pips":   3.0,           # gold spread > 3 pips is elevated
         "spread_block_pips":  8.0,           # gold spread > 8 pips = rollover/news spike
         "sessions":           ["london", "newyork"],
-        "pip_size":           0.1,
-        "notes":              "Expanded ATR. No suffix. Wide spread tolerance vs forex.",
+        "pip_size":           0.1,           # 1 pip = $0.10; ATR ~5-50 pips on M15
+        "notes": (
+            "Macro/safe-haven commodity driven by USD, real yields, risk sentiment. "
+            "OB + Trend is the primary edge. FVG fills reliable in London/NY. "
+            "Hard block on Asian session and FOMC/CPI spike ATR levels. "
+            "Pure breakouts are stop-raid traps — OB backing required. "
+            "pip_size=0.1: $2 move = 20 pips. ATR sweet spot: 12-50 pips."
+        ),
+
+        # ── ATR gates (Phase 11 extended fields) ─────────────────────────────
+        # pip_size=0.1, so:
+        #   5 pips  = $0.50  (dead/rollover)
+        #   12 pips = $1.20  (London open minimum momentum)
+        #   25 pips = $2.50  (active session sweet spot)
+        #   50 pips = $5.00  (elevated — spike risk; reduce size)
+        #   80 pips = $8.00  (FOMC/CPI territory; hard block)
+        "min_atr_pips":       5.0,    # below = dead overnight / Asian rollover
+        "ideal_atr_min":      12.0,   # healthy London momentum starts here
+        "ideal_atr_max":      50.0,   # above = news/spike territory; reduce size
+        "max_atr_pips":       80.0,   # above = FOMC/CPI spike; hard block
+
+        # ── Lot multiplier cap ────────────────────────────────────────────────
+        # Gold: $1 move per pip × pip_size=0.1 × lot_size.
+        # A 0.01-lot gold position moves $1 per $0.10 price change.
+        # Dollar risk per pip is proportionally larger than most FX pairs.
+        # Cap at 0.80 to limit notional exposure on wide ATR moves.
+        "lot_mult_cap":       0.80,
+
+        # ── Execution style ───────────────────────────────────────────────────
+        "execution_style":    "momentum_trend",   # OB+Trend primary; no counter-trend
+
+        # ── Scoring modifiers ─────────────────────────────────────────────────
+        # Applied multiplicatively to factor weights in the confluence engine.
+        # Derived from gold market microstructure:
+        #   trend:         MACRO THESIS — #1 predictor; gold trends align with macro regime
+        #   order_block:   INSTITUTIONAL FILL PROTECTION — OB zones are gold's entry trigger
+        #   fvg:           IMBALANCE FILLS — gold fills gaps cleanly in London/NY sessions
+        #   liquidity:     SWEEP ACCELERATION — liquidity sweeps precede gold's strongest moves
+        #   fibonacci:     TIMING — useful for pullback timing but secondary to OB
+        #   ema:           REDUCED — gold price action is more impulsive; EMA can lag
+        #   confirmation:  REDUCED — gold can run before candle confirmation
+        #   breakout:      STRONG DEMOTION — pure breakouts = stop raids; avoid without OB
+        "scoring_modifiers": {
+            "trend":        1.25,   # +25%: macro alignment is the strongest gold predictor
+            "order_block":  1.20,   # +20%: institutional OB zones are the primary trigger
+            "fvg":          1.15,   # +15%: FVG fills reliable in London/NY
+            "liquidity":    1.10,   # +10%: sweep → acceleration; high-confidence signal
+            "fibonacci":    1.05,   # +5%:  useful for timing on impulse pullbacks
+            "ema":          0.90,   # -10%: impulsive gold moves exceed EMA zones
+            "confirmation": 0.95,   # -5%:  candle confirmation can lag on fast gold moves
+            "breakout":     0.55,   # -45%: stop-raid traps above swing highs; needs OB
+        },
+
+        # ── Market regime execution multiplier overrides ──────────────────────
+        # Gold regime characteristics:
+        #   TRENDING:              1.00  (prime state; macro thesis driving direction)
+        #   VOLATILE_EXPANSION:    0.40  (CPI/NFP/FOMC spike — most dangerous gold state)
+        #   RANGING:               0.50  (unlike GBPJPY, gold ranging is tradeable with OB)
+        #   VOLATILITY_COMPRESSION:0.30  (coiling before unknown breakout; min exposure)
+        #   REVERSAL_ENVIRONMENT:  0.60  (reversals valid with strong OB; controlled risk)
+        #   DEAD:                  0.00  (standard)
+        "regime_mult": {
+            "TRENDING":               1.00,
+            "VOLATILE_EXPANSION":     0.40,   # hard reduction — spike regimes kill gold P&L
+            "RANGING":                0.50,   # not a hard block; gold range trading viable
+            "VOLATILITY_COMPRESSION": 0.30,   # minimum exposure — direction unknown
+            "REVERSAL_ENVIRONMENT":   0.60,
+            "DEAD":                   0.00,
+        },
+
+        # ── Session restrictions ──────────────────────────────────────────────
+        "priority_sessions":  ["london", "newyork"],  # institutional gold sessions
+        "block_sessions":     ["asian"],              # thin liquidity; wide spread; no flow
     },
     "EURUSD": {
         "no_suffix":          False,
@@ -466,6 +567,61 @@ def log_symbol_profile(symbol: str) -> None:
 
     from aurex_ai.core.symbol_mapper import strip_suffix
     base = strip_suffix(symbol).upper()
+
+    if base == "XAUUSD":
+        # ── XAUUSD extended institutional banner ──────────────────────────────
+        _mod    = profile.get("scoring_modifiers", {})
+        _regime = profile.get("regime_mult", {})
+        log.warning(
+            "\n"
+            "  ┌──────────────────────────────────────────────────────────────┐\n"
+            "  │                  XAUUSD PROFILE                              │\n"
+            "  │             INSTITUTIONAL COMMODITY INTELLIGENCE              │\n"
+            "  ├──────────────────────────────────────────────────────────────┤\n"
+            "  │  Instrument     : %-42s│\n"
+            "  │  ATR Profile    : %-42s│\n"
+            "  │  ATR Gates      : %-42s│\n"
+            "  │  Spread         : %-42s│\n"
+            "  │  Sessions       : %-42s│\n"
+            "  │  Block Sessions : %-42s│\n"
+            "  │  RR Profile     : %-42s│\n"
+            "  │  Lot Mult Cap   : %-42s│\n"
+            "  │  Execution      : %-42s│\n"
+            "  │  Pip Size       : %-42s│\n"
+            "  ├──────────────────────────────────────────────────────────────┤\n"
+            "  │  Scoring Modifiers (vs baseline):                            │\n"
+            "  │    trend=%.2f× ob=%.2f× fvg=%.2f× liquidity=%.2f× breakout=%.2f×  │\n"
+            "  ├──────────────────────────────────────────────────────────────┤\n"
+            "  │  Regime Gates:                                               │\n"
+            "  │    TRENDING=%.2f  RANGING=%.2f  VOLATILE_EXP=%.2f            │\n"
+            "  │    COMPRESSION=%.2f  REVERSAL=%.2f                           │\n"
+            "  └──────────────────────────────────────────────────────────────┘",
+            "Gold / XAUUSD (safe-haven commodity)",
+            "EXPANDED (5-80 pips M15; pip_size=0.1)",
+            f"min={profile.get('min_atr_pips',5):.0f} ideal={profile.get('ideal_atr_min',12):.0f}-{profile.get('ideal_atr_max',50):.0f} max={profile.get('max_atr_pips',80):.0f} pips",
+            f"warn≥{profile.get('spread_warn_pips',3):.0f} block≥{profile.get('spread_block_pips',8):.0f} pips",
+            " / ".join(profile.get("priority_sessions", [])).upper(),
+            " / ".join(profile.get("block_sessions", [])).upper(),
+            f"standard={profile.get('rr_standard',1.5):.1f}R  high-conf={profile.get('rr_high_conf',2.5):.1f}R",
+            f"{profile.get('lot_mult_cap',0.80):.2f}× (dollar-pip exposure cap)",
+            str(profile.get("execution_style","momentum_trend")).upper(),
+            "0.1 (gold — 1 pip = $0.10; $2 move = 20 pips)",
+            _mod.get("trend",    1.0), _mod.get("order_block", 1.0),
+            _mod.get("fvg",      1.0), _mod.get("liquidity",   1.0),
+            _mod.get("breakout", 1.0),
+            _regime.get("TRENDING",               1.00),
+            _regime.get("RANGING",                0.50),
+            _regime.get("VOLATILE_EXPANSION",     0.40),
+            _regime.get("VOLATILITY_COMPRESSION", 0.30),
+            _regime.get("REVERSAL_ENVIRONMENT",   0.60),
+        )
+        log.warning(
+            "[XAUUSD PROFILE] type=COMMODITY volatility=VERY_HIGH "
+            "atr=EXPANDED(5-80pips) spread=WIDE(warn3/block8) "
+            "session=LONDON/NEWYORK mode=MOMENTUM_TREND "
+            "rr=1.5/2.5 lot_cap=0.80x",
+        )
+        return
 
     if base == "GBPJPY":
         # ── GBPJPY extended institutional banner ──────────────────────────────
