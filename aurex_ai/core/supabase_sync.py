@@ -250,7 +250,7 @@ class SupabaseSync:
             losses = report.total_closed - wins
             self._upsert("daily_analytics", {
                 "user_id":          user_id,
-                "date":             date.today().isoformat(),
+                "date":             datetime.now(timezone.utc).date().isoformat(),
                 "win_rate":         round(report.win_rate, 4),
                 "profit_factor":    round(max(0.0, report.profit_factor), 4),
                 "total_trades":     report.total_closed,

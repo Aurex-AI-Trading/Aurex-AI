@@ -46,7 +46,9 @@ except ImportError:
 
 # ── MT5 server time helper ────────────────────────────────────────────────────
 
-_MAX_TICK_AGE_SECONDS = 300  # tick older than 5 min = market closed or MT5 frozen
+_MAX_TICK_AGE_SECONDS   = 300   # tick older than 5 min = market closed or MT5 frozen
+_TIME_WARN_THRESHOLD    = 30    # seconds — log [TIME WARNING] when VPS↔MT5 drift exceeds this
+_TIME_CRITICAL_THRESHOLD = 120  # seconds — log [TIME CRITICAL] when drift exceeds this
 
 # Set True when get_mt5_time() returned actual broker tick time; False = local UTC fallback.
 _mt5_time_fresh: bool = False
@@ -57,29 +59,44 @@ def is_mt5_time_fresh() -> bool:
     return _mt5_time_fresh
 
 
-def log_time_sync_banner(symbol: str = "EURUSD.Z") -> None:
+def log_time_sync_banner(symbol: str = "EURUSD.Z") -> float:
     """
     Log a startup time-sync validation banner comparing local PC time to MT5 broker time.
 
     Call once after bridge.connect() succeeds.  Visible at WARNING level so it
     appears in the console regardless of log verbosity.
+
+    Returns:
+        abs(delta_secs) — VPS↔MT5 drift in seconds (0.0 when MT5 unavailable).
+        Caller should emit [TIME WARNING] / [TIME CRITICAL] based on thresholds.
     """
     local_utc  = _dt.datetime.now(_dt.timezone.utc)
     mt5_time   = get_mt5_time(symbol)
     fresh      = is_mt5_time_fresh()
     source     = "MT5 LIVE TICK" if fresh else "LOCAL UTC (MT5 tick unavailable)"
 
-    # PC wall-clock time in its local timezone (for human reference)
-    local_wall = _dt.datetime.now()
-    local_tz_offset = local_wall - local_utc.replace(tzinfo=None)
-    tz_sign    = "+" if local_tz_offset.total_seconds() >= 0 else "-"
-    tz_hours   = int(abs(local_tz_offset.total_seconds()) // 3600)
-    tz_mins    = int((abs(local_tz_offset.total_seconds()) % 3600) // 60)
+    # PC wall-clock in local timezone — human-readable display only, not used in trading
+    local_wall      = _dt.datetime.now()
+    tz_offset_secs  = (local_wall - local_utc.replace(tzinfo=None)).total_seconds()
+    tz_sign         = "+" if tz_offset_secs >= 0 else "-"
+    tz_hours        = int(abs(tz_offset_secs) // 3600)
+    tz_mins         = int((abs(tz_offset_secs) % 3600) // 60)
 
-    # Clock delta: positive means MT5 tick is ahead of local UTC (broker clock leading)
+    # Broker drift: difference between MT5 broker UTC and VPS UTC clock.
+    # Near-zero when NTP is healthy and MT5 feed is live.
+    # Positive  = VPS clock is BEHIND broker (clock was set too early).
+    # Negative  = VPS clock is AHEAD  of broker (rare; clock was set too late).
     delta_secs = (mt5_time - local_utc).total_seconds()
+    abs_delta  = abs(delta_secs)
     delta_sign = "+" if delta_secs >= 0 else "-"
-    delta_str  = f"{delta_sign}{abs(delta_secs):.1f}s"
+    delta_str  = f"{delta_sign}{abs_delta:.1f}s"
+
+    if abs_delta < _TIME_WARN_THRESHOLD:
+        sync_status = "OK — in sync"
+    elif abs_delta < _TIME_CRITICAL_THRESHOLD:
+        sync_status = f"WARNING — {abs_delta:.0f}s drift"
+    else:
+        sync_status = f"CRITICAL — {abs_delta:.0f}s drift"
 
     log.warning(
         "\n"
@@ -89,19 +106,36 @@ def log_time_sync_banner(symbol: str = "EURUSD.Z") -> None:
         "  │  PC local time  : %-27s│\n"
         "  │  PC UTC time    : %-27s│\n"
         "  │  MT5 time (UTC) : %-27s│\n"
-        "  │  PC clock delta : %-27s│\n"
+        "  │  Broker drift   : %-27s│\n"
         "  │  Source         : %-27s│\n"
+        "  │  NTP peers      : %-27s│\n"
         "  │  Status         : %-27s│\n"
         "  └─────────────────────────────────────────────┘",
         local_wall.strftime("%Y-%m-%d %H:%M:%S")
             + f" UTC{tz_sign}{tz_hours:02d}:{tz_mins:02d}",
         local_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
         mt5_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        delta_str + (" (in sync)" if abs(delta_secs) < 5 else " *** CHECK CLOCK ***"),
+        delta_str,
         source,
-        "OK — trading uses MT5 time" if fresh
-            else "WARNING — using local fallback",
+        "pool.ntp.org / time.google.com / time.nist.gov",
+        sync_status + (" — trading uses MT5 time" if fresh else " — using local fallback"),
     )
+
+    # Emit actionable tags for log monitoring / alerting
+    if fresh and abs_delta >= _TIME_CRITICAL_THRESHOLD:
+        log.critical(
+            "[TIME CRITICAL] VPS clock drift %.0fs exceeds %ds threshold — "
+            "trading safety risk. Run: w32tm /resync /force",
+            abs_delta, _TIME_CRITICAL_THRESHOLD,
+        )
+    elif fresh and abs_delta >= _TIME_WARN_THRESHOLD:
+        log.warning(
+            "[TIME WARNING] VPS clock drift %.0fs detected — "
+            "NTP resync recommended. Run: w32tm /resync /force",
+            abs_delta,
+        )
+
+    return abs_delta if fresh else 0.0
 
 
 def get_mt5_time(symbol: str = "EURUSD.Z") -> _dt.datetime:

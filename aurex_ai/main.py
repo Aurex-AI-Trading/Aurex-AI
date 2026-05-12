@@ -4003,7 +4003,17 @@ def main() -> None:
         )
 
     # Time-sync validation: log local vs MT5 broker time once at startup.
-    log_time_sync_banner(symbol=symbols[0] if symbols else "EURUSD.Z")
+    # log_time_sync_banner() returns abs drift in seconds (0.0 when MT5 unavailable).
+    # [TIME WARNING] / [TIME CRITICAL] tags are emitted inside the function.
+    # Trading always uses MT5 time regardless of drift — local clock is never traded on.
+    _startup_drift = log_time_sync_banner(symbol=symbols[0] if symbols else "EURUSD.Z")
+    if _startup_drift >= 120:
+        log.warning(
+            "[TIME SYNC] Drift=%.0fs exceeds critical threshold — "
+            "run 'w32tm /resync /force' on the VPS before trading. "
+            "Bot will continue using MT5 broker time.",
+            _startup_drift,
+        )
 
     log.warning(
         "[STARTUP] MT5 connected OK | symbols=%d | mode=%s | scan_interval=%ds "
