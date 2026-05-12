@@ -34,37 +34,104 @@ from aurex_ai.core.logger import get_logger
 
 log = get_logger("execution.confidence")
 
-MIN_TRADE_CONFIDENCE = 30   # base pre-filter; use get_confidence_threshold() for adaptive
+MIN_TRADE_CONFIDENCE = 40   # [Phase 7] base pre-filter raised from 30; use get_confidence_threshold() for adaptive
+
+# Per-symbol minimum confidence thresholds [Phase 7]
+# Applied independently of mode.min_confidence — the stricter gate wins.
+# Key: strip all broker suffixes before lookup (XAUUSD, not XAUUSD.Z).
+_SYMBOL_CONF_FLOOR: dict = {
+    "XAUUSD": 65,   # Gold — extreme ATR + frequent false breaks demand strictest gate
+    "GBPUSD": 63,   # High-ATR GBP cable
+    "GBPJPY": 63,   # High-ATR cross; hardest directional predictability
+    "USDJPY": 61,   # Yen carry; slightly stricter than commodity pairs
+    "EURUSD": 61,   # Deepest FX liquidity; still needs strong signal
+    "AUDUSD": 60,   # Commodity-correlated; standard gate
+    "USDCAD": 60,   # Oil-correlated; standard gate
+    "NZDUSD": 60,   # Lower volatility pair
+    "USDCHF": 60,   # Safe-haven; standard gate
+}
 
 
 def get_confidence_threshold(utc_hour: int = -1, atr_pips: float = 0.0) -> int:
     """
-    Return an adaptive minimum confidence threshold.
+    Return an adaptive minimum confidence threshold for market state.
 
-    Lower during active sessions (London, NY) where setups are higher quality.
-    Higher during Asian / off-hours and when ATR is very low (dead market).
+    Used as a secondary gate alongside mode.min_confidence and per-symbol
+    thresholds.  Raises bar for dead or off-hours markets.
 
     Args:
         utc_hour:  Current UTC hour (0-23).  Pass -1 when unknown.
         atr_pips:  Recent ATR in pips for the symbol being evaluated.
 
     Returns:
-        Threshold integer in the range [15, 42].
+        Threshold integer in the range [40, 58].
     """
-    base = MIN_TRADE_CONFIDENCE
+    base = MIN_TRADE_CONFIDENCE   # 40
 
-    # Session adjustment — only raise threshold during low-quality hours.
-    # London/NY sessions keep base unchanged; lowering during prime hours was
-    # counterproductive (admitted weaker markets during highest-noise periods).
+    # Off-hours penalty: Asian / dead session demands a higher bar.
+    # London/NY sessions keep base unchanged.
     if utc_hour >= 0:
-        if not (7 <= utc_hour < 21):   # Asian / off-hours only
-            base += 5                   # dead hours demand a higher bar
+        if not (7 <= utc_hour < 21):
+            base += 8    # off-hours dead session
 
-    # Volatility adjustment — dead market deserves a harder gate
+    # Volatility penalty: flat market deserves a hard gate.
     if atr_pips < 5.0:
-        base += 7    # flat / sleeping market
+        base += 10   # near-dead volatility; was 7
 
-    return max(20, min(45, base))
+    return max(40, min(58, base))
+
+
+def get_symbol_confidence_threshold(
+    symbol:    str,
+    utc_hour:  int   = -1,
+    atr_pips:  float = 0.0,
+    cfg=None,
+) -> int:
+    """
+    Return the per-symbol minimum confidence threshold.
+
+    Checks cfg.per_symbol first (runtime override from settings.yaml).
+    Falls back to the hardcoded _SYMBOL_CONF_FLOOR dict.
+    If the symbol is unknown, returns MIN_TRADE_CONFIDENCE.
+
+    The caller should use max(this, mode.min_confidence, get_confidence_threshold())
+    as the effective gate.
+
+    Args:
+        symbol:    Broker symbol string (e.g. "XAUUSD", "EURUSD.Z").
+        utc_hour:  Current UTC hour for session context (not currently used here;
+                   session penalties are applied separately in main.py).
+        atr_pips:  ATR for the symbol (not currently used here).
+        cfg:       Settings object — checks cfg.per_symbol for overrides.
+
+    Returns:
+        Integer minimum confidence threshold for this symbol.
+    """
+    # Strip broker suffix for lookup: "EURUSD.Z" → "EURUSD", "XAUUSD" → "XAUUSD"
+    base = symbol.upper().strip()
+    for suffix in (".Z", ".M", ".ECN", ".PRO", ".STP"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+
+    # Check runtime config override first
+    if cfg is not None:
+        try:
+            ps = getattr(cfg, "per_symbol", None)
+            if ps is not None:
+                val = getattr(ps, base, None)
+                if val is not None:
+                    return int(val)
+        except Exception:
+            pass
+
+    # Hardcoded institutional floor — apply to known symbols
+    for key, floor in _SYMBOL_CONF_FLOOR.items():
+        if key in base:
+            log.debug("[CONFIDENCE] %s per-symbol floor=%d", symbol, floor)
+            return floor
+
+    return MIN_TRADE_CONFIDENCE
 
 
 @dataclass

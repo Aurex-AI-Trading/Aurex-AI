@@ -1,21 +1,30 @@
 """
-Aurex AI — News Guard  (Phase 5: Trade Quality)
+Aurex AI — News Guard  (Phase 7: Institutional Upgrade)
 
 Lightweight news event protection without external API dependency.
 Identifies high-impact economic release windows from deterministic UTC patterns.
 
 Covered events:
-  NFP        — First Friday of each month, 13:30 UTC  (±window minutes)
-  FOMC risk  — Every Wednesday, 17:45–20:00 UTC       (approximate — not every Wed)
-  Rollover   — 22:00–23:59 UTC  (outside session gate anyway; secondary guard)
+  NFP        — First Friday of each month, 13:30 UTC     (block ±pre/post minutes)
+  FOMC risk  — Every Wednesday, 17:45–20:00 UTC          (reduce size — not every Wed)
+  CPI        — Second Tuesday of each month, 13:30 UTC   (block ±pre/post minutes)
+  Rate day   — Every Thursday, 11:00–13:30 UTC           (reduce size — ECB/BoE windows)
+  Rollover   — 22:00–23:59 UTC  (outside session gate; secondary guard)
 
 Configuration (settings.yaml news: section):
-  avoid_nfp:         true    — block NFP window (nfp_window_pre + nfp_window_post)
-  nfp_window_pre:    15      — minutes before 13:30 UTC to start protection
-  nfp_window_post:   30      — minutes after 13:30 UTC before resuming
-  avoid_fomc:        true    — reduce size on all Wednesdays 17:45-20:00 UTC
-  fomc_size_mult:    0.50    — lot multiplier during FOMC risk window
-  news_size_mult:    0.50    — generic fallback size multiplier for reduced windows
+  avoid_nfp:           true    — block NFP window
+  nfp_window_pre:      20      — minutes before 13:30 UTC to start protection
+  nfp_window_post:     45      — minutes after 13:30 UTC before resuming
+  avoid_fomc:          true    — reduce size Wednesdays 17:45-20:00 UTC
+  fomc_size_mult:      0.50    — lot multiplier during FOMC risk window
+  avoid_cpi:           true    — block CPI window (2nd Tuesday each month)
+  cpi_window_pre:      20      — minutes before 13:30 UTC to start protection
+  cpi_window_post:     45      — minutes after 13:30 UTC before resuming
+  avoid_rate_day:      true    — reduce size on rate-decision Thursdays
+  rate_day_size_mult:  0.60    — lot multiplier during rate-day window
+  rate_day_start_hm:   660     — 11:00 UTC in minutes-since-midnight
+  rate_day_end_hm:     810     — 13:30 UTC in minutes-since-midnight
+  news_size_mult:      0.50    — generic fallback size multiplier
 
 Usage:
     result = check_news(cfg, now_utc)
@@ -53,6 +62,16 @@ def _first_friday(year: int, month: int) -> date:
     raise ValueError(f"No Friday in {year}-{month}")   # should never happen
 
 
+def _second_tuesday(year: int, month: int) -> date:
+    """Return the date of the second Tuesday in the given year/month."""
+    tuesdays = [
+        week[calendar.TUESDAY]
+        for week in calendar.monthcalendar(year, month)
+        if week[calendar.TUESDAY] != 0
+    ]
+    return date(year, month, tuesdays[1])
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def check_news(cfg: object, now_utc: datetime) -> NewsGuardResult:
@@ -62,13 +81,19 @@ def check_news(cfg: object, now_utc: datetime) -> NewsGuardResult:
     Returns NewsGuardResult with safe=False when execution should be blocked,
     or safe=True with size_mult < 1.0 when size should be reduced.
     """
-    news         = getattr(cfg, "news", None)
-    avoid_nfp    = bool(getattr(news, "avoid_nfp",      True))
-    avoid_fomc   = bool(getattr(news, "avoid_fomc",     True))
-    nfp_pre      = int(getattr(news,  "nfp_window_pre",  15))
-    nfp_post     = int(getattr(news,  "nfp_window_post", 30))
-    fomc_mult    = float(getattr(news, "fomc_size_mult",  0.50))
-    news_mult    = float(getattr(news, "news_size_mult",  0.50))
+    news              = getattr(cfg, "news", None)
+    avoid_nfp         = bool(getattr(news,  "avoid_nfp",           True))
+    avoid_fomc        = bool(getattr(news,  "avoid_fomc",           True))
+    avoid_cpi         = bool(getattr(news,  "avoid_cpi",            True))
+    avoid_rate_day    = bool(getattr(news,  "avoid_rate_day",       True))
+    nfp_pre           = int(getattr(news,   "nfp_window_pre",       20))
+    nfp_post          = int(getattr(news,   "nfp_window_post",      45))
+    cpi_pre           = int(getattr(news,   "cpi_window_pre",       20))
+    cpi_post          = int(getattr(news,   "cpi_window_post",      45))
+    fomc_mult         = float(getattr(news, "fomc_size_mult",       0.50))
+    rate_day_mult     = float(getattr(news, "rate_day_size_mult",   0.60))
+    rate_day_start_hm = int(getattr(news,   "rate_day_start_hm",   660))   # 11:00 UTC
+    rate_day_end_hm   = int(getattr(news,   "rate_day_end_hm",     810))   # 13:30 UTC
 
     h       = now_utc.hour
     m       = now_utc.minute
@@ -88,19 +113,37 @@ def check_news(cfg: object, now_utc: datetime) -> NewsGuardResult:
             post_hm  = nfp_hm + nfp_post
             if pre_hm <= hm <= post_hm:
                 phase  = "PRE" if hm < nfp_hm else "POST"
-                reason = (
-                    f"NFP {phase}-release | 13:30 UTC ±{nfp_pre}/{nfp_post} min"
-                )
+                reason = f"NFP {phase}-release | 13:30 UTC ±{nfp_pre}/{nfp_post} min"
                 log.warning(
                     "[NEWS FILTER] [HIGH IMPACT EVENT] [TRADING PAUSED FOR NEWS] "
                     "NFP %s window | %s",
                     phase, reason,
                 )
                 return NewsGuardResult(
-                    safe       = False,
-                    size_mult  = 0.0,
-                    event_type = "NFP",
-                    reason     = reason,
+                    safe=False, size_mult=0.0, event_type="NFP", reason=reason,
+                )
+
+    # ── CPI: Second Tuesday of each month, 13:30 UTC ─────────────────────────
+    if avoid_cpi and weekday == 1:   # Tuesday
+        try:
+            cpi_date = _second_tuesday(now_utc.year, now_utc.month)
+        except (IndexError, ValueError):
+            cpi_date = None
+
+        if cpi_date is not None and now_utc.date() == cpi_date:
+            cpi_hm  = 13 * 60 + 30
+            pre_hm  = cpi_hm - cpi_pre
+            post_hm = cpi_hm + cpi_post
+            if pre_hm <= hm <= post_hm:
+                phase  = "PRE" if hm < cpi_hm else "POST"
+                reason = f"CPI {phase}-release | 13:30 UTC ±{cpi_pre}/{cpi_post} min"
+                log.warning(
+                    "[NEWS FILTER] [HIGH IMPACT EVENT] [TRADING PAUSED FOR NEWS] "
+                    "CPI %s window | %s",
+                    phase, reason,
+                )
+                return NewsGuardResult(
+                    safe=False, size_mult=0.0, event_type="CPI", reason=reason,
                 )
 
     # ── FOMC risk window: Wednesdays 17:45–20:00 UTC ─────────────────────────
@@ -118,10 +161,22 @@ def check_news(cfg: object, now_utc: datetime) -> NewsGuardResult:
                 reason, fomc_mult * 100,
             )
             return NewsGuardResult(
-                safe       = True,
-                size_mult  = fomc_mult,
-                event_type = "FOMC_RISK",
-                reason     = reason,
+                safe=True, size_mult=fomc_mult, event_type="FOMC_RISK", reason=reason,
+            )
+
+    # ── Rate day: Thursdays, ECB/BoE decision window 11:00–13:30 UTC ─────────
+    # Covers ECB (13:15 UTC) and BoE (12:00 UTC) interest rate announcements.
+    # Not every Thursday has a decision; conservative approach reduces size.
+    if avoid_rate_day and weekday == 3:   # Thursday
+        if rate_day_start_hm <= hm < rate_day_end_hm:
+            reason = f"Rate-day window | Thu {rate_day_start_hm//60:02d}:{rate_day_start_hm%60:02d}-{rate_day_end_hm//60:02d}:{rate_day_end_hm%60:02d} UTC"
+            log.warning(
+                "[NEWS FILTER] [HIGH IMPACT EVENT] Rate-day window active | %s | "
+                "size=%.0f%%",
+                reason, rate_day_mult * 100,
+            )
+            return NewsGuardResult(
+                safe=True, size_mult=rate_day_mult, event_type="RATE_DAY", reason=reason,
             )
 
     return NewsGuardResult(

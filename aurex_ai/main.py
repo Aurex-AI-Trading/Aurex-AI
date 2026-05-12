@@ -49,7 +49,8 @@ from aurex_ai.execution.risk_manager     import calculate as calc_risk
 from aurex_ai.execution.cooldown_manager import CooldownManager
 from aurex_ai.execution.trade_executor   import execute, TradeResult, _load_allowed_symbols
 from aurex_ai.execution.confidence_engine import (
-    compute_confidence, MIN_TRADE_CONFIDENCE, get_confidence_threshold,
+    compute_confidence, MIN_TRADE_CONFIDENCE,
+    get_confidence_threshold, get_symbol_confidence_threshold,
 )
 from aurex_ai.execution.trade_manager    import TradeManager
 from aurex_ai.execution.reentry_tracker  import ReEntryTracker, ClosedTrade
@@ -143,6 +144,19 @@ def _derive_setup_type(fvg_present: bool, ob_present: bool, sweep_detected: bool
     if sweep_detected:
         return "Sweep"
     return "Trend"
+
+
+def _confidence_weakest(cs) -> str:
+    """Return the 2 lowest-scoring confidence components as a formatted string."""
+    parts = [
+        ("trend",      cs.trend,      25),
+        ("momentum",   cs.momentum,   20),
+        ("structure",  cs.structure,  20),
+        ("volatility", cs.volatility, 15),
+        ("entry",      cs.entry,      20),
+    ]
+    ranked = sorted(parts, key=lambda x: x[1] / x[2])
+    return ", ".join(f"{n}={v}/{mx}" for n, v, mx in ranked[:2])
 
 
 def _log_rejected(
@@ -1443,7 +1457,7 @@ async def scan_symbol(
         and symbol not in _pending_signals
     )
 
-    # ── AI Confidence pre-filter ──────────────────────────────────────────────
+    # ── AI Confidence pre-filter [Phase 7: Institutional-Grade Gate] ─────────
     confidence = compute_confidence(
         symbol      = symbol,
         candles_m15 = candles_m15,
@@ -1454,44 +1468,99 @@ async def scan_symbol(
     )
     _symbol_confidence_cache[symbol] = float(confidence.total)
 
-    _conf_min        = mode.min_confidence
-    _conf_adaptive   = get_confidence_threshold(current_time.hour, atr_pips)
-    _conf_threshold  = max(_conf_adaptive, _conf_min)
+    # Layer 1: mode minimum (aggressive=62 / conservative=60)
+    _conf_min      = mode.min_confidence
 
-    # Confidence tier cap: even when the gate passes, borderline-confidence markets
-    # cap the maximum eligible tier so full position is not placed in uncertain conditions.
-    # confidence >= 55 → all tiers eligible (Tier 1 allowed)
-    # confidence 45–54 → Tier 2 cap (0.50× max) — valid setup, uncertain market
-    # Soft zone: 55-59 allows Tier1 but main flow applies 0.80× size penalty via the
-    # combined_size_mult path, so risk is still reduced without a hard tier cliff.
-    _CONF_FULL_TIER = 55
+    # Layer 2: adaptive market-state threshold (40–58; higher when ATR dead or off-hours)
+    _conf_adaptive = get_confidence_threshold(current_time.hour, atr_pips)
+
+    # Layer 3: per-symbol institutional floor (gold=65, high-ATR FX=61-63, standard=60)
+    _conf_symbol   = get_symbol_confidence_threshold(symbol, current_time.hour, atr_pips, cfg)
+
+    # Effective threshold = strictest of all three layers
+    _conf_threshold = max(_conf_adaptive, _conf_min, _conf_symbol)
+
+    # Layer 4: AI adaptive learning modifier
+    # If a symbol has been underperforming (modifier < 1.0), raise the threshold.
+    # This dynamically tightens the gate for symbols with poor recent win rates.
+    _al_sym_mod  = adaptive_learning.get_symbol_modifier(symbol)   # 0.70–1.00
+    _al_sess_mod = adaptive_learning.get_session_modifier(current_time.hour)  # 0.75–1.00
+    # Underperformance penalty: modifier=0.70 → +12 pts; modifier=0.85 → +6 pts; modifier=1.0 → 0
+    _al_sym_penalty  = round((1.0 - _al_sym_mod)  * 40)   # max +12 at worst modifier
+    _al_sess_penalty = round((1.0 - _al_sess_mod) * 20)   # max +5 at worst session modifier
+    _al_penalty      = _al_sym_penalty + _al_sess_penalty
+    if _al_penalty > 0:
+        _conf_threshold += _al_penalty
+        log.info(
+            "[AI LEARNING] [CONFIDENCE GATE] %s AI modifiers applied | "
+            "sym_mod=%.2f→+%d sess_mod=%.2f→+%d total_penalty=+%d → threshold=%d",
+            symbol, _al_sym_mod, _al_sym_penalty, _al_sess_mod, _al_sess_penalty,
+            _al_penalty, _conf_threshold,
+        )
+
+    # Layer 5: session intelligence — stricter confidence required in weaker sessions
+    # London open (07:00-08:59 UTC): spreads wide, institutional orders still settling
+    # NY pure    (16:00-20:59 UTC): post-overlap lower liquidity and higher chop
+    _sess_cfg_p7    = getattr(cfg, "session", None)
+    _utc_h          = current_time.hour
+    _sess_conf_adj  = 0
+    if 7 <= _utc_h < 9:
+        _sess_conf_adj = int(getattr(_sess_cfg_p7, "london_open_conf_penalty", 3))
+        log.info("[SESSION INTELLIGENCE] %s London-open conf penalty=+%d (07:00-08:59 UTC)",
+                 symbol, _sess_conf_adj)
+    elif 16 <= _utc_h < 21:
+        _sess_conf_adj = int(getattr(_sess_cfg_p7, "newyork_conf_penalty", 4))
+        log.info("[SESSION INTELLIGENCE] %s NY-pure conf penalty=+%d (16:00-20:59 UTC)",
+                 symbol, _sess_conf_adj)
+    _conf_threshold += _sess_conf_adj
+
+    # Confidence tier cap [Phase 7]: raised from 55→65
+    # confidence >= 65 → all tiers eligible (Tier 1 allowed — genuinely strong market)
+    # confidence 60–64 → Tier 2 cap (0.50× max) — valid setup, sub-optimal conditions
+    _CONF_FULL_TIER = 65
     _conf_tier_cap  = 1 if confidence.total >= _CONF_FULL_TIER else 2
 
+    _conf_verdict = (
+        "PASS" if confidence.total >= _conf_threshold
+        else f"REJECT (score {confidence.total} < threshold {_conf_threshold})"
+    )
     log.warning(
         "\n[CONFIDENCE DEBUG] %s\n"
-        "  score       = %d  (threshold=%d  adaptive=%d  min_conf=%d)\n"
+        "  score       = %d  (verdict=%s)\n"
         "  trend       = %d /25\n"
         "  momentum    = %d /20\n"
         "  structure   = %d /20\n"
         "  volatility  = %d /15  (atr=%.1f pips)\n"
         "  entry       = %d /20  (ema_proximity)\n"
-        "  session     = utc_hour=%d\n"
-        "  tier_cap    = %s  (score >= %d -> Tier1 eligible)\n"
-        "  verdict     = %s",
+        "  ─── threshold breakdown ───────────────────\n"
+        "  mode_min    = %d  (aggressive/conservative)\n"
+        "  adaptive    = %d  (market-state gate)\n"
+        "  symbol_min  = %d  (per-symbol institutional floor)\n"
+        "  ai_penalty  = +%d (sym_mod=%.2f sess_mod=%.2f)\n"
+        "  sess_adj    = +%d (utc_hour=%d session=%s)\n"
+        "  THRESHOLD   = %d\n"
+        "  tier_cap    = Tier%d  (>=%d → Tier1 eligible)",
         symbol,
-        confidence.total, _conf_threshold, _conf_adaptive, _conf_min,
-        confidence.trend,
-        confidence.momentum,
-        confidence.structure,
-        confidence.volatility, atr_pips,
-        confidence.entry,
-        current_time.hour,
-        f"Tier{_conf_tier_cap}",   # always shows the effective tier cap (1 or 2)
-        _CONF_FULL_TIER,
-        "PASS" if confidence.total >= _conf_threshold else f"REJECT (score {confidence.total} < threshold {_conf_threshold})",
+        confidence.total, _conf_verdict,
+        confidence.trend, confidence.momentum, confidence.structure,
+        confidence.volatility, atr_pips, confidence.entry,
+        _conf_min, _conf_adaptive, _conf_symbol,
+        _al_penalty, _al_sym_mod, _al_sess_mod,
+        _sess_conf_adj, _utc_h,
+        ("london_open" if 7 <= _utc_h < 9 else "ny_pure" if 16 <= _utc_h < 21 else "london_core"),
+        _conf_threshold,
+        _conf_tier_cap, _CONF_FULL_TIER,
     )
 
     if confidence.total < _conf_threshold:
+        log.warning(
+            "[CONFIDENCE REJECT] %s | score=%d < threshold=%d | "
+            "weakest components: %s | "
+            "mode=%d sym=%d ai=+%d sess=+%d",
+            symbol, confidence.total, _conf_threshold,
+            _confidence_weakest(confidence),
+            _conf_min, _conf_symbol, _al_penalty, _sess_conf_adj,
+        )
         if _fallback_ready:
             return await _fallback_pipeline(
                 symbol, candles_m15, price, pip,

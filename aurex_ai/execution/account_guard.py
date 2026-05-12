@@ -302,7 +302,8 @@ class AccountGuard:
             reason = f"consecutive_losses={consec}/{self.consec_halt}"
             self._halt(reason)
             log.warning(
-                "[CONSECUTIVE LOSS LIMIT] %d consecutive losses — trading paused until next UTC day",
+                "[CONSECUTIVE LOSS LIMIT] [LOSS STREAK PAUSE] %d consecutive losses — "
+                "trading paused until next UTC day",
                 consec,
             )
             log.warning("[TRADING PAUSED] reason=%s", reason)
@@ -320,7 +321,7 @@ class AccountGuard:
                 )
                 self._halt(reason)
                 log.warning(
-                    "[DAILY LOSS LIMIT] Daily drawdown %.2f%% >= %.1f%% limit — "
+                    "[DAILY LOSS LIMIT] [DAILY DRAWDOWN HIT] Daily drawdown %.2f%% >= %.1f%% limit — "
                     "trading paused until next UTC day",
                     daily_dd, self.daily_dd_halt,
                 )
@@ -340,8 +341,8 @@ class AccountGuard:
                 )
                 self._halt(reason)
                 log.warning(
-                    "[MAX DD HIT] Total drawdown %.2f%% >= %.1f%% from peak %.2f — "
-                    "trading paused until next UTC day",
+                    "[MAX DD HIT] [EQUITY PROTECTION ACTIVATED] Total drawdown %.2f%% >= %.1f%% "
+                    "from peak %.2f — trading paused until next UTC day",
                     total_dd, self.total_dd_halt, peak_eq,
                 )
                 log.warning("[TRADING PAUSED] reason=%s", reason)

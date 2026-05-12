@@ -27,7 +27,7 @@ risk:
   min_rr:              2.0     # minimum RR — TP is always ATR×3.0/SL×1.5 = 2.0; floor ensures this
   max_open_trades:     1       # LIVE CAPITAL PROTECTION: 1 trade at a time
   max_open_per_symbol: 1       # max concurrent positions per individual symbol
-  max_daily_trades:    3       # 5 symbols — 3 trades/day still conservative; was 2
+  max_daily_trades:    2       # institutional discipline: 2 high-quality trades > 3 marginal ones
   max_lot_size:        0.05    # safety cap — 0.0 means no cap
   max_daily_loss_pct:  8.0     # halt at 8% daily DD (tighter than 10% — protect capital)
   max_trade_risk_pct:  15.0    # survivability cap: micro-account floor.
@@ -218,9 +218,9 @@ trade_management:
 guard:
   consecutive_loss_halt:   3       # halt all trading after N consecutive losses (resets next UTC day)
   consecutive_loss_reduce: 2       # reduce lot size to 50% at N consecutive losses
-  daily_dd_halt_pct:       5.0     # halt when daily equity drawdown reaches this % (vs session open)
-  daily_dd_reduce_pct:     2.5     # reduce to 50% lot when daily DD reaches this % (50% of halt level)
-  total_dd_halt_pct:       12.0    # halt when total equity drawdown from all-time peak reaches this %
+  daily_dd_halt_pct:       4.0     # halt when daily equity drawdown reaches this % (tightened: was 5.0)
+  daily_dd_reduce_pct:     2.0     # reduce to 50% lot when daily DD reaches this % (tightened: was 2.5)
+  total_dd_halt_pct:       10.0    # halt when total equity drawdown from all-time peak reaches this % (was 12.0)
   small_account_balance:   2000.0  # ZAR balance below which small-account conservative limits apply
 
 # ── Testing ───────────────────────────────────────────────────
@@ -237,9 +237,31 @@ session:
   block_overlap:        true   # block all new entries 13:00–15:59 UTC
   overlap_start_hour:   13     # inclusive
   overlap_end_hour:     16     # exclusive (16:00 = first allowed NY pure hour)
-  # Phase 5: Session quality multipliers
+  # Phase 5: Session quality multipliers (size penalties)
   london_quality:       1.00   # full participation 07-13 UTC (highest institutional flow)
   newyork_quality:      0.90   # slight reduction 16-21 UTC (post-overlap lower liquidity)
+  # [Phase 7] Session intelligence: confidence threshold adjustments
+  # Raises the bar during statistically weaker periods.
+  # London core (09-13 UTC): prime institutional window — no adjustment (base threshold)
+  # London open (07-09 UTC): spreads wide, volatility spiking — +3 confidence required
+  # NY pure   (16-21 UTC): lower liquidity, more choppy — +4 confidence required
+  london_open_conf_penalty:  3    # extra confidence pts required 07:00-08:59 UTC
+  newyork_conf_penalty:      4    # extra confidence pts required 16:00-20:59 UTC
+
+# ── Per-symbol minimum confidence thresholds [Phase 7] ───────────────────────
+# Applied on top of mode.min_confidence. The higher value wins.
+# Gold requires strictest gate: high ATR + extreme false-break frequency.
+# High-ATR FX pairs require slightly stricter gates than low-volatility pairs.
+per_symbol:
+  XAUUSD:   65    # Gold — very strict; 65 minimum regardless of mode
+  GBPUSD:   63    # High-ATR GBP pair — stricter gate
+  GBPJPY:   63    # High-ATR cross — hardest to predict direction
+  USDJPY:   61    # Yen carry pair — sometimes correlated, slightly stricter
+  EURUSD:   61    # Deepest liquidity — still needs strong confirmation
+  AUDUSD:   60    # Commodity correlated — standard gate
+  USDCAD:   60    # Oil correlated — standard gate
+  NZDUSD:   60    # Lower volatility — standard gate
+  USDCHF:   60    # Safe-haven — standard gate
 
 # ── Trading mode gate presets ─────────────────────────────────
 # These override the individual strategy/risk/scoring values at runtime.
@@ -264,16 +286,17 @@ modes:
   aggressive:
     # ── Quality-Aggressive: small account survivability (R500/$30) ────────────
     # "Aggressive" = aggressive filtering, NOT aggressive entry frequency.
-    # Every threshold raised to require genuine institutional confirmation.
+    # Phase 7: All thresholds raised — only genuinely institutional setups execute.
+    # Fewer trades, higher quality, better drawdown control.
     # Tier 3 disabled. Session gate enforced at pipeline level.
-    min_confidence:      52     # stricter market-readiness floor
+    min_confidence:      62     # [Phase 7] institutional market-readiness floor (was 52)
     min_atr_pips:        5.0    # 5 pips is the dead-market absolute floor
     atr_optimal_max_pips: 35    # cap high-volatility ceiling (news/spike protection)
-    min_core_score:      35.0   # requires trend + at least one institutional factor
+    min_core_score:      38.0   # [Phase 7] requires trend + at least two institutional factors (was 35)
     min_execution_tier:  2      # TIER 3 ELIMINATED (0.25× lot, no quality edge)
-    tier1:               65     # A+ setups only for full lot execution
-    tier2:               52     # B+ setups for half lot execution
-    tier3:               42     # blocked by min_execution_tier=2 anyway
+    tier1:               70     # [Phase 7] A+ setups only for full lot execution (was 65)
+    tier2:               62     # [Phase 7] B+ setups for half lot — must pass confidence gate first (was 52)
+    tier3:               48     # blocked by min_execution_tier=2 anyway
     weights:
       # Phase 3: trend continuation + pullback system — trend, EMA, Fib dominate.
       # Liquidity reduced (still valuable but doesn't need to dominate).
@@ -287,14 +310,14 @@ modes:
       confirmation:  4   # candle pattern confirms but doesn't lead; reduced weight
 
   conservative:
-    min_confidence:      50
+    min_confidence:      60     # [Phase 7] raised from 50
     min_atr_pips:       10.0
     atr_optimal_max_pips: 25   # HIGH zone above 25 pips: block (news/spike risk)
-    min_core_score:     35.0
+    min_core_score:     38.0   # [Phase 7] raised from 35
     min_execution_tier:  2
-    tier1:               60
-    tier2:               50
-    tier3:               35
+    tier1:               68     # [Phase 7] raised from 60
+    tier2:               60     # [Phase 7] raised from 50
+    tier3:               48     # blocked by min_execution_tier=2 anyway
     # weights: omitted → learning engine provides adaptive weights
 
 # ── Spread control (Phase 5) ──────────────────────────────────────────────────
@@ -305,17 +328,26 @@ spread:
   max_ratio:    0.20    # spread/ATR > this → size reduced to 60-80%
   block_ratio:  0.35    # spread/ATR > this → execution blocked entirely
 
-# ── News protection (Phase 5) ─────────────────────────────────────────────────
+# ── News protection (Phase 5 + Phase 7) ──────────────────────────────────────
 # Lightweight protection against high-impact economic releases.
 # No external API required — uses deterministic UTC time patterns.
 news:
   avoid_nfp:         true    # block NFP window (1st Friday, 13:30 UTC ±window)
-  nfp_window_pre:    15      # minutes before NFP release to start protection
-  nfp_window_post:   30      # minutes after NFP release before resuming
+  nfp_window_pre:    20      # [Phase 7] minutes before NFP — extended from 15
+  nfp_window_post:   45      # [Phase 7] minutes after NFP recovery — extended from 30
   avoid_fomc:        true    # reduce size Wednesday 17:45–20:00 UTC (FOMC risk)
   fomc_size_mult:    0.50    # lot multiplier during FOMC risk window
   avoid_rollover:    false   # rollover is outside session gate — redundant but available
   news_size_mult:    0.50    # generic fallback size reduction during news events
+  # [Phase 7] US CPI — 2nd Tuesday of each month, 13:30 UTC
+  avoid_cpi:         true    # block CPI release window
+  cpi_window_pre:    20      # minutes before CPI release
+  cpi_window_post:   45      # minutes after CPI release before resuming
+  # [Phase 7] Central bank rate decisions — BOE/ECB typically Thursdays
+  avoid_rate_day:    true    # reduce size during Thursday rate-decision window
+  rate_day_size_mult: 0.60   # lot multiplier on rate decision days
+  rate_day_start_hm:  660    # 11:00 UTC in minutes (660 = 11×60)
+  rate_day_end_hm:    810    # 13:30 UTC in minutes (810 = 13×60+30)
 
 # ── Phase 6: AI Adaptive Learning ────────────────────────────────────────────
 # Controls the AdaptiveLearning engine's rolling-window analysis and
