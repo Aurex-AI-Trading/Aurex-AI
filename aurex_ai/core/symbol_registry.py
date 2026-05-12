@@ -1,5 +1,5 @@
 """
-Aurex AI — Centralized Symbol Registry  (Phase 6)
+Aurex AI — Centralized Symbol Registry  (Phase 6 + Phase 10)
 
 Single source of truth for all supported trading instruments.
 
@@ -11,6 +11,18 @@ Per-symbol profiles carry volatility class, ATR behaviour, preferred sessions,
 RR guidance, and spread tolerance so the rest of the codebase can query one
 place instead of scattering if-XAU logic everywhere.
 
+Extended fields (Phase 10 — institutional pair intelligence):
+  • min_atr_pips      — hard minimum ATR floor (overrides global setting)
+  • ideal_atr_min     — lower bound of ideal trading ATR range
+  • ideal_atr_max     — upper bound of ideal trading ATR range (above = spike/news risk)
+  • max_atr_pips      — hard ATR ceiling (block trade; too volatile to trade safely)
+  • lot_mult_cap      — max lot multiplier for this symbol (1.0 = no extra cap)
+  • execution_style   — "momentum_trend" | "trend_continuation" | "range_revert"
+  • scoring_modifiers — dict: factor → multiplier adjustment (1.0 = no change)
+  • regime_mult       — dict: market_state → exec_mult override (None = use default)
+  • priority_sessions — sessions where this pair has historically highest WR
+  • block_sessions    — sessions to hard-block (Asian for crosses, etc.)
+
 Public API
 ----------
     get_broker_symbol(base, broker_suffix)  → str   e.g. "XAUUSD" or "EURUSD.Z"
@@ -19,11 +31,15 @@ Public API
     is_no_suffix(base)                      → bool  True for gold / bare symbols
     validate_symbol_name(symbol)            → bool  True if in registry
     log_registry_summary(broker_suffix)     → None  startup banner
+    get_atr_gates(symbol)                   → tuple (min, ideal_min, ideal_max, max)
+    get_lot_mult_cap(symbol)                → float
+    get_regime_mult(symbol, state)          → float | None
 
 Tags emitted
 ------------
     [SYMBOL INIT]  [SYMBOL VALIDATION]  [MARKET WATCH SYNC]  [SYMBOL EXECUTION READY]
     [SYMBOL PROFILE]  [PAIR INTELLIGENCE]  [SYMBOL VERIFIED]
+    [GBPJPY PROFILE]  [GBPJPY QUALITY]
 """
 from __future__ import annotations
 
@@ -154,6 +170,99 @@ SYMBOL_CONFIG: Dict[str, dict] = {
         "pip_size":           0.0001,
         "notes":              "Safe-haven flow. Active in London. CHF spikes on risk events.",
     },
+
+    # ── Phase 10: GBPJPY Institutional Intelligence Profile ───────────────────
+    # GBPJPY is the highest-ATR actively-traded FX cross.  It combines GBP
+    # institutional momentum (London-dominated) with JPY risk-on/off flows.
+    # Result: explosive trends when both currencies agree; dangerous whipsaw
+    # when they diverge.  The edge is EXCLUSIVELY momentum continuation in
+    # clearly-trending markets during London/Overlap sessions.
+    #
+    # DO NOT treat this pair like EURUSD.  ATR thresholds, spread tolerances,
+    # session restrictions, and lot caps all require bespoke calibration.
+    #
+    # Live analytics: GBPJPY.Z = +40.0 score (strong positive expected value).
+    # This profile unlocks that edge while protecting capital in adverse conditions.
+    "GBPJPY": {
+        # ── Core registry fields ──────────────────────────────────────────────
+        "no_suffix":          False,
+        "type":               "forex_cross",   # cross pair — no direct USD leg
+        "volatility":         "very_high",     # highest ATR of any major cross
+        "atr_profile":        "expanded",      # M15 ATR typically 15-60 pips
+        "rr_standard":        2.0,             # wider TP needed to accommodate ATR
+        "rr_high_conf":       3.0,             # exceptional trending setups: 3R target
+        "spread_warn_pips":   4.0,             # GBP+JPY spread stacks; warn at 4 pips
+        "spread_block_pips":  9.0,             # rollover/news spike ceiling: hard block
+        "sessions":           ["london", "overlap"],  # priority sessions
+        "pip_size":           0.01,            # JPY pairs: 0.01 pip (not 0.0001)
+        "notes": (
+            "Highest-ATR major FX cross. MOMENTUM_TREND execution only. "
+            "London/Overlap sessions exclusively. Block Asian session. "
+            "Block RANGING/COMPRESSION regimes — ATR collapse = whipsaw trap. "
+            "Wide SL required; use full ATR-adaptive sizing (no hard pips cap). "
+            "OB+Trend is the primary edge; pure breakout is a trap on this pair."
+        ),
+
+        # ── ATR gates (Phase 10 extended fields) ─────────────────────────────
+        # min_atr_pips: below this = Asian dead session / institutional liquidity absent
+        # ideal_atr_min/max: sweet spot — enough momentum, not spike/news territory
+        # max_atr_pips: above this = news/spike; execution blocked
+        "min_atr_pips":       12.0,    # must have at least 12 pips ATR to trade
+        "ideal_atr_min":      18.0,    # healthy momentum starts here
+        "ideal_atr_max":      55.0,    # above 55 = risky spike territory; reduce size
+        "max_atr_pips":       100.0,   # above 100 = flash crash / extreme news; hard block
+
+        # ── Lot multiplier cap ────────────────────────────────────────────────
+        # GBPJPY extreme ATR means dollar risk is very high per pip.
+        # Cap the lot multiplier at 0.85 to avoid runaway exposure on volatile entries.
+        "lot_mult_cap":       0.85,
+
+        # ── Execution style ───────────────────────────────────────────────────
+        "execution_style":    "momentum_trend",   # OB+Trend, no counter-trend
+
+        # ── Scoring modifiers ─────────────────────────────────────────────────
+        # Applied multiplicatively to factor weights in the confluence engine.
+        # Values > 1.0 increase the effective weight; < 1.0 reduce it.
+        # These reflect what actually works on GBPJPY based on market microstructure:
+        #   - Trend alignment is MANDATORY (directional conviction is the edge)
+        #   - Order block confirms institutional order flow (strongest on crosses)
+        #   - FVG valid in London/Overlap where filling is fast
+        #   - Breakout: weak without OB or Fib — demoted
+        #   - Fibonacci: important for entry timing on continuation pullbacks
+        "scoring_modifiers": {
+            "trend":         1.20,   # +20%: directional commitment is the primary edge
+            "order_block":   1.15,   # +15%: institutional flow confirmation essential
+            "fvg":           1.10,   # +10%: valid in London/Overlap sessions
+            "fibonacci":     1.10,   # +10%: pullback timing on momentum legs
+            "liquidity":     1.05,   # +5%:  sweep of swing highs/lows = acceleration signal
+            "ema":           1.00,   # neutral: EMA proximity scoring unchanged
+            "confirmation":  1.00,   # neutral: candle confirmation unchanged
+            "breakout":      0.60,   # -40%: pure breakouts without OB/Fib often fail
+        },
+
+        # ── Market regime execution multiplier overrides ──────────────────────
+        # For most pairs the global market_state.exec_mult applies.
+        # GBPJPY needs stricter overrides because its volatility makes regime
+        # mismatches far more costly than on EURUSD-class pairs.
+        #   TRENDING:              1.00  (home territory — full size)
+        #   VOLATILE_EXPANSION:    0.65  (extra caution vs global 0.70; gap risk)
+        #   RANGING:               0.00  (hard block; GBPJPY chop is savage)
+        #   VOLATILITY_COMPRESSION: 0.00 (coiling → direction unknown; avoid)
+        #   REVERSAL_ENVIRONMENT:  0.50  (risky but sometimes valid with full OB)
+        #   DEAD:                  0.00  (standard)
+        "regime_mult": {
+            "TRENDING":               1.00,
+            "VOLATILE_EXPANSION":     0.65,
+            "RANGING":                0.00,   # hard block — identical to EURUSD treatment
+            "VOLATILITY_COMPRESSION": 0.00,   # block: breakout direction unknown
+            "REVERSAL_ENVIRONMENT":   0.50,
+            "DEAD":                   0.00,
+        },
+
+        # ── Session restrictions ──────────────────────────────────────────────
+        "priority_sessions":  ["overlap", "london"],   # highest-WR execution windows
+        "block_sessions":     ["asian"],               # Asian session = thin JPY + wide spread
+    },
 }
 
 # Fast lookup sets derived once at module load
@@ -244,6 +353,74 @@ def get_spread_thresholds(symbol: str) -> tuple[float, float]:
     )
 
 
+def get_atr_gates(symbol: str) -> tuple[float, float, float, float]:
+    """
+    Return (min_atr_pips, ideal_atr_min, ideal_atr_max, max_atr_pips) for a symbol.
+
+    Phase 10 extended field — only populated for symbols with bespoke ATR profiles
+    (currently GBPJPY).  Falls back to sensible global defaults for all others.
+
+    Returns:
+        min_atr_pips   — hard floor: below this the market is dead / sleeping
+        ideal_atr_min  — lower bound of the ideal trading ATR range
+        ideal_atr_max  — upper bound: above this apply size reduction
+        max_atr_pips   — hard ceiling: above this block execution entirely
+    """
+    profile = get_profile(symbol)
+    return (
+        float(profile.get("min_atr_pips",   6.0)),
+        float(profile.get("ideal_atr_min",  8.0)),
+        float(profile.get("ideal_atr_max", 40.0)),
+        float(profile.get("max_atr_pips", 200.0)),
+    )
+
+
+def get_lot_mult_cap(symbol: str) -> float:
+    """
+    Return the per-symbol lot-multiplier cap.
+
+    Phase 10: GBPJPY uses 0.85 to limit exposure on its extreme ATR.
+    All other symbols default to 1.0 (no extra cap beyond the global 1.5× guard).
+    """
+    profile = get_profile(symbol)
+    return float(profile.get("lot_mult_cap", 1.0))
+
+
+def get_regime_mult(symbol: str, market_state: str) -> Optional[float]:
+    """
+    Return a symbol-specific execution multiplier for the given market regime.
+
+    Phase 10: GBPJPY has bespoke regime gates (e.g. RANGING=0.0 hard block,
+    VOLATILITY_COMPRESSION=0.0).  Returns None for symbols without overrides
+    (caller should fall back to the global market_state.exec_mult).
+
+    Args:
+        symbol:       Instrument name (base or broker-suffixed).
+        market_state: State string from MarketStateResult.state.
+
+    Returns:
+        float override if the symbol has a bespoke gate for this state.
+        None if no override — caller uses market_state.exec_mult directly.
+    """
+    profile = get_profile(symbol)
+    regime_map: dict = profile.get("regime_mult", {})
+    val = regime_map.get(market_state)
+    if val is None:
+        return None
+    return float(val)
+
+
+def get_scoring_modifiers(symbol: str) -> dict:
+    """
+    Return the per-symbol factor scoring modifiers dict.
+
+    Phase 10: GBPJPY has bespoke modifiers (trend +20%, breakout -40%, etc.).
+    Returns {} for symbols without overrides (no modification applied).
+    """
+    profile = get_profile(symbol)
+    return dict(profile.get("scoring_modifiers", {}))
+
+
 def log_registry_summary(broker_suffix: str) -> None:
     """
     Emit a startup banner listing all registered symbols and their broker names.
@@ -273,11 +450,78 @@ def log_registry_summary(broker_suffix: str) -> None:
 
 
 def log_symbol_profile(symbol: str) -> None:
-    """Log the profile for a single symbol at scan startup."""
+    """
+    Log the profile for a single symbol at scan startup.
+
+    Phase 10: GBPJPY emits an extended [GBPJPY PROFILE] institutional banner
+    instead of the generic one-liner, reflecting its bespoke intelligence profile.
+    """
     profile = get_profile(symbol)
     if not profile:
-        log.warning("[SYMBOL PROFILE] %s — NOT IN REGISTRY [PAIR INTELLIGENCE UNAVAILABLE]", symbol)
+        log.warning(
+            "[SYMBOL PROFILE] %s — NOT IN REGISTRY [PAIR INTELLIGENCE UNAVAILABLE]",
+            symbol,
+        )
         return
+
+    from aurex_ai.core.symbol_mapper import strip_suffix
+    base = strip_suffix(symbol).upper()
+
+    if base == "GBPJPY":
+        # ── GBPJPY extended institutional banner ──────────────────────────────
+        _mod = profile.get("scoring_modifiers", {})
+        _regime = profile.get("regime_mult", {})
+        log.warning(
+            "\n"
+            "  ┌──────────────────────────────────────────────────────────────┐\n"
+            "  │                  GBPJPY PROFILE                              │\n"
+            "  │              INSTITUTIONAL PAIR INTELLIGENCE                 │\n"
+            "  ├──────────────────────────────────────────────────────────────┤\n"
+            "  │  Volatility     : %-42s│\n"
+            "  │  ATR Profile    : %-42s│\n"
+            "  │  ATR Gates      : %-42s│\n"
+            "  │  Spread         : %-42s│\n"
+            "  │  Sessions       : %-42s│\n"
+            "  │  Block Sessions : %-42s│\n"
+            "  │  RR Profile     : %-42s│\n"
+            "  │  Lot Mult Cap   : %-42s│\n"
+            "  │  Execution      : %-42s│\n"
+            "  │  Pip Size       : %-42s│\n"
+            "  ├──────────────────────────────────────────────────────────────┤\n"
+            "  │  Scoring Modifiers (vs baseline):                            │\n"
+            "  │    trend=%.2f× ob=%.2f× fib=%.2f× liquidity=%.2f× breakout=%.2f×  │\n"
+            "  ├──────────────────────────────────────────────────────────────┤\n"
+            "  │  Regime Gates:                                               │\n"
+            "  │    TRENDING=%.2f  RANGING=%.2f  VOLATILE_EXP=%.2f            │\n"
+            "  │    COMPRESSION=%.2f  REVERSAL=%.2f                           │\n"
+            "  └──────────────────────────────────────────────────────────────┘",
+            "VERY HIGH (highest ATR major cross)",
+            "EXPANDED (15-60 pips M15 ATR typical)",
+            f"min={profile.get('min_atr_pips',12):.0f} ideal={profile.get('ideal_atr_min',18):.0f}-{profile.get('ideal_atr_max',55):.0f} max={profile.get('max_atr_pips',100):.0f} pips",
+            f"warn≥{profile.get('spread_warn_pips',4):.0f} block≥{profile.get('spread_block_pips',9):.0f} pips",
+            " / ".join(profile.get("priority_sessions", [])).upper(),
+            " / ".join(profile.get("block_sessions", [])).upper(),
+            f"standard={profile.get('rr_standard',2.0):.1f}R  high-conf={profile.get('rr_high_conf',3.0):.1f}R",
+            f"{profile.get('lot_mult_cap',0.85):.2f}× (ATR-risk cap)",
+            str(profile.get("execution_style","momentum_trend")).upper(),
+            f"0.01 (JPY pair — 100 pips = 1.00 price unit)",
+            _mod.get("trend",    1.0), _mod.get("order_block", 1.0),
+            _mod.get("fibonacci",1.0), _mod.get("liquidity",   1.0),
+            _mod.get("breakout", 1.0),
+            _regime.get("TRENDING",               1.00),
+            _regime.get("RANGING",                0.00),
+            _regime.get("VOLATILE_EXPANSION",     0.65),
+            _regime.get("VOLATILITY_COMPRESSION", 0.00),
+            _regime.get("REVERSAL_ENVIRONMENT",   0.50),
+        )
+        log.warning(
+            "[GBPJPY PROFILE] volatility=VERY_HIGH atr=EXPANDED(12-55pips) "
+            "spread=WIDE(warn4/block9) session=LONDON/OVERLAP mode=MOMENTUM_TREND "
+            "rr=2.0/3.0 lot_cap=0.85x",
+        )
+        return
+
+    # ── Generic one-liner for all other symbols ───────────────────────────────
     log.info(
         "[SYMBOL PROFILE] [PAIR INTELLIGENCE] %s | type=%s vol=%s atr=%s "
         "rr=%.1f/%.1f sessions=%s",

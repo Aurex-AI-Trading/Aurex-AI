@@ -74,6 +74,7 @@ from aurex_ai.core.symbol_registry import (
     log_symbol_profile   as _log_symbol_profile,
     get_profile          as _get_symbol_profile,
 )
+from aurex_ai.core.pair_intelligence import evaluate_symbol_quality as _eval_pair_quality
 from aurex_ai.core.failsafe  import Failsafe
 from aurex_ai.core.telemetry import Telemetry
 from aurex_ai.execution.execution_quality import ExecutionQualityEngine
@@ -1482,6 +1483,7 @@ async def scan_symbol(
     # Check spread/ATR ratio before running the expensive confluence pipeline.
     # Supplements the post-risk spread filter (which runs on the final lot/SL).
     _early_spread_mult = 1.0
+    _sp_pips           = 0.0   # hoisted — referenced later by pair intelligence
     if not feed._backtest and atr_pips > 0:
         try:
             _bid, _ask = await asyncio.to_thread(bridge.get_tick_raw, symbol)
@@ -1851,6 +1853,32 @@ async def scan_symbol(
         _log_rejected(symbol, f"REGIME_BLOCK_{_market_state.state}", atr=atr_pips)
         return None
 
+    # ── Pair intelligence (Phase 10) ─────────────────────────────────────────
+    # Symbol-specific quality gate: bespoke ATR range, absolute spread threshold,
+    # session restrictions, and per-symbol regime overrides.
+    # Example: GBPJPY RANGING → exec_mult=0.0 (stricter than global 0.80 default),
+    #          GBPJPY Asian   → hard block regardless of ATR or regime.
+    _pair_cond = _eval_pair_quality(
+        symbol       = symbol,
+        atr_pips     = atr_pips,
+        spread_pips  = _sp_pips,
+        utc_hour     = current_time.hour,
+        market_state = _market_state.state,
+        confidence   = confidence.total,
+    )
+    if not _pair_cond.allowed:
+        _bc = _pair_cond.block_reason.split(" | ")[0].upper().replace(" ", "_")
+        _log_rejected(symbol, f"PAIR_{_bc}", atr=atr_pips)
+        return None
+
+    # Apply symbol-specific regime override (e.g. GBPJPY VOLATILE_EXPANSION=0.65 vs global 0.70).
+    # None means no override — leave _market_mult from market_state.exec_mult unchanged.
+    if _pair_cond.exec_mult_override is not None:
+        _market_mult = _pair_cond.exec_mult_override
+
+    # ATR quality factor: 1.0 = ideal range, 0.80 = elevated spike zone, 0.75 = low momentum
+    _pair_atr_size_mult = _pair_cond.atr_size_mult
+
     # ── H1 trend bias + M5 entry timing ─────────────────────────────────────
     # H1 defines macro direction. M5 EMA20 is the entry timing signal.
     # Three outcomes: aligned (full size), near/recovering (size penalty), misaligned (skip).
@@ -2085,6 +2113,29 @@ async def scan_symbol(
     # weights (tuned for conservative gates) don't corrupt aggressive execution.
     # Conservative mode lets the learning engine self-tune weights normally.
     weights = mode.weights if mode.weights is not None else engine.get_weights()
+
+    # ── Pair scoring modifiers (Phase 10) ────────────────────────────────────
+    # Apply bespoke factor weight adjustments for symbols with institutional profiles.
+    # For GBPJPY: trend+20%, ob+15%, fvg+10%, fib+10%, breakout-40%.
+    # Fields not in the modifier dict are left unchanged (multiplier defaults to 1.0).
+    _pair_mods = _pair_cond.scoring_mods
+    if _pair_mods:
+        from dataclasses import replace as _dc_replace
+        weights = _dc_replace(
+            weights,
+            trend        = max(5,  round(weights.trend        * _pair_mods.get("trend",        1.0))),
+            liquidity    = max(5,  round(weights.liquidity    * _pair_mods.get("liquidity",    1.0))),
+            fvg          = max(5,  round(weights.fvg          * _pair_mods.get("fvg",          1.0))),
+            fibonacci    = max(5,  round(weights.fibonacci    * _pair_mods.get("fibonacci",    1.0))),
+            ema          = max(5,  round(weights.ema          * _pair_mods.get("ema",          1.0))),
+            confirmation = max(2,  round(weights.confirmation * _pair_mods.get("confirmation", 1.0))),
+            order_block  = max(5,  round(weights.order_block  * _pair_mods.get("order_block",  1.0))),
+        )
+        log.info(
+            "[PAIR SCORING MODS] %s | trend=%d liq=%d fvg=%d fib=%d ema=%d conf=%d ob=%d",
+            symbol, weights.trend, weights.liquidity, weights.fvg, weights.fibonacci,
+            weights.ema, weights.confirmation, weights.order_block,
+        )
 
     # Thresholds: mode values are the base; learning engine applies ±3 adaptive nudge.
     thresholds = engine.get_thresholds(
@@ -2467,20 +2518,32 @@ async def scan_symbol(
         * _early_spread_mult
         * _session_quality_mult
         * _news_mult
+        * _pair_atr_size_mult
         * _entry_timing_mult,
         2,
     )))
     log.warning(
         "[EXECUTION SCALING] %s %s | tier=%.2f opt=%.2f mtf_h4=%.2f m5=%.2f "
         "atr=%.2f quality=%.2f guard=%.2f market=%.2f(%s) "
-        "spread=%.2f session=%.2f news=%.2f timing=%.2f → combined=%.2f",
+        "spread=%.2f session=%.2f news=%.2f pair_atr=%.2f timing=%.2f → combined=%.2f",
         symbol, direction,
         decision.size_mult, opt.lot_mult, _mtf_h4_size_penalty,
         _m5_size_penalty, _atr_size_penalty, _quality_size_mult,
         guard_size_mult, _market_mult, _market_state.state,
-        _early_spread_mult, _session_quality_mult, _news_mult, _entry_timing_mult,
+        _early_spread_mult, _session_quality_mult, _news_mult,
+        _pair_atr_size_mult, _entry_timing_mult,
         combined_size_mult,
     )
+
+    # ── Per-symbol lot multiplier cap (Phase 10: GBPJPY=0.85, others=1.0) ────
+    if _pair_cond.lot_mult_cap < 1.0:
+        _pre_cap = combined_size_mult
+        combined_size_mult = round(min(combined_size_mult, _pair_cond.lot_mult_cap), 2)
+        if combined_size_mult < _pre_cap:
+            log.warning(
+                "[LOT CAP] %s pair_lot_cap=%.2f applied: %.2f → %.2f",
+                symbol, _pair_cond.lot_mult_cap, _pre_cap, combined_size_mult,
+            )
 
     # ── Dynamic RR assignment (Phase 5) ──────────────────────────────────────
     _sl_atr_mult     = float(getattr(cfg.strategy, "sl_atr_mult",      1.5))
