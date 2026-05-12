@@ -53,6 +53,7 @@ from aurex_ai.execution.confidence_engine import (
 from aurex_ai.execution.trade_manager    import TradeManager
 from aurex_ai.execution.reentry_tracker  import ReEntryTracker, ClosedTrade
 from aurex_ai.execution.adaptive_limits    import get_adaptive_limit
+from aurex_ai.execution.account_guard     import AccountGuard, cap_lot_multiplier
 
 from aurex_ai.ai.optimizer        import optimize as ai_optimize, Optimizer
 from aurex_ai.ai.learning_engine  import LearningEngine
@@ -1056,6 +1057,8 @@ async def scan_symbol(
     signal_id:        str  = "",
     now_utc:          Optional[datetime] = None,
     reentry_tracker:  Optional[ReEntryTracker] = None,
+    guard_size_mult:  float = 1.0,
+    guard:            Optional["AccountGuard"] = None,
 ) -> Optional[TradeResult]:
     """
     Run the full Aurex AI pipeline for a single symbol.
@@ -1872,7 +1875,7 @@ async def scan_symbol(
     )
 
     combined_size_mult = max(0.10, min(1.0, round(
-        decision.size_mult * opt.lot_mult * _mtf_h4_size_penalty * _m5_size_penalty, 2
+        decision.size_mult * opt.lot_mult * _mtf_h4_size_penalty * _m5_size_penalty * guard_size_mult, 2
     )))
 
     _sl_atr_mult = float(getattr(cfg.strategy, "sl_atr_mult", 1.5))
@@ -1926,6 +1929,19 @@ async def scan_symbol(
         "[RISK SIZE] %s lot=%.2f risk_pct=%.2f balance=%.2f sl=%.1fpips rr=%.2f",
         symbol, risk.lot_size, cfg.risk.risk_pct, account.balance, risk.sl_pips, risk.rr_ratio,
     )
+
+    # Small account lot cap — hard ceiling when balance < threshold
+    if guard is not None:
+        _sa_limits = guard.get_small_account_limits(account.balance)
+        if _sa_limits.active:
+            _is_gold = "XAU" in symbol.upper() or "GOLD" in symbol.upper()
+            _sa_cap  = _sa_limits.max_lot_gold if _is_gold else _sa_limits.max_lot_forex
+            if risk.lot_size > _sa_cap:
+                log.warning(
+                    "[SAFE CAPITAL PROTECTION] %s lot %.2f → %.2f (small account cap)",
+                    symbol, risk.lot_size, _sa_cap,
+                )
+                risk.lot_size = _sa_cap
 
     # Apply optimizer SL/TP multipliers to the actual computed levels
     if opt.sl_mult != 1.0:
@@ -2284,6 +2300,7 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     engine          = LearningEngine.get_instance()
     trade_logger    = TradeLogger.get_instance()
     sync            = _SupabaseSync() if _SYNC_AVAILABLE else None
+    guard           = AccountGuard(cfg)
     interval = cfg.trading.scan_interval
     mode     = "DRY_RUN" if bridge.dry_run else "LIVE"
 
@@ -2393,6 +2410,24 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             "[HEARTBEAT] cycle=%d timestamp=%s symbols=%d trades_today=%d open=%d idle=%d",
             scan_num, now_ts, len(symbols), daily.trades, len(session.open_tickets), idle_cycles,
         )
+
+        # Account Guard — fetch live equity/balance and run cycle check
+        _guard_equity  = 0.0
+        _guard_balance = 0.0
+        try:
+            _acct_info     = bridge.get_account_info_raw()
+            _guard_equity  = float(getattr(_acct_info, "equity",  0.0) or 0.0)
+            _guard_balance = float(getattr(_acct_info, "balance", 0.0) or 0.0)
+        except Exception:
+            pass
+
+        _guard_decision = guard.check_cycle(
+            equity    = _guard_equity,
+            balance   = _guard_balance,
+            date_utc  = server_time.date(),
+        )
+        log.warning(guard.telemetry(_guard_equity, _guard_balance))
+
         log.info("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
 
         # Push live data to Supabase (non-blocking — runs in thread)
@@ -2414,8 +2449,10 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         valid_count       = 0
         trades_this_cycle = 0
 
-        _scan_paused = _api_is_paused()
-        if _scan_paused:
+        _scan_paused = _api_is_paused() or not _guard_decision.trading_allowed
+        if not _guard_decision.trading_allowed:
+            log.warning("[RISK LOCK] Skipping scan cycle — %s", _guard_decision.halt_reason)
+        elif _api_is_paused():
             log.warning("[SYSTEM PAUSED] skipping symbol scan this cycle")
 
         # Open count snapshot for this cycle (used in daily-limit replacement check)
@@ -2498,6 +2535,8 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                     signal_id        = f"{sym}-{scan_num}",
                     now_utc          = server_time,
                     reentry_tracker  = reentry_tracker,
+                    guard_size_mult  = _guard_decision.size_mult,
+                    guard            = guard,
                 )
                 valid_count += 1
                 if result is not None:
@@ -2520,6 +2559,7 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 reentry_tracker = reentry_tracker,
                 current_time    = server_time,
                 param_optimizer = param_optimizer,
+                guard           = guard,
             )
 
         # Post-trade management: break-even SL + partial TP
@@ -2598,6 +2638,7 @@ def _check_live_outcomes(
     reentry_tracker:  Optional[ReEntryTracker]    = None,
     current_time:     Optional[datetime]          = None,
     param_optimizer:  Optional[Optimizer]         = None,
+    guard:            Optional["AccountGuard"]    = None,
 ) -> None:
     """
     Detect newly-closed positions, record P&L into the learning engine,
@@ -2641,6 +2682,10 @@ def _check_live_outcomes(
                 daily.losses_today       += 1
                 daily.consecutive_losses += 1
                 daily.consecutive_wins    = 0
+
+            # Account Guard — update persistent loss streak + halted state
+            if guard is not None:
+                guard.record_trade_outcome(won=won, pnl=profit)
 
             # Record into learning engine for weight + threshold adaptation
             engine.record_outcome(

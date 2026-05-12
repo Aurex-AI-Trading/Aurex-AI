@@ -195,6 +195,15 @@ trade_management:
   trail_atr_mult_1:   1.0     # first trail stage multiplier
   trail_atr_mult_2:   0.4     # tighter trail at 2R — lock in more profit; was 0.5
 
+# ── Account Guard (Phase 1: Risk Stabilization) ───────────────
+guard:
+  consecutive_loss_halt:   3       # halt all trading after N consecutive losses (resets next UTC day)
+  consecutive_loss_reduce: 2       # reduce lot size to 50% at N consecutive losses
+  daily_dd_halt_pct:       5.0     # halt when daily equity drawdown reaches this % (vs session open)
+  daily_dd_reduce_pct:     2.5     # reduce to 50% lot when daily DD reaches this % (50% of halt level)
+  total_dd_halt_pct:       12.0    # halt when total equity drawdown from all-time peak reaches this %
+  small_account_balance:   2000.0  # ZAR balance below which small-account conservative limits apply
+
 # ── Testing ───────────────────────────────────────────────────
 testing:
   test_mode: false              # MUST remain false in production

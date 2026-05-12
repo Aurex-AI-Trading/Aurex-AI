@@ -29,6 +29,7 @@ from typing import Dict, List, Optional
 
 from aurex_ai.core.data_feed import Candle
 from aurex_ai.core.logger import get_logger
+from aurex_ai.execution.account_guard import cap_lot_multiplier
 
 log = get_logger("ai.optimizer")
 
@@ -145,7 +146,7 @@ def optimize(
         lot_mult *= 0.50
         reasons.append(f"Drawdown {daily_loss_pct:.1f}%")
 
-    lot_mult = round(max(0.25, min(1.0, lot_mult)), 2)
+    lot_mult = cap_lot_multiplier(round(max(0.25, min(1.0, lot_mult)), 2), context="optimizer")
     sl_mult  = round(sl_mult, 2)
     tp_mult  = round(tp_mult, 2)
     reason   = " + ".join(reasons) if reasons else "No adjustments"
