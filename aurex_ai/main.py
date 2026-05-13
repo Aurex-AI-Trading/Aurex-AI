@@ -1158,7 +1158,6 @@ async def _stack_pipeline(
 
 _ATR_DEAD_MARKET = 3.0   # absolute floor — dead market in any mode (pips)
 
-@dataclass
 def _check_micro_tier2_eligible(
     symbol:       str,
     utc_hour:     int,
@@ -1232,6 +1231,7 @@ def _check_micro_tier2_eligible(
     )
 
 
+@dataclass
 class _ModeParams:
     """
     Resolved per-mode execution parameters.
