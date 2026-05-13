@@ -344,12 +344,17 @@ class SupabaseSync:
         """
         try:
             from aurex_ai.analytics.signal_store import SignalStore
-            store   = SignalStore.get_instance()
-            metrics = store.get_filter_effectiveness(window=500)
+            from aurex_ai.analytics.signal_telemetry import SignalTelemetry
+            store       = SignalStore.get_instance()
+            metrics     = store.get_filter_effectiveness(window=500)
             if not metrics or metrics.get("total_signals", 0) < 5:
                 return
 
-            paper_stats = trade_logger.get_paper_trade_stats(window=200)
+            paper_stats   = trade_logger.get_paper_trade_stats(window=200)
+            funnel_stats  = SignalTelemetry.get_instance().get_funnel_stats()
+            top_rej       = funnel_stats.get("top_rejections", {})
+            # Serialize top_rejections dict as a compact string for a TEXT column
+            top_rej_str   = "|".join(f"{k}:{v}" for k, v in list(top_rej.items())[:5])
 
             self._upsert("ai_signal_intelligence", {
                 "user_id":               user_id,
@@ -367,6 +372,11 @@ class SupabaseSync:
                 "paper_trade_count":     paper_stats.get("n", 0),
                 "paper_win_rate":        round(paper_stats.get("win_rate", 0.0), 4),
                 "paper_expectancy":      round(paper_stats.get("expectancy", 0.0), 4),
+                "funnel_total_scanned":  funnel_stats.get("total_scanned", 0),
+                "funnel_total_executed": funnel_stats.get("total_executed", 0),
+                "funnel_exec_rate":      round(funnel_stats.get("exec_rate", 0.0), 4),
+                "funnel_near_misses":    funnel_stats.get("near_miss_count", 0),
+                "top_rejection_reasons": top_rej_str,
                 "computed_at":           _now_iso(),
             }, conflict="user_id,snapshot_date")
         except Exception as exc:

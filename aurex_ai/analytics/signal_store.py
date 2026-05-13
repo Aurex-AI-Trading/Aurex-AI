@@ -61,12 +61,19 @@ CREATE TABLE IF NOT EXISTS signals (
     market_state      TEXT DEFAULT '',
     signal_score      REAL DEFAULT 0,
     confidence        REAL DEFAULT 0,
+    core_score        REAL DEFAULT 0,
+    quality_grade     TEXT DEFAULT '',
     atr_pips          REAL DEFAULT 0,
     spread_pips       REAL DEFAULT 0,
     trend_strength    REAL DEFAULT 0,
+    trend_score       REAL DEFAULT 0,
+    ob_score          REAL DEFAULT 0,
+    fvg_score         REAL DEFAULT 0,
+    liquidity_score   REAL DEFAULT 0,
     executed          INTEGER DEFAULT 0,
     trade_ticket      INTEGER,
     rejection_reason  TEXT DEFAULT '',
+    pipeline_stage    TEXT DEFAULT '',
     confidence_band   TEXT DEFAULT 'BELOW',
     band_distance_pts REAL DEFAULT 0,
     strategy_version  TEXT DEFAULT 'AI_FORWARD_V2',
@@ -84,7 +91,21 @@ CREATE INDEX IF NOT EXISTS idx_sig_detected ON signals(detected_at);
 CREATE INDEX IF NOT EXISTS idx_sig_executed ON signals(executed);
 CREATE INDEX IF NOT EXISTS idx_sig_outcome  ON signals(hyp_outcome);
 CREATE INDEX IF NOT EXISTS idx_sig_band     ON signals(confidence_band);
+CREATE INDEX IF NOT EXISTS idx_sig_quality  ON signals(quality_grade);
 """
+
+# Columns added after initial schema — applied via ALTER TABLE to existing DBs
+_SCHEMA_MIGRATIONS = [
+    "ALTER TABLE signals ADD COLUMN core_score      REAL DEFAULT 0",
+    "ALTER TABLE signals ADD COLUMN quality_grade   TEXT DEFAULT ''",
+    "ALTER TABLE signals ADD COLUMN trend_score     REAL DEFAULT 0",
+    "ALTER TABLE signals ADD COLUMN ob_score        REAL DEFAULT 0",
+    "ALTER TABLE signals ADD COLUMN fvg_score       REAL DEFAULT 0",
+    "ALTER TABLE signals ADD COLUMN liquidity_score REAL DEFAULT 0",
+    "ALTER TABLE signals ADD COLUMN pipeline_stage  TEXT DEFAULT ''",
+    "ALTER TABLE signals ADD COLUMN spread_pips     REAL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_sig_quality ON signals(quality_grade)",
+]
 
 
 @dataclass
@@ -100,9 +121,16 @@ class SignalRecord:
     atr_pips:         float = 0.0
     spread_pips:      float = 0.0
     trend_strength:   float = 0.0
+    core_score:       float = 0.0
+    quality_grade:    str   = ""
+    trend_score:      float = 0.0
+    ob_score:         float = 0.0
+    fvg_score:        float = 0.0
+    liquidity_score:  float = 0.0
     executed:         bool  = False
     trade_ticket:     Optional[int] = None
     rejection_reason: str   = ""
+    pipeline_stage:   str   = ""
     confidence_band:  str   = BAND_BELOW
     band_distance_pts: float = 0.0
     strategy_version: str   = "AI_FORWARD_V2"
@@ -160,6 +188,12 @@ class SignalStore:
                 stmt = stmt.strip()
                 if stmt:
                     conn.execute(stmt)
+            # Apply schema migrations for existing DBs (ignore "duplicate column" errors)
+            for migration in _SCHEMA_MIGRATIONS:
+                try:
+                    conn.execute(migration)
+                except Exception:
+                    pass
 
     # ── Write operations ──────────────────────────────────────────────────────
 
@@ -175,18 +209,22 @@ class SignalStore:
                 INSERT INTO signals (
                     symbol, direction, detected_at, utc_hour, session,
                     setup_type, market_state, signal_score, confidence,
+                    core_score, quality_grade,
                     atr_pips, spread_pips, trend_strength,
-                    executed, trade_ticket, rejection_reason,
+                    trend_score, ob_score, fvg_score, liquidity_score,
+                    executed, trade_ticket, rejection_reason, pipeline_stage,
                     confidence_band, band_distance_pts, strategy_version,
                     hyp_outcome, hyp_entry_price, hyp_sl_price, hyp_tp_price
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 record.symbol, record.direction, now, record.utc_hour,
                 record.session, record.setup_type, record.market_state,
                 record.signal_score, record.confidence,
+                record.core_score, record.quality_grade,
                 record.atr_pips, record.spread_pips, record.trend_strength,
+                record.trend_score, record.ob_score, record.fvg_score, record.liquidity_score,
                 1 if record.executed else 0,
-                record.trade_ticket, record.rejection_reason,
+                record.trade_ticket, record.rejection_reason, record.pipeline_stage,
                 record.confidence_band, record.band_distance_pts,
                 record.strategy_version,
                 initial_outcome,

@@ -92,6 +92,13 @@ from aurex_ai.analytics.signal_store import SignalStore, SignalRecord, compute_b
 from aurex_ai.execution.shadow_engine import ShadowEngine
 from aurex_ai.analytics.signal_analytics import SignalAnalytics
 from aurex_ai.analytics.event_logger import EventLogger, StructuralEvent, EVT_OB, EVT_FVG, EVT_LIQ_SWEEP
+from aurex_ai.analytics.signal_telemetry import (
+    SignalTelemetry, SignalContext,
+    STAGE_SESSION, STAGE_CAPACITY, STAGE_NEWS, STAGE_DATA,
+    STAGE_SPREAD, STAGE_ATR, STAGE_CONFIDENCE, STAGE_TREND,
+    STAGE_MTF, STAGE_REGIME, STAGE_PAIR, STAGE_CONFLUENCE,
+    STAGE_POSTCONFLUENCE, STAGE_EXECUTION,
+)
 
 try:
     from aurex_ai.api.server import (
@@ -1258,6 +1265,9 @@ async def scan_symbol(
     current_time = now_utc if now_utc is not None else get_mt5_time()
     today        = current_time.date()
 
+    # Phase 12: Telemetry — count every symbol scan for the signal funnel
+    SignalTelemetry.get_instance().count_scan(symbol)
+
     # ── Trading mode resolution ───────────────────────────────────────────────
     # Reads once per symbol scan; all subsequent gates use mode params.
     mode = _resolve_mode_params(cfg)
@@ -1290,6 +1300,7 @@ async def scan_symbol(
             "[TRADE BLOCKED] %s — max open trades reached total_open=%d/%d",
             symbol, open_count, cfg.risk.max_open_trades,
         )
+        SignalTelemetry.get_instance().block_stage(STAGE_CAPACITY, "OPEN_TRADE_CAP", symbol)
         return None
 
     # ── Per-symbol cap ────────────────────────────────────────────────────────
@@ -1301,6 +1312,7 @@ async def scan_symbol(
                 "[TRADE BLOCKED] %s — symbol cap reached total_open=%d/%d symbol_open=%d/%d",
                 symbol, open_count, cfg.risk.max_open_trades, _sym_count, _max_per_sym,
             )
+            SignalTelemetry.get_instance().block_stage(STAGE_CAPACITY, "SYMBOL_CAP", symbol)
             return None
 
     # ── Adaptive daily trade cap (skipped in HF mode) ───────────────────────
@@ -1316,11 +1328,13 @@ async def scan_symbol(
                 "[ADAPTIVE LIMIT] %s trading stopped due to drawdown pnl=%.2f%%",
                 symbol, daily.daily_pnl_pct,
             )
+            SignalTelemetry.get_instance().block_stage(STAGE_CAPACITY, "DRAWDOWN_STOP", symbol)
             return None
         if daily.trades >= _adap_max:
             if open_count > 0:
                 log.warning("[TRADE BLOCKED] %s — daily limit reached (%d/%d)",
                             symbol, daily.trades, _adap_max)
+                SignalTelemetry.get_instance().block_stage(STAGE_CAPACITY, "DAILY_LIMIT", symbol)
                 return None
             log.warning(
                 "[TRADE SLOT FREED] %s — daily limit reached but all positions closed, allowing replacement",
@@ -1333,9 +1347,13 @@ async def scan_symbol(
             "Daily loss limit reached %.2f%% >= %.2f%% — halting trades for today",
             daily.daily_loss_pct, cfg.risk.max_daily_loss_pct,
         )
+        SignalTelemetry.get_instance().block_stage(STAGE_CAPACITY, "DAILY_LOSS_LIMIT", symbol)
         return None
 
     _utc_hour = current_time.hour
+
+    # Phase 12: Capacity gates passed — signal progresses to session check
+    SignalTelemetry.get_instance().pass_stage(STAGE_CAPACITY, symbol)
 
     # ── Session hard block ────────────────────────────────────────────────────
     # Only trade during London + New York sessions (07:00–21:00 UTC).
@@ -1347,6 +1365,7 @@ async def scan_symbol(
             "[BLOCKED] %s — outside trading session (UTC=%02d, require 07–21)",
             symbol, _utc_hour,
         )
+        SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "BAD_SESSION", symbol)
         return None
 
     # ── Phase 10: Session-loss halt ──────────────────────────────────────────
@@ -1365,6 +1384,7 @@ async def scan_symbol(
             "→ no new entries until next UTC day",
             symbol, _session_losses, _sess_loss_halt,
         )
+        SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "SESSION_LOSS_HALT", symbol)
         return None
 
     # ── Phase 10: Anti-overtrading: minimum re-entry gap ─────────────────────
@@ -1378,6 +1398,7 @@ async def scan_symbol(
                 "[ANTI-OVERTRADING] %s — last entry %.0f min ago (min=%d min) → skip",
                 symbol, _elapsed_min, _min_reentry,
             )
+            SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "ANTI_OVERTRADING", symbol)
             return None
 
     # ── London-NY overlap gate (Phase 10: unblocked — overlap is BEST session)
@@ -1389,6 +1410,7 @@ async def scan_symbol(
             "[BLOCKED] %s — overlap blocked via config (UTC=%02d)",
             symbol, _utc_hour,
         )
+        SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "OVERLAP_BLOCKED", symbol)
         return None
 
     # ── Session quality multiplier (Phase 10: analytics-driven) ─────────────
@@ -1419,6 +1441,9 @@ async def scan_symbol(
             symbol, _utc_hour, _session_quality_mult * 100,
         )
 
+    # Phase 12: Session gates passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_SESSION, symbol)
+
     # ── News guard (Phase 5) ──────────────────────────────────────────────────
     # Blocks NFP window (1st Friday 13:30 UTC ±15/30 min) and reduces size during
     # FOMC risk window (Wednesdays 17:45-20:00 UTC).
@@ -1427,8 +1452,12 @@ async def scan_symbol(
         log.warning(
             "[TRADING PAUSED FOR NEWS] %s — %s", symbol, _news_result.reason,
         )
+        SignalTelemetry.get_instance().block_stage(STAGE_NEWS, "NEWS_BLOCK", symbol)
         return None
     _news_mult = _news_result.size_mult   # 1.0 normally; 0.50 during FOMC window
+
+    # Phase 12: News gate passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_NEWS, symbol)
 
     # ── Candle data ───────────────────────────────────────────────────────────
     candles_h4  = await feed.get_candles(symbol, TF_H4,  cfg.timeframes.h4_candles)
@@ -1447,11 +1476,13 @@ async def scan_symbol(
             len(candles_m5) if candles_m5 else 0,
         )
         failsafe.mt5_error()
+        SignalTelemetry.get_instance().block_stage(STAGE_DATA, "NO_CANDLE_DATA", symbol)
         return None
 
     if len(candles_h1) < 205 or len(candles_m15) < 10:
         log.warning("[WARNING] %s candle data insufficient H1=%d M15=%d (need H1≥205, M15≥10)",
                     symbol, len(candles_h1), len(candles_m15))
+        SignalTelemetry.get_instance().block_stage(STAGE_DATA, "INSUFFICIENT_CANDLES", symbol)
         return None
 
     log.warning(
@@ -1484,6 +1515,7 @@ async def scan_symbol(
                 "[STALE DATA] %s newest M15 candle is %.0f min old — skipping scan",
                 symbol, _candle_age_mins,
             )
+            SignalTelemetry.get_instance().block_stage(STAGE_DATA, "STALE_DATA", symbol)
             return None
 
     price    = candles_m15[-1].close
@@ -1491,6 +1523,9 @@ async def scan_symbol(
     atr_pips = fb_mod.calc_atr_pips(candles_m15, pip)
 
     log.info("[SYMBOL] %s price=%.5f atr=%.1f pips", symbol, price, atr_pips)
+
+    # Phase 12: Data gate passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_DATA, symbol)
 
     # ── Early spread check (Phase 5) ──────────────────────────────────────────
     # Check spread/ATR ratio before running the expensive confluence pipeline.
@@ -1513,6 +1548,7 @@ async def scan_symbol(
                         symbol, _sp_pips, atr_pips, _sp_ratio, _sp_block,
                     )
                     _log_rejected(symbol, "SPREAD_TOO_HIGH", spread=_sp_pips, atr=atr_pips)
+                    SignalTelemetry.get_instance().block_stage(STAGE_SPREAD, "SPREAD_TOO_HIGH", symbol)
                     return None
                 elif _sp_ratio > _sp_max:
                     _early_spread_mult = round(
@@ -1593,6 +1629,9 @@ async def scan_symbol(
                     del _pending_signals[symbol]
                     return None
 
+    # Phase 12: Spread gate passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_SPREAD, symbol)
+
     # ── Volatility bounds ─────────────────────────────────────────────────────
     _min_atr = mode.min_atr_pips                                  # mode-resolved floor
     _max_atr = float(getattr(cfg.strategy, "max_atr_pips", 0.0))
@@ -1608,6 +1647,7 @@ async def scan_symbol(
             symbol, atr_pips, _ATR_DEAD_MARKET,
         )
         _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
+        SignalTelemetry.get_instance().block_stage(STAGE_ATR, "ATR_DEAD_MARKET", symbol)
         return None
 
     # Mode ATR floor: aggressive=5.0 pips, conservative=10.0 pips.
@@ -1632,6 +1672,7 @@ async def scan_symbol(
                 symbol, atr_pips, _min_atr, mode.name.upper(),
             )
             _log_rejected(symbol, "ATR_TOO_LOW", atr=atr_pips)
+            SignalTelemetry.get_instance().block_stage(STAGE_ATR, "ATR_TOO_LOW", symbol)
             return None
 
     # ── ATR zone classification ───────────────────────────────────────────────
@@ -1648,6 +1689,7 @@ async def scan_symbol(
         )
         if mode.name == "conservative":
             _log_rejected(symbol, "ATR_TOO_HIGH", atr=atr_pips)
+            SignalTelemetry.get_instance().block_stage(STAGE_ATR, "ATR_TOO_HIGH", symbol)
             return None
         # Aggressive: ATR is already captured in confluence score; no extra block needed.
     else:
@@ -1656,6 +1698,9 @@ async def scan_symbol(
             "[ATR RANGE] %s atr=%.1f zone=OPTIMAL (floor=%.0f ceiling=%.0f)",
             symbol, atr_pips, _min_atr, _atr_opt_max if _atr_opt_max > 0 else 999,
         )
+
+    # Phase 12: ATR gate passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_ATR, symbol)
 
     # Evaluate fallback readiness once — used at several exit points below.
     # Suppressed when a pending confirmation signal already exists: we don't want
@@ -1773,6 +1818,20 @@ async def scan_symbol(
             _confidence_weakest(confidence),
             _conf_min, _conf_symbol, _al_penalty, _sess_conf_adj,
         )
+        _tel = SignalTelemetry.get_instance()
+        _tel.block_stage(STAGE_CONFIDENCE, "LOW_CONFIDENCE", symbol)
+        _tel.log_near_miss(
+            symbol, "BUY" if confidence.total > 0 else "?",
+            float(confidence.total), float(_conf_threshold),
+            "LOW_CONFIDENCE",
+            confidence=float(confidence.total),
+            atr=atr_pips,
+            session=(
+                "london"  if 7  <= _utc_hour < 13 else
+                "overlap" if 13 <= _utc_hour < 16 else
+                "newyork" if 16 <= _utc_hour < 22 else "asian"
+            ),
+        )
         if _fallback_ready:
             return await _fallback_pipeline(
                 symbol, candles_m15, price, pip,
@@ -1781,6 +1840,9 @@ async def scan_symbol(
             )
         _log_rejected(symbol, "LOW_CONFIDENCE", confidence=confidence.total, atr=atr_pips)
         return None
+
+    # Phase 12: Confidence gate passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_CONFIDENCE, symbol)
 
     # ── Momentum pre-filter ───────────────────────────────────────────────────
     # Zero momentum (5-bar ROC < 0.02%) means price barely moved over 75 min.
@@ -1809,6 +1871,7 @@ async def scan_symbol(
                 signal_id, current_time, idle_cycles=idle_cycles,
             )
         _log_rejected(symbol, "NEUTRAL_TREND", confidence=confidence.total, atr=atr_pips)
+        SignalTelemetry.get_instance().block_stage(STAGE_TREND, "NEUTRAL_TREND", symbol)
         log.debug("%s: neutral trend — skip", symbol)
         return None
 
@@ -1836,6 +1899,7 @@ async def scan_symbol(
                 symbol, _h1_bias, _h4_bias, trend_result.reason,
             )
             _log_rejected(symbol, "MTF_H1_H4_CONFLICT", confidence=confidence.total, atr=atr_pips)
+            SignalTelemetry.get_instance().block_stage(STAGE_MTF, "MTF_H1_H4_CONFLICT", symbol)
             if _fallback_ready:
                 return await _fallback_pipeline(
                     symbol, candles_m15, price, pip,
@@ -1843,6 +1907,10 @@ async def scan_symbol(
                     signal_id, current_time, idle_cycles=idle_cycles,
                 )
             return None
+
+    # Phase 12: Trend + MTF gates passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_TREND, symbol)
+    SignalTelemetry.get_instance().pass_stage(STAGE_MTF, symbol)
 
     # ── Market condition classification ──────────────────────────────────────
     _market_state = ms_mod.classify(
@@ -1864,6 +1932,9 @@ async def scan_symbol(
             symbol, _market_state.state, _market_state.reason,
         )
         _log_rejected(symbol, f"REGIME_BLOCK_{_market_state.state}", atr=atr_pips)
+        SignalTelemetry.get_instance().block_stage(
+            STAGE_REGIME, f"REGIME_BLOCK_{_market_state.state}", symbol
+        )
         return None
 
     # ── Pair intelligence (Phase 10) ─────────────────────────────────────────
@@ -1882,7 +1953,12 @@ async def scan_symbol(
     if not _pair_cond.allowed:
         _bc = _pair_cond.block_reason.split(" | ")[0].upper().replace(" ", "_")
         _log_rejected(symbol, f"PAIR_{_bc}", atr=atr_pips)
+        SignalTelemetry.get_instance().block_stage(STAGE_PAIR, f"PAIR_{_bc}", symbol)
         return None
+
+    # Phase 12: Regime + pair gates passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_REGIME, symbol)
+    SignalTelemetry.get_instance().pass_stage(STAGE_PAIR, symbol)
 
     # Apply symbol-specific regime override (e.g. GBPJPY VOLATILE_EXPANSION=0.65 vs global 0.70).
     # None means no override — leave _market_mult from market_state.exec_mult unchanged.
@@ -1980,6 +2056,7 @@ async def scan_symbol(
                 signal_id, current_time, idle_cycles=idle_cycles,
             )
         _log_rejected(symbol, "FILTER_CONFLICT", confidence=confidence.total, atr=atr_pips)
+        SignalTelemetry.get_instance().block_stage(STAGE_CONFLUENCE, "COOLDOWN", symbol)
         log.debug("%s %s: on cooldown (%.0f s remaining)",
                   symbol, hint_dir, cooldown.remaining(symbol, hint_dir))
         return None
@@ -2220,6 +2297,7 @@ async def scan_symbol(
             else "CONFLUENCE_SCORE_LOW"
         )
         _log_rejected(symbol, _rej_label, confidence=decision.confidence, atr=atr_pips)
+        SignalTelemetry.get_instance().block_stage(STAGE_CONFLUENCE, _rej_label, symbol)
         log.info("[SKIP] symbol=%s reason=%s score=%.1f", symbol, skip_reason, decision.score)
         if _fallback_ready:
             return await _fallback_pipeline(
@@ -2230,6 +2308,13 @@ async def scan_symbol(
         return None
 
     direction = decision.direction
+
+    # Phase 12: Signal telemetry — confluence gate passed
+    SignalTelemetry.get_instance().pass_stage(STAGE_CONFLUENCE, symbol)
+
+    # Pre-initialize quality grade; will be overwritten after score integrity block.
+    # Allows the _sig_reject() closure to reference _quality even on early post-confluence gates.
+    _quality: str = ""
 
     # ── Phase 12: Signal Intelligence tracking ────────────────────────────────
     # Log every non-SKIP signal so we can measure filter effectiveness.
@@ -2265,13 +2350,52 @@ async def scan_symbol(
     except Exception:
         _sig_id = 0
 
-    def _sig_reject(reason: str) -> None:
-        """Helper: mark this signal rejected in SignalStore (non-fatal)."""
+    def _sig_reject(reason: str, stage: str = STAGE_POSTCONFLUENCE) -> None:
+        """Mark signal rejected in SignalStore and emit rich [SIGNAL REJECTED] telemetry."""
         if _sig_id:
             try:
                 SignalStore.get_instance().mark_rejected(_sig_id, reason)
             except Exception:
                 pass
+        _tel = SignalTelemetry.get_instance()
+        _tel.block_stage(stage, reason, symbol)
+        try:
+            _t2  = float(thresholds.tier2)
+            _sc  = float(decision.score)
+            _session_str = (
+                "london"  if 7  <= current_time.hour < 13 else
+                "overlap" if 13 <= current_time.hour < 16 else
+                "newyork" if 16 <= current_time.hour < 22 else "asian"
+            )
+            _tel.log_signal_rejected(SignalContext(
+                symbol          = symbol,
+                direction       = direction,
+                stage           = stage,
+                reason          = reason,
+                signal_score    = round(_sc, 1),
+                confidence      = float(confidence.total),
+                core_score      = float(getattr(confluence, "core_score", 0.0)),
+                quality_grade   = _quality,
+                tier            = decision.tier,
+                atr_pips        = atr_pips,
+                spread_pips     = _sp_pips,
+                session         = _session_str,
+                utc_hour        = current_time.hour,
+                market_state    = getattr(_market_state, "state", ""),
+                trend_score     = float(getattr(trend_result, "strength", 0.0)),
+                ob_score        = float(getattr(ob_result,   "score", 0.0)),
+                fvg_score       = float(getattr(fvg_result,  "score", 0.0)),
+                liquidity_score = float(getattr(sweep_result,"score", 0.0)),
+                fib_score       = float(getattr(fib_result,  "score", 0.0)),
+                ema_score       = float(getattr(ema_result,  "score", 0.0)),
+                breakout_score  = float(getattr(bo_result,   "score", 0.0)),
+                structure_score = float(getattr(struct_result,"score", 0.0)),
+                trend_strength  = float(getattr(trend_result,"strength", 0.0)),
+                near_threshold  = (0 < _t2 - _sc <= 8),
+                threshold_used  = _t2,
+            ))
+        except Exception:
+            pass
 
     # ── BUY confirmation gate (Phase 8) ──────────────────────────────────────
     # BUY trades require at least one institutional signal: sweep, FVG, or OB.
@@ -2555,6 +2679,9 @@ async def scan_symbol(
                           confidence=decision.confidence, atr=atr_pips)
             _sig_reject("CORRELATION_BLOCKED")
             return None
+
+    # Phase 12: All post-confluence gates passed — signal progresses to execution
+    SignalTelemetry.get_instance().pass_stage(STAGE_POSTCONFLUENCE, symbol)
 
     # ── AI Pre-trade optimizer ────────────────────────────────────────────────
     opt = ai_optimize(
@@ -2876,10 +3003,11 @@ async def scan_symbol(
         _sig_reject("EXECUTION_FAILED")
         return None
 
-    # Phase 12: mark signal as executed in SignalStore
+    # Phase 12: mark signal as executed in SignalStore + count in telemetry
     try:
         if _sig_id:
             SignalStore.get_instance().mark_executed(_sig_id, trade.ticket)
+        SignalTelemetry.get_instance().count_executed()
         # Also open a parallel shadow trade (PARALLEL mode: shadows all real signals)
         ShadowEngine.get_instance().open_paper_trade(
             symbol           = symbol,
@@ -3399,6 +3527,9 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 EventLogger.get_instance().log_expectancy_summary()
                 EventLogger.get_instance().expire_old_events()
                 _shadow_engine.log_stats()
+                _tel = SignalTelemetry.get_instance()
+                _tel.log_funnel()
+                _tel.log_filter_analytics()
             except Exception:
                 pass
 
