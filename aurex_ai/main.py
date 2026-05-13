@@ -3832,12 +3832,22 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         except Exception:
             pass
 
+        log.warning("[RUNTIME TRACE] E1: guard.check_cycle()")
+        _t_e1 = asyncio.get_event_loop().time()
         _guard_decision = guard.check_cycle(
             equity    = _guard_equity,
             balance   = _guard_balance,
             date_utc  = server_time.date(),
         )
+        log.warning("[RUNTIME TRACE] E1 done in %dms mode=%s",
+                    round((asyncio.get_event_loop().time() - _t_e1) * 1000),
+                    _guard_decision.mode)
+
+        log.warning("[RUNTIME TRACE] E2: guard.telemetry()")
+        _t_e2 = asyncio.get_event_loop().time()
         log.warning(guard.telemetry(_guard_equity, _guard_balance))
+        log.warning("[RUNTIME TRACE] E2 done in %dms",
+                    round((asyncio.get_event_loop().time() - _t_e2) * 1000))
         log.warning("[RUNTIME STEP] E: account guard done")
 
         # Phase 13: Micro account mode — balance < 1000 ZAR → Tier 1 only
@@ -3852,8 +3862,10 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         # ── Step F: Adaptive learning compute ────────────────────────────────
         log.warning("[RUNTIME STEP] F: telemetry cycle-start + adaptive learning")
         telemetry.cycle_start()
+        _t_f = asyncio.get_event_loop().time()
         _al_snap = adaptive_learning.compute(trade_logger, cfg=cfg)
-        log.warning("[RUNTIME STEP] F: adaptive learning done")
+        log.warning("[RUNTIME STEP] F: adaptive learning done in %dms",
+                    round((asyncio.get_event_loop().time() - _t_f) * 1000))
 
         # Phase 11: AI sample status
         if scan_num % 50 == 0:

@@ -201,16 +201,20 @@ class AccountGuard:
         1.0 = full size  |  0.5 = half size  |  0.0 = halted (no trades)
         """
         with self._lock:
-            s = self._state
-            if s.get("halted"):
-                return 0.0
-            if s["consecutive_losses"] >= self.consec_reduce:
+            return self._size_mult_unlocked(equity)
+
+    def _size_mult_unlocked(self, equity: float = 0.0) -> float:
+        """Compute size multiplier. MUST be called while self._lock is already held."""
+        s = self._state
+        if s.get("halted"):
+            return 0.0
+        if s["consecutive_losses"] >= self.consec_reduce:
+            return 0.5
+        if equity > 0 and s["daily_start_equity"] > 0:
+            dd = (s["daily_start_equity"] - equity) / s["daily_start_equity"] * 100.0
+            if dd >= self.daily_dd_reduce:
                 return 0.5
-            if equity > 0 and s["daily_start_equity"] > 0:
-                dd = (s["daily_start_equity"] - equity) / s["daily_start_equity"] * 100.0
-                if dd >= self.daily_dd_reduce:
-                    return 0.5
-            return 1.0
+        return 1.0
 
     # ── Small account limits ─────────────────────────────────────────────────
 
@@ -273,7 +277,9 @@ class AccountGuard:
                 max(0.0, (balance - equity) / balance * 100.0)
                 if balance > 0 else 0.0
             )
-            size_mult  = self.get_size_mult(equity)
+            # Use _size_mult_unlocked() — self._lock is already held here.
+            # Calling get_size_mult() here would deadlock (threading.Lock is not reentrant).
+            size_mult  = self._size_mult_unlocked(equity)
             risk_mode  = "HALTED" if halted else ("REDUCED" if size_mult < 1.0 else "NORMAL")
 
         return (
