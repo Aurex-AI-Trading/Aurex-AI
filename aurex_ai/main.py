@@ -3753,29 +3753,31 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             scan_num, now_ts, len(symbols), daily.trades, len(session.open_tickets), idle_cycles,
         )
 
-        # Phase 6: Telemetry cycle-end + heartbeat
+        # ── Step A: Telemetry (pure Python, no MT5 calls) ────────────────────────
+        log.warning("[RUNTIME STEP] A: telemetry cycle-end + heartbeat")
         _tel_duration = telemetry.cycle_end(
             mt5_ok  = not failsafe.mt5_in_recovery,
         )
         if scan_num % telemetry.heartbeat_interval == 0:
             telemetry.emit_heartbeat(bridge, daily_state=daily)
 
-        # Periodic VPS clock drift check — every 240 cycles (~60 min at 15s interval).
-        # Emits [TIME WARNING] / [TIME CRITICAL] if VPS↔MT5 drift exceeds thresholds.
-        # Trading always uses MT5 broker time regardless of drift result.
+        # ── Step B: Periodic VPS clock drift (every 240 cycles) ──────────────
         if scan_num % 240 == 0 and symbols:
+            log.warning("[RUNTIME STEP] B: VPS clock drift check")
             try:
                 check_time_drift(symbol=symbols[0])
             except Exception:
                 pass
 
-        # Manual trade detection — every 20 cycles (~5 min at 15s interval).
-        # Scans ALL MT5 positions (no magic filter) and logs any non-Aurex positions
-        # so they can be tracked and excluded from AI learning.
+        # ── Step C: Manual trade detection (every 20 cycles) ─────────────────
         if not bridge.dry_run and scan_num % 20 == 0:
+            log.warning("[RUNTIME STEP] C: manual trade detection (MT5 positions_get)")
             try:
-                _all_pos = bridge.get_all_positions()
-                _tl      = TradeLogger.get_instance()
+                _all_pos = await asyncio.wait_for(
+                    asyncio.to_thread(bridge.get_all_positions),
+                    timeout=5.0,
+                )
+                _tl = TradeLogger.get_instance()
                 for _pos in _all_pos:
                     _src = _classify_mt5_pos(_pos["magic"], _pos.get("comment", ""))
                     if _src == _MANUAL:
@@ -3796,20 +3798,37 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                                 stop_loss   = _pos.get("sl", 0.0),
                                 take_profit = _pos.get("tp", 0.0),
                             )
+            except asyncio.TimeoutError:
+                log.warning("[MT5 BLOCK DETECTED] get_all_positions timed out after 5s — skipping manual detection")
             except Exception as _mdet_exc:
                 log.debug("[TRADE SOURCE] manual detect error: %s", _mdet_exc)
 
-        # Phase 6: AI score (once per day, after daily update)
+        # ── Step D: AI score ──────────────────────────────────────────────────
         if trade_logger.total_closed() >= 10:
             adaptive_learning.log_ai_score(trade_logger)
 
-        # Account Guard — fetch live equity/balance and run cycle check
+        # ── Step E: Account Guard — MT5 account_info() [previously blocking] ─
+        # ROOT CAUSE FIX: was called synchronously, blocking the event loop
+        # indefinitely when MT5 is slow. Now uses asyncio.to_thread + timeout.
+        log.warning("[RUNTIME STEP] E: account guard — MT5 account_info()")
         _guard_equity  = 0.0
         _guard_balance = 0.0
+        _t_acct = asyncio.get_event_loop().time()
         try:
-            _acct_info     = bridge.get_account_info_raw()
+            _acct_info = await asyncio.wait_for(
+                asyncio.to_thread(bridge.get_account_info_raw),
+                timeout=5.0,
+            )
             _guard_equity  = float(getattr(_acct_info, "equity",  0.0) or 0.0)
             _guard_balance = float(getattr(_acct_info, "balance", 0.0) or 0.0)
+            _acct_ms = round((asyncio.get_event_loop().time() - _t_acct) * 1000)
+            if _acct_ms > 3000:
+                log.warning("[MT5 BLOCK DETECTED] account_info() took %dms — MT5 slow", _acct_ms)
+            log.warning("[MT5 CALL] account_info done in %dms equity=%.2f balance=%.2f",
+                        _acct_ms, _guard_equity, _guard_balance)
+        except asyncio.TimeoutError:
+            _acct_ms = round((asyncio.get_event_loop().time() - _t_acct) * 1000)
+            log.error("[MT5 BLOCK DETECTED] account_info() hung for %dms — using defaults", _acct_ms)
         except Exception:
             pass
 
@@ -3819,6 +3838,7 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             date_utc  = server_time.date(),
         )
         log.warning(guard.telemetry(_guard_equity, _guard_balance))
+        log.warning("[RUNTIME STEP] E: account guard done")
 
         # Phase 13: Micro account mode — balance < 1000 ZAR → Tier 1 only
         _micro_account_mode = _guard_balance > 0 and _guard_balance < 1000.0
@@ -3829,20 +3849,22 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 _guard_balance,
             )
 
-        # Phase 6: telemetry cycle start + adaptive learning compute
+        # ── Step F: Adaptive learning compute ────────────────────────────────
+        log.warning("[RUNTIME STEP] F: telemetry cycle-start + adaptive learning")
         telemetry.cycle_start()
         _al_snap = adaptive_learning.compute(trade_logger, cfg=cfg)
+        log.warning("[RUNTIME STEP] F: adaptive learning done")
 
-        # Phase 11: AI sample status — log every 50 cycles so the dashboard can track
-        # when the AI_FORWARD_V2 dataset crosses BUILDING → VALID → MATURE thresholds.
+        # Phase 11: AI sample status
         if scan_num % 50 == 0:
             try:
                 PerformanceEngine.get_sample_status(trade_logger).log_status()
             except Exception:
                 pass
 
-        # Phase 12: Signal intelligence analytics — periodic reports every 100 cycles
+        # ── Step G: Signal intelligence analytics (every 100 cycles) ─────────
         if scan_num % 100 == 0:
+            log.warning("[RUNTIME STEP] G: signal intelligence analytics")
             try:
                 SignalAnalytics(SignalStore.get_instance()).log_full_report()
                 EventLogger.get_instance().log_expectancy_summary()
@@ -3893,7 +3915,7 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                     " | ".join(f"{r}:{n}" for r, n in _top_blocks) or "none",
                 )
 
-        # Phase 12: Resolve hypothetical outcomes for rejected signals (every 10 cycles)
+        # ── Step H: Resolve hypothetical outcomes (every 10 cycles) ──────────
         if scan_num % 10 == 0 and not bridge.dry_run:
             try:
                 def _get_price(sym):
@@ -3905,11 +3927,25 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
             except Exception:
                 pass
 
-        # Phase 12: Resolve shadow (paper) trades every cycle
+        # ── Step I: Shadow engine resolve [previously blocking] ───────────────
+        # resolve_open_trades() calls bridge.get_tick() synchronously for each
+        # paper trade — wrapped in asyncio.to_thread + timeout to prevent blocking.
+        log.warning("[RUNTIME STEP] I: shadow engine resolve open trades")
+        _t_shadow = asyncio.get_event_loop().time()
         try:
-            _shadow_engine.resolve_open_trades(bridge, trade_logger)
+            await asyncio.wait_for(
+                asyncio.to_thread(_shadow_engine.resolve_open_trades, bridge, trade_logger),
+                timeout=5.0,
+            )
+            _shadow_ms = round((asyncio.get_event_loop().time() - _t_shadow) * 1000)
+            if _shadow_ms > 3000:
+                log.warning("[MT5 BLOCK DETECTED] resolve_open_trades took %dms", _shadow_ms)
+        except asyncio.TimeoutError:
+            _shadow_ms = round((asyncio.get_event_loop().time() - _t_shadow) * 1000)
+            log.warning("[MT5 BLOCK DETECTED] resolve_open_trades hung %dms — skipping", _shadow_ms)
         except Exception:
             pass
+        log.warning("[RUNTIME STEP] I: shadow engine done — entering symbol scan")
 
         log.warning("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
 
