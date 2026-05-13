@@ -67,6 +67,11 @@ _SMALL_ACCT_ZAR      = 2000.0   # ZAR balance threshold for small-account mode
 _MAX_LOT_MULT        = 1.5      # hard cap on any lot multiplier
 _STATE_FILE          = Path(__file__).resolve().parent.parent / "data" / "account_guard_state.json"
 
+# ── Adaptive symbol thresholds ────────────────────────────────────────────────
+# Balance-based symbol activation gates (Phase 13 — small account survivability).
+_XAUUSD_MIN_BALANCE_ZAR   = 7000.0   # XAUUSD only allowed when balance >= this value
+_GBPJPY_REDUCE_BALANCE_ZAR = 3000.0  # log GBPJPY reduced-allocation warning below this
+
 
 # ── Public data classes ───────────────────────────────────────────────────────
 
@@ -461,6 +466,70 @@ class AccountGuard:
             )
         except Exception as exc:
             log.error("[ACCOUNT GUARD] State save failed: %s", exc)
+
+
+# ── Adaptive symbol activation ────────────────────────────────────────────────
+
+def get_active_symbols(balance: float, configured_symbols: list) -> list:
+    """
+    Filter the configured symbol list based on account balance.
+
+    Phase 13 small-account survivability rules:
+      balance < 7000 ZAR  → XAUUSD removed (extreme ATR, requires larger cushion)
+      balance < 3000 ZAR  → GBPJPY lot already capped at 0.01 by SmallAccountLimits;
+                            a warning is emitted to flag reduced effective exposure
+      balance >= 7000 ZAR → all configured symbols allowed
+
+    Logs [SMALL ACCOUNT PROTECTION] whenever a symbol is removed at startup.
+    Returns the filtered list (never empty — falls back to full list if all removed).
+    """
+    from typing import List
+    active: List[str] = list(configured_symbols)
+    removed: List[str] = []
+
+    xauusd_syms = [s for s in active if "XAU" in s.upper() or "GOLD" in s.upper()]
+    if xauusd_syms and balance < _XAUUSD_MIN_BALANCE_ZAR:
+        for sym in xauusd_syms:
+            active.remove(sym)
+            removed.append(sym)
+        log.warning(
+            "[SMALL ACCOUNT PROTECTION] XAUUSD DISABLED | balance=%.2f ZAR < %.0f ZAR threshold | "
+            "gold ATR requires larger capital cushion. Re-enable when balance >= %.0f ZAR.",
+            balance, _XAUUSD_MIN_BALANCE_ZAR, _XAUUSD_MIN_BALANCE_ZAR,
+        )
+
+    if removed:
+        log.warning(
+            "[SMALL ACCOUNT PROTECTION] Active symbols after balance filter: [%s] | "
+            "Removed: [%s]",
+            ", ".join(active), ", ".join(removed),
+        )
+    else:
+        log.warning(
+            "[SMALL ACCOUNT PROTECTION] Symbol filter passed | balance=%.2f ZAR | "
+            "all %d configured symbols active",
+            balance, len(active),
+        )
+
+    if balance < _GBPJPY_REDUCE_BALANCE_ZAR:
+        gbpjpy_syms = [s for s in active if "GBPJPY" in s.upper()]
+        if gbpjpy_syms:
+            log.warning(
+                "[SMALL ACCOUNT PROTECTION] GBPJPY reduced allocation | balance=%.2f ZAR < %.0f ZAR | "
+                "lot capped at 0.01 by small-account limits. "
+                "Consider removing GBPJPY if drawdown exceeds 5%% in a single session.",
+                balance, _GBPJPY_REDUCE_BALANCE_ZAR,
+            )
+
+    if not active:
+        log.error(
+            "[SMALL ACCOUNT PROTECTION] All symbols were filtered out (balance=%.2f ZAR) — "
+            "restoring full list to prevent trading halt.",
+            balance,
+        )
+        return list(configured_symbols)
+
+    return active
 
 
 # ── Module-level lot cap utility ──────────────────────────────────────────────

@@ -61,7 +61,7 @@ from aurex_ai.execution.confidence_engine import (
 from aurex_ai.execution.trade_manager    import TradeManager
 from aurex_ai.execution.reentry_tracker  import ReEntryTracker, ClosedTrade
 from aurex_ai.execution.adaptive_limits    import get_adaptive_limit
-from aurex_ai.execution.account_guard     import AccountGuard, cap_lot_multiplier
+from aurex_ai.execution.account_guard     import AccountGuard, cap_lot_multiplier, get_active_symbols
 from aurex_ai.execution.news_guard        import check_news as _check_news
 
 from aurex_ai.ai.optimizer        import optimize as ai_optimize, Optimizer
@@ -4592,6 +4592,11 @@ def main() -> None:
 
     log.warning("MT5 connected | balance=%.2f %s | equity=%.2f %s",
                 _live_bal, _live_ccy, _live_equ, _live_ccy)
+
+    # Phase 13 — balance-based symbol filtering (small account survivability).
+    # get_active_symbols() removes XAUUSD when balance < 7000 ZAR and warns on
+    # GBPJPY when balance < 3000 ZAR. Runs once at startup using the live balance.
+    symbols = get_active_symbols(_live_bal, symbols)
 
     _fixed_lot  = float(getattr(cfg.risk, "fixed_lot_size",      0.0))
     _max_sl     = float(getattr(cfg.risk, "max_sl_pips",         50.0))

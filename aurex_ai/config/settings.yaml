@@ -15,7 +15,11 @@ symbols:
   # Forex pairs use the broker suffix configured in broker_suffix above.
   # Removed low-ATR pairs (AUDUSD, USDCAD, NZDUSD, USDCHF) — insufficient edge.
   # Added GBPJPY.Z — highest ATR cross; institutional order flow pairs only.
-  - XAUUSD     # Gold — NO .Z suffix. Highest ATR. Strictest confidence gate.
+  #
+  # Phase 13 — Small account survivability: XAUUSD disabled.
+  # Re-enable when account balance >= 7000 ZAR (see account_guard._XAUUSD_MIN_BALANCE_ZAR).
+  # AccountGuard.get_active_symbols() enforces this at runtime regardless of this list.
+  # - XAUUSD   # Gold — disabled: extreme ATR unsuitable for <7000 ZAR accounts.
   - EURUSD.Z   # Deepest FX liquidity — trend continuation + sweep setups
   - GBPUSD.Z   # High ATR, strong institutional flow — London session leader
   - USDJPY.Z   # Risk-on/risk-off gauge; carry pair with strong directional bias
@@ -397,8 +401,11 @@ api:
 # Prevents entries during rollover, news, or symbol-specific spread spikes.
 # A supplementary check — the existing post-risk spread filter still runs.
 spread:
-  max_ratio:    0.20    # spread/ATR > this → size reduced to 60-80%
-  block_ratio:  0.35    # spread/ATR > this → execution blocked entirely
+  # Phase 13: XAUUSD removed from active symbols — FX-only environment.
+  # Gold drove the need for strict ratios; FX pairs have far tighter spreads.
+  # Relaxed to reduce unnecessary FX rejections on EURUSD/USDJPY/GBPUSD/GBPJPY.
+  max_ratio:    0.25    # spread/ATR > this → size reduced to 60-80%  (was 0.20)
+  block_ratio:  0.40    # spread/ATR > this → execution blocked entirely (was 0.35)
 
 # ── News protection (Phase 5 + Phase 7) ──────────────────────────────────────
 # Lightweight protection against high-impact economic releases.
