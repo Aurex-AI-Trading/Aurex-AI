@@ -235,6 +235,17 @@ guard:
   total_dd_halt_pct:       15.0    # Phase 8: 15% max account drawdown from peak — safer ceiling
   small_account_balance:   2000.0  # ZAR balance below which small-account conservative limits apply
 
+# ── Micro account conditional Tier 2 (Phase 13b) ─────────────
+# Allows Tier 2 execution on balance < 1000 ZAR ONLY when ALL
+# institutional conditions align simultaneously. Purpose: generate
+# 1-3 quality trades/day without weakening survivability gates.
+# Set enabled: false to revert to strict Tier-1-only micro mode.
+micro_account_tier2:
+  enabled:             true
+  min_trend_strength:  12.0   # H1+H4 alignment (0-25 scale); 12 = strong agreement
+  max_spread_ratio:    0.15   # stricter than global 0.25; excellent spread only
+  gbpjpy_max_atr:      25.0   # GBPJPY only when ATR <= this (stable volatility)
+
 # ── Testing ───────────────────────────────────────────────────
 testing:
   test_mode: false              # MUST remain false in production

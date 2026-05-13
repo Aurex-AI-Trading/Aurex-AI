@@ -134,6 +134,13 @@ MAX_CYCLE_TRADES    = 2   # hard cap on trades executed in a single scan cycle
 # before the next scan so higher-quality setups are evaluated first.
 _symbol_confidence_cache: Dict[str, float] = {}
 
+# Phase 13b: Conditional Tier 2 analytics — in-memory counters (reset on restart)
+_TIER2_COND_STATS: dict = {
+    "passed":           0,    # Tier 2 signals that cleared all conditions
+    "rejected":         0,    # Tier 2 signals that failed at least one condition
+    "rejected_reasons": {},   # reason_key → count; for block attribution
+}
+
 
 def _pip_size(symbol: str) -> float:
     s = symbol.upper()
@@ -1152,6 +1159,79 @@ async def _stack_pipeline(
 _ATR_DEAD_MARKET = 3.0   # absolute floor — dead market in any mode (pips)
 
 @dataclass
+def _check_micro_tier2_eligible(
+    symbol:       str,
+    utc_hour:     int,
+    trend_str:    float,
+    ob_present:   bool,
+    fvg_present:  bool,
+    sp_pips:      float,
+    atr_pips:     float,
+    market_state: str,
+    cfg,
+):
+    """
+    Phase 13b: Evaluate whether a Tier 2 signal meets ALL institutional
+    conditions required for conditional execution on a micro account
+    (balance < 1000 ZAR). Returns (eligible: bool, reason: str).
+
+    Every condition is a hard gate — any failure returns False immediately.
+    The function is intentionally strict: 1-3 trades/day is the target.
+    """
+    t2_cfg = getattr(cfg, "micro_account_tier2", None)
+    if t2_cfg is not None and not bool(getattr(t2_cfg, "enabled", True)):
+        return False, "tier2_conditional_disabled"
+
+    # Gate 1: New York session only (16-21 UTC)
+    if not (16 <= utc_hour < 21):
+        sess = (
+            "overlap" if 13 <= utc_hour < 16 else
+            "london"  if 7  <= utc_hour < 13 else "asian"
+        )
+        return False, f"session_not_newyork(session={sess})"
+
+    # Gate 2: Strong trend — H1+H4 directional agreement mandatory
+    min_trend = float(getattr(t2_cfg, "min_trend_strength", 12.0)) if t2_cfg else 12.0
+    if trend_str < min_trend:
+        return False, f"weak_trend(strength={trend_str:.1f}<{min_trend:.0f})"
+
+    # Gate 3: OB + FVG both present — liquidity alone may NOT elevate a setup
+    if not ob_present:
+        return False, "missing_ob"
+    if not fvg_present:
+        return False, "missing_fvg"
+
+    # Gate 4: Excellent spread — stricter than the global threshold
+    max_sp_ratio = float(getattr(t2_cfg, "max_spread_ratio", 0.15)) if t2_cfg else 0.15
+    sp_ratio = sp_pips / atr_pips if atr_pips > 0 else 1.0
+    if sp_ratio > max_sp_ratio:
+        return False, f"spread_not_excellent(ratio={sp_ratio:.2f}>{max_sp_ratio:.2f})"
+
+    # Gate 5: Volatility stability — no ranging, choppy, or dead regimes
+    if market_state in ("RANGING", "CHOPPY", "DEAD", ""):
+        return False, f"market_unstable(state={market_state or 'unknown'})"
+
+    # Gate 6: Symbol restrictions
+    _base = symbol.upper()
+    for _sfx in (".Z", ".M", ".ECN", ".PRO"):
+        _base = _base.replace(_sfx, "")
+
+    if _base == "GBPJPY":
+        # GBPJPY: additionally requires TRENDING market and stable ATR
+        if market_state != "TRENDING":
+            return False, f"gbpjpy_market_not_trending(state={market_state})"
+        _gbpjpy_max_atr = float(getattr(t2_cfg, "gbpjpy_max_atr", 25.0)) if t2_cfg else 25.0
+        if atr_pips > _gbpjpy_max_atr:
+            return False, f"gbpjpy_atr_too_high({atr_pips:.1f}>{_gbpjpy_max_atr:.0f})"
+    elif _base not in ("EURUSD", "USDJPY", "GBPUSD"):
+        return False, f"symbol_not_approved_for_tier2({_base})"
+
+    return True, (
+        f"OB+FVG+TREND+NY+SPREAD aligned "
+        f"(trend={trend_str:.1f} spread_ratio={sp_ratio:.2f} state={market_state})"
+    )
+
+
 class _ModeParams:
     """
     Resolved per-mode execution parameters.
@@ -2466,17 +2546,50 @@ async def scan_symbol(
         _sig_reject("TIER_BELOW_MINIMUM")
         return None
 
-    # ── Micro account Tier 1 gate (Phase 13) ─────────────────────────────────
-    # On sub-1000 ZAR accounts, Tier 2 lots are still significant % risk.
-    # Only Tier 1 (strongest setups) execute until balance grows above 1000 ZAR.
+    # ── Micro account conditional Tier 2 gate (Phase 13b) ───────────────────
+    # Below 1000 ZAR, Tier 2 may execute ONLY when ALL six institutional gates
+    # pass simultaneously: NY session + strong trend + OB+FVG + excellent spread
+    # + stable volatility + approved symbol. Any failure = hard block.
+    # Quality-C remains permanently blocked (handled separately below).
+    # Max open=1, correlation taper, and daily DD protection remain active.
     if micro_account_mode and decision.tier > 1:
-        log.warning(
-            "[MICRO ACCOUNT MODE] %s — Tier %d blocked | balance < 1000 ZAR "
-            "requires Tier 1 only | score=%.1f conf=%d",
-            symbol, decision.tier, decision.score, int(confidence.total),
+        _t2_eligible, _t2_reason = _check_micro_tier2_eligible(
+            symbol       = symbol,
+            utc_hour     = _utc_hour,
+            trend_str    = float(getattr(trend_result, "strength", 0.0)),
+            ob_present   = ob_result.present,
+            fvg_present  = fvg_result.present,
+            sp_pips      = _sp_pips,
+            atr_pips     = atr_pips,
+            market_state = getattr(_market_state, "state", ""),
+            cfg          = cfg,
         )
-        _sig_reject("MICRO_MODE_TIER2_BLOCKED")
-        return None
+        if _t2_eligible:
+            log.warning(
+                "[TIER2 CONDITIONAL PASS] symbol=%s session=NEWYORK tier=%d "
+                "score=%.1f conf=%d | reason=%s | "
+                "spread_ratio=%.2f trend_strength=%.1f market=%s execution_quality=PASS",
+                symbol, decision.tier, decision.score, int(confidence.total),
+                _t2_reason,
+                _sp_pips / atr_pips if atr_pips > 0 else 0.0,
+                float(getattr(trend_result, "strength", 0.0)),
+                getattr(_market_state, "state", ""),
+            )
+            _TIER2_COND_STATS["passed"] += 1
+        else:
+            log.warning(
+                "[TIER2 CONDITIONAL BLOCK] symbol=%s tier=%d score=%.1f conf=%d "
+                "| reason=%s",
+                symbol, decision.tier, decision.score, int(confidence.total),
+                _t2_reason,
+            )
+            _TIER2_COND_STATS["rejected"] += 1
+            _r_key = _t2_reason.split("(")[0]
+            _TIER2_COND_STATS["rejected_reasons"][_r_key] = (
+                _TIER2_COND_STATS["rejected_reasons"].get(_r_key, 0) + 1
+            )
+            _sig_reject("MICRO_TIER2_CONDITIONS_NOT_MET")
+            return None
 
     # ── Score integrity: prevent inflation from missing institutional signals ──
     _vote_diff = abs(confluence.buy_votes - confluence.sell_votes)
@@ -3606,6 +3719,23 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 _tel.log_filter_analytics()
             except Exception:
                 pass
+
+            # Phase 13b: Conditional Tier 2 analytics
+            _t2_total = _TIER2_COND_STATS["passed"] + _TIER2_COND_STATS["rejected"]
+            if _t2_total > 0:
+                _t2_pass_pct = _TIER2_COND_STATS["passed"] / _t2_total * 100
+                _top_blocks = sorted(
+                    _TIER2_COND_STATS["rejected_reasons"].items(),
+                    key=lambda x: -x[1],
+                )[:4]
+                log.warning(
+                    "[TIER2 CONDITIONAL ANALYTICS] passed=%d rejected=%d "
+                    "pass_rate=%.1f%% | top_blocks: %s",
+                    _TIER2_COND_STATS["passed"],
+                    _TIER2_COND_STATS["rejected"],
+                    _t2_pass_pct,
+                    " | ".join(f"{r}:{n}" for r, n in _top_blocks) or "none",
+                )
 
         # Phase 12: Resolve hypothetical outcomes for rejected signals (every 10 cycles)
         if scan_num % 10 == 0 and not bridge.dry_run:
