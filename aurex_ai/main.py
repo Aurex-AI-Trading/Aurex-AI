@@ -1494,9 +1494,9 @@ async def scan_symbol(
     _overlap_q        = float(getattr(_sess_cfg_p14, "overlap_quality",       0.40))
     _ny_q             = float(getattr(_sess_cfg_p14, "newyork_quality",       1.00))
     _asian_max_tier   = int(getattr(_sess_cfg_p14,   "asian_max_tier",        1))
-    _overlap_max_tier = int(getattr(_sess_cfg_p14,   "overlap_max_tier",      2))
+    _overlap_max_tier = int(getattr(_sess_cfg_p14,   "overlap_max_tier",      3))
     _asian_conf_pen   = int(getattr(_sess_cfg_p14,   "asian_conf_penalty",    8))
-    _overlap_conf_pen = int(getattr(_sess_cfg_p14,   "overlap_conf_penalty",  5))
+    _overlap_conf_pen = int(getattr(_sess_cfg_p14,   "overlap_conf_penalty",  2))
     _ov_s             = int(getattr(_sess_cfg_p14,   "overlap_start_hour",   13))
     _ov_e             = int(getattr(_sess_cfg_p14,   "overlap_end_hour",     16))
 
@@ -1684,12 +1684,20 @@ async def scan_symbol(
                         SignalTelemetry.get_instance().block_stage(STAGE_SPREAD, "SPREAD_TOO_HIGH", symbol)
                         return None
                 elif _session_name == "overlap":
-                    _ov_sp = float(getattr(_sess_cfg_p14, "overlap_spread_max_ratio", 0.20))
+                    # GBPJPY: JPY pairs widen more in overlap — use broker-calibrated limit
+                    _is_gbpjpy = "GBPJPY" in symbol.upper()
+                    if _is_gbpjpy:
+                        _ov_sp = float(getattr(_sess_cfg_p14,
+                                               "gbpjpy_overlap_spread_max_ratio", 0.35))
+                    else:
+                        _ov_sp = float(getattr(_sess_cfg_p14,
+                                               "overlap_spread_max_ratio", 0.30))
                     if _sp_ratio > _ov_sp:
                         log.warning(
                             "[SPREAD BLOCKED] %s — OVERLAP session spread too wide "
-                            "(ratio=%.2f > %.2f threshold)",
+                            "(ratio=%.2f > %.2f threshold%s)",
                             symbol, _sp_ratio, _ov_sp,
+                            " [GBPJPY]" if _is_gbpjpy else "",
                         )
                         _log_rejected(symbol, "SPREAD_TOO_HIGH", spread=_sp_pips, atr=atr_pips)
                         SignalTelemetry.get_instance().block_stage(STAGE_SPREAD, "SPREAD_TOO_HIGH", symbol)
@@ -3681,7 +3689,8 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     _s_ov_cp        = int(getattr(_sess_cfg_init,   "overlap_conf_penalty",     5))
     _s_ny_cp        = int(getattr(_sess_cfg_init,   "newyork_conf_penalty",     0))
     _s_asian_sp     = float(getattr(_sess_cfg_init, "asian_spread_max_ratio",   0.15))
-    _s_ov_sp        = float(getattr(_sess_cfg_init, "overlap_spread_max_ratio", 0.20))
+    _s_ov_sp        = float(getattr(_sess_cfg_init, "overlap_spread_max_ratio", 0.30))
+    _s_gbpjpy_ov_sp = float(getattr(_sess_cfg_init, "gbpjpy_overlap_spread_max_ratio", 0.35))
     log.warning(
         "\n[SESSION INTELLIGENCE] Phase 14 — Adaptive Session Execution\n"
         "  ┌─────────────┬──────────┬────────┬────────────────────────────────┐\n"
@@ -3697,6 +3706,16 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         _s_lon_q   * 100, _s_lon_op,
         _s_ov_q    * 100, _s_ov_mt,   _s_ov_cp,    _s_ov_sp * 100,
         _s_ny_q    * 100, _s_ny_cp,
+    )
+    _s_mode_cfg    = getattr(getattr(cfg, "modes", None), "normal", None) or getattr(cfg, "modes", None)
+    _s_atr_floor   = float(getattr(_s_mode_cfg, "min_atr_pips", 6.0) if _s_mode_cfg else 6.0)
+    _s_sp_block    = float(getattr(getattr(cfg, "spread", None), "block_ratio", 0.40))
+    log.warning(
+        "[SPREAD PROFILE] broker=HFMarketsSA-Live2 (retail .Z suffix) | "
+        "overlap_threshold=%.0f%%ATR  gbpjpy_overlap=%.0f%%ATR  "
+        "hard_block=%.0f%%ATR | atr_floor=%.1fpips | "
+        "spreads_seen: EURUSD≈0.25 GBPUSD≈0.23 USDJPY≈0.37 GBPJPY≈0.21 (ratio vs ATR)",
+        _s_ov_sp * 100, _s_gbpjpy_ov_sp * 100, _s_sp_block * 100, _s_atr_floor,
     )
     log.warning(
         "[STARTUP VALIDATION] Dataclass integrity OK | session_classifier=adaptive "

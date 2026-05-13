@@ -192,7 +192,7 @@ fallback:
   # Daily limit — resets at UTC midnight
   max_daily_trades:   2
   # Market quality filters
-  min_atr_pips:       8.0     # minimum ATR to enter (below = flat/dead market)
+  min_atr_pips:       6.0     # Phase 15 HFM: reduced from 8 — allow entry on quieter HFM sessions
   max_spread_pips:    3.0     # maximum allowed spread in pips
   min_strength:       0.35    # minimum signal strength (fallback max is 0.50)
 
@@ -271,17 +271,18 @@ session:
   # Session confidence adjustments (pts added to effective threshold; tighter = harder to pass)
   asian_conf_penalty:        8    # Asian: only cleanest institutional setups qualify
   london_open_conf_penalty:  2    # London open (07-09 UTC): extra penalty for wide spreads
-  overlap_conf_penalty:      5    # Overlap: above-normal gate; controlled access
+  overlap_conf_penalty:      2    # Phase 15 HFM: reduced from 5 — retail spreads already act as gate
   newyork_conf_penalty:      0    # NY: no extra bar — best session
 
   # Session tier caps (enforced independent of mode.min_execution_tier)
   asian_max_tier:       1    # Asian: Tier 1 only — highest quality only
-  overlap_max_tier:     2    # Overlap: Tier 1+2; no Tier 3 fallback
+  overlap_max_tier:     3    # Phase 15 HFM: Tier 3 allowed; spread gate provides discrimination
   # London and NY: no session tier cap (mode.min_execution_tier governs)
 
   # Session-specific spread thresholds (fraction of ATR; stricter than global 0.40)
-  asian_spread_max_ratio:    0.15  # Asian: excellent spread required
-  overlap_spread_max_ratio:  0.20  # Overlap: tighter than global
+  asian_spread_max_ratio:         0.15  # Asian: excellent spread required
+  overlap_spread_max_ratio:       0.30  # Phase 15 HFM: raised from 0.20 — retail .Z spreads 0.21-0.37
+  gbpjpy_overlap_spread_max_ratio: 0.35  # Phase 15 HFM: GBPJPY wider tolerance — JPY pair widens in overlap
 
   # Anti-overtrading session controls
   session_loss_halt:    2      # pause new entries after N losses in same session
@@ -332,7 +333,7 @@ modes:
     # Quality-C trades blocked: only A+/A/B grades execute in normal mode.
     # Trend gate added: minimum trend strength required before confluence check.
     min_confidence:       64     # Phase 14: from 71 — controlled relaxation; session+symbol gates discriminate
-    min_atr_pips:         8.0    # unchanged — ATR floor appropriate for FX pairs
+    min_atr_pips:         6.0    # Phase 15 HFM: reduced from 8 — allows entry on quieter HFM sessions
     atr_optimal_max_pips: 30     # Phase 13: tightened from 35 — FX pairs; gold removed
     min_core_score:       48.0   # Phase 14: from 52.0 — allows solid 2-factor setups; trend gate still applies
     min_execution_tier:   3      # Phase 14: from 2 — Tier 3 allowed in London/NY; session cap prevents Asian/Overlap abuse
