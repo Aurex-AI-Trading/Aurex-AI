@@ -3961,12 +3961,13 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
 
         log.warning("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
 
-        # Push live data to Supabase (non-blocking — runs in thread)
+        # Push live data to Supabase — fire-and-forget background task.
+        # The sync runs in a thread pool and does NOT block cycle progression.
+        # Trading engine priority > cloud sync: scan continues immediately.
         if sync is not None and not bridge.dry_run:
-            try:
-                await asyncio.to_thread(sync.sync_all, bridge, trade_logger)
-            except Exception as _sync_exc:
-                log.debug("[SYNC] background sync error: %s", _sync_exc)
+            asyncio.ensure_future(
+                asyncio.to_thread(sync.sync_all, bridge, trade_logger)
+            )
 
         # Rank symbols by their confidence score from the previous cycle.
         # First cycle all scores are 0 so order equals the configured list.

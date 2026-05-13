@@ -8,15 +8,26 @@ real-time data.
 Uses raw httpx REST calls against the Supabase PostgREST API.
 (supabase-py cannot be installed — storage3 pulls pyiceberg which fails to build.)
 
-Called once per scan cycle from run_live() via asyncio.to_thread().
-All exceptions are caught so this module can never crash the trading loop.
+Called once per scan cycle from run_live() via asyncio.ensure_future() so the
+sync runs in a background thread and never blocks the trading loop.
+
+Failure isolation
+-----------------
+  - All exceptions are caught — this module can never crash the trading loop.
+  - [SUPABASE PATCH ERROR] warning emitted on 400/404 with full response body.
+  - Per-table circuit breaker: any table that returns 4xx is skipped for
+    _CIRCUIT_SKIP_CYCLES cycles, preventing error floods.
+  - Closed-trade dedup: once a ticket is successfully pushed as closed it is
+    never re-PATCHed (closed trades are immutable).
 """
 from __future__ import annotations
 
 import os
+import time
+import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from aurex_ai.core.logger import get_logger
 
@@ -39,17 +50,40 @@ except ImportError:
 _URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 _KEY = os.environ.get("SUPABASE_KEY", "")
 
+# After this many consecutive 4xx errors on a table, skip it for _CIRCUIT_SKIP_CYCLES
+_CIRCUIT_BREAK_THRESHOLD = 3
+_CIRCUIT_SKIP_CYCLES      = 50
+
 
 class SupabaseSync:
     """
     One instance lives for the lifetime of the trading session.
-    Call sync_all(bridge, trade_logger) each scan cycle.
+    Call sync_all(bridge, trade_logger) each scan cycle — best fired as
+    asyncio.ensure_future(asyncio.to_thread(sync.sync_all, bridge, tl))
+    so it never blocks the event loop.
     """
 
     def __init__(self) -> None:
         self._user_id: Optional[str] = None
         self._client:  Optional[Any] = None
         self._enabled = _HTTPX_OK and bool(_URL) and bool(_KEY)
+
+        # ── Circuit breaker per table ─────────────────────────────────────────
+        # Maps table name → sync_count value at which to re-enable it
+        self._circuit_skip_until: Dict[str, int] = {}
+        self._circuit_consec_err: Dict[str, int] = {}
+
+        # ── Closed-trade dedup ────────────────────────────────────────────────
+        # Tickets already confirmed-synced as closed (immutable — never re-push)
+        self._synced_closed: Set[int] = set()
+
+        # ── Performance counters ──────────────────────────────────────────────
+        self._sync_count:       int = 0
+        self._patch_ok:         int = 0
+        self._patch_err:        int = 0
+        self._insert_ok:        int = 0
+        self._insert_err:       int = 0
+        self._skipped_closed:   int = 0
 
         if not self._enabled:
             reason = (
@@ -67,20 +101,22 @@ class SupabaseSync:
                 "Authorization": f"Bearer {_KEY}",
                 "Content-Type":  "application/json",
             },
-            timeout=8.0,
+            timeout=5.0,  # hard cap — never block longer than 5s per request
         )
-        log.info("[SYNC] Supabase sync ready | %s", _URL)
+        log.warning("[SYNC] Supabase sync ready | %s", _URL)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
     def sync_all(self, bridge: Any, trade_logger: Any) -> None:
-        """Full sync — call once per scan cycle."""
+        """Full sync — call from asyncio.to_thread() to avoid blocking the event loop."""
         if not self._enabled:
             return
+        self._sync_count += 1
+        _t0 = time.monotonic()
         try:
             user_id = self._resolve_user_id(bridge)
             if not user_id:
-                log.debug("[SYNC] No mt5_accounts row for account=%s — skipping", bridge.account)
+                log.debug("[SYNC] No mt5_accounts row for this account — skipping")
                 return
             self._sync_account(bridge, user_id)
             self._sync_positions(bridge, user_id)
@@ -92,6 +128,20 @@ class SupabaseSync:
             self._sync_signal_intelligence(trade_logger, user_id)
         except Exception as exc:
             log.debug("[SYNC] sync_all error: %s", exc)
+        finally:
+            dur_ms = round((time.monotonic() - _t0) * 1000)
+            if self._sync_count % 20 == 0:
+                log.warning(
+                    "[SYNC PERFORMANCE] cycle=%d dur=%dms | "
+                    "patch_ok=%d patch_err=%d insert_ok=%d insert_err=%d "
+                    "closed_dedup_skipped=%d circuit_breaks=%s",
+                    self._sync_count, dur_ms,
+                    self._patch_ok, self._patch_err,
+                    self._insert_ok, self._insert_err,
+                    self._skipped_closed,
+                    {t: v for t, v in self._circuit_skip_until.items()
+                     if v > self._sync_count} or "none",
+                )
 
     def on_shutdown(self) -> None:
         """Mark bot stopped and MT5 disconnected on clean shutdown."""
@@ -121,8 +171,6 @@ class SupabaseSync:
     def _resolve_user_id(self, bridge: Any) -> Optional[str]:
         if self._user_id:
             return self._user_id
-        # Prefer the live login number from MT5 account_info (works when the bridge
-        # connects to an already-running terminal with account=0 in config).
         try:
             info = bridge.get_account_info_raw()
             acct = str(int(getattr(info, "login", 0) or 0))
@@ -133,7 +181,7 @@ class SupabaseSync:
         rows = self._get("mt5_accounts", {"account_number": f"eq.{acct}", "select": "user_id"})
         if rows:
             self._user_id = rows[0]["user_id"]
-            log.info("[SYNC] Linked MT5 account=%s to user_id=%s", acct, self._user_id)
+            log.warning("[SYNC] Linked MT5 account=%s to user_id=%s", acct, self._user_id)
         return self._user_id
 
     # ── Account ───────────────────────────────────────────────────────────────
@@ -159,7 +207,6 @@ class SupabaseSync:
     def _sync_positions(self, bridge: Any, user_id: str) -> None:
         try:
             positions = bridge.get_open_positions()
-            # Atomic replace: delete all user's rows then insert current state
             self._delete("open_positions", {"user_id": f"eq.{user_id}"})
             for p in positions:
                 ticket = p.get("ticket")
@@ -204,17 +251,88 @@ class SupabaseSync:
         except Exception as exc:
             log.debug("[SYNC] _sync_trades error: %s", exc)
 
+    def _push_trade(self, t: Dict, user_id: str, status: str) -> None:
+        ticket = t.get("ticket")
+        if not ticket:
+            return
+
+        # Closed trades are immutable — once synced, never touch them again.
+        # This eliminates the per-cycle PATCH storm on historical closed trades.
+        if status == "closed" and ticket in self._synced_closed:
+            self._skipped_closed += 1
+            return
+
+        tier_raw = t.get("tier")
+        payload: Dict[str, Any] = {
+            "user_id":      user_id,
+            "mt5_ticket":   ticket,
+            "symbol":       t.get("symbol", ""),
+            "direction":    t.get("direction", "BUY"),
+            "entry_price":  t.get("entry_price"),
+            "sl":           t.get("stop_loss"),
+            "tp":           t.get("take_profit"),
+            "lot_size":     t.get("lot_size"),
+            "status":       status,
+            "rr_ratio":     t.get("risk_reward"),
+            "score":        t.get("total_score"),
+            "confidence":   t.get("confidence"),
+            "tier":         f"T{tier_raw}" if tier_raw else None,
+            "opened_at":    t.get("opened_at") or None,
+            # NOTE: trade_source is NOT included — it is not in the Supabase
+            # trades schema. Including it causes PGRST204 400 on every request.
+        }
+        if status == "closed":
+            payload["pnl_zar"]   = round(float(t.get("profit_zar", 0.0) or 0.0), 2)
+            payload["pnl_pips"]  = round(float(t.get("pips",        0.0) or 0.0), 2)
+            payload["closed_at"] = t.get("closed_at") or None
+
+        existing = self._get("trades", {
+            "mt5_ticket": f"eq.{ticket}",
+            "user_id":    f"eq.{user_id}",
+            "select":     "id",
+        })
+        if existing:
+            update = {k: v for k, v in payload.items() if k not in ("user_id", "mt5_ticket")}
+            ok = self._patch("trades", {"mt5_ticket": f"eq.{ticket}", "user_id": f"eq.{user_id}"}, update)
+        else:
+            ok = self._insert("trades", payload)
+
+        if ok and status == "closed":
+            self._synced_closed.add(ticket)
+
+    # ── Daily analytics ───────────────────────────────────────────────────────
+
+    def _sync_daily_analytics(self, trade_logger: Any, user_id: str) -> None:
+        try:
+            if trade_logger.total_closed() == 0:
+                return
+            from aurex_ai.analytics.performance import PerformanceEngine
+            report = PerformanceEngine.compute(trade_logger, window=200)
+            wins   = max(0, int(round(report.total_closed * report.win_rate)))
+            losses = report.total_closed - wins
+            self._upsert("daily_analytics", {
+                "user_id":          user_id,
+                "date":             datetime.now(timezone.utc).date().isoformat(),
+                "win_rate":         round(report.win_rate, 4),
+                "profit_factor":    round(max(0.0, report.profit_factor), 4),
+                "total_trades":     report.total_closed,
+                "winning_trades":   wins,
+                "losing_trades":    losses,
+                "gross_profit":     0.0,
+                "gross_loss":       0.0,
+                "total_pnl":        round(report.total_pnl_zar, 2),
+                "max_drawdown_pct": round(abs(report.max_drawdown_pct), 4),
+                "best_trade":       0.0,
+                "worst_trade":      0.0,
+            }, conflict="user_id,date")
+        except Exception as exc:
+            log.debug("[SYNC] _sync_daily_analytics error: %s", exc)
+
     # ── AI analytics dashboard ────────────────────────────────────────────────
 
     def _sync_ai_analytics(self, trade_logger: Any, user_id: str) -> None:
         """
         Sync AI_FORWARD_V2 performance breakdown to Supabase.
-
-        Pushes one row per (trade_source, strategy_version) combination
-        to the `ai_analytics_snapshot` table so the dashboard can render:
-          • AI-only WR, PF, expectancy, DD
-          • Source comparison (AI_AUTO vs MANUAL vs HYBRID)
-          • Symbol / session / setup breakdowns (from component_deltas + symbol_pnl)
 
         Table schema (create once in Supabase dashboard):
           CREATE TABLE IF NOT EXISTS ai_analytics_snapshot (
@@ -242,7 +360,6 @@ class SupabaseSync:
 
             today = datetime.now(timezone.utc).date().isoformat()
 
-            # AI_FORWARD_V2 report (primary clean-baseline panel)
             ai_report = PerformanceEngine.compute_ai_forward(trade_logger)
             self._upsert("ai_analytics_snapshot", {
                 "user_id":          user_id,
@@ -261,7 +378,6 @@ class SupabaseSync:
                 "computed_at":      _now_iso(),
             }, conflict="user_id,snapshot_date,strategy_version,trade_source")
 
-            # Source comparison (ALL sources, legacy-inclusive)
             for src in (AI_AUTO, MANUAL, HYBRID):
                 n = trade_logger.total_closed(sources=[src])
                 if n == 0:
@@ -353,7 +469,6 @@ class SupabaseSync:
             paper_stats   = trade_logger.get_paper_trade_stats(window=200)
             funnel_stats  = SignalTelemetry.get_instance().get_funnel_stats()
             top_rej       = funnel_stats.get("top_rejections", {})
-            # Serialize top_rejections dict as a compact string for a TEXT column
             top_rej_str   = "|".join(f"{k}:{v}" for k, v in list(top_rej.items())[:5])
 
             self._upsert("ai_signal_intelligence", {
@@ -382,115 +497,117 @@ class SupabaseSync:
         except Exception as exc:
             log.debug("[SYNC] _sync_signal_intelligence error: %s", exc)
 
-    def _push_trade(self, t: Dict, user_id: str, status: str) -> None:
-        ticket = t.get("ticket")
-        if not ticket:
-            return
-        tier_raw = t.get("tier")
-        payload: Dict[str, Any] = {
-            "user_id":      user_id,
-            "mt5_ticket":   ticket,
-            "symbol":       t.get("symbol", ""),
-            "direction":    t.get("direction", "BUY"),
-            "entry_price":  t.get("entry_price"),
-            "sl":           t.get("stop_loss"),
-            "tp":           t.get("take_profit"),
-            "lot_size":     t.get("lot_size"),
-            "status":       status,
-            "rr_ratio":     t.get("risk_reward"),
-            "score":        t.get("total_score"),
-            "confidence":   t.get("confidence"),
-            "tier":         f"T{tier_raw}" if tier_raw else None,
-            "opened_at":    t.get("opened_at") or None,
-            "trade_source": t.get("trade_source", "AI_AUTO"),
-        }
-        if status == "closed":
-            payload["pnl_zar"]   = round(float(t.get("profit_zar", 0.0) or 0.0), 2)
-            payload["pnl_pips"]  = round(float(t.get("pips",        0.0) or 0.0), 2)
-            payload["closed_at"] = t.get("closed_at") or None
-        # trades.mt5_ticket has no UNIQUE constraint — use check-then-insert/update
-        existing = self._get("trades", {
-            "mt5_ticket": f"eq.{ticket}",
-            "user_id":    f"eq.{user_id}",
-            "select":     "id",
-        })
-        if existing:
-            update = {k: v for k, v in payload.items() if k not in ("user_id", "mt5_ticket")}
-            self._patch("trades", {"mt5_ticket": f"eq.{ticket}", "user_id": f"eq.{user_id}"}, update)
-        else:
-            self._insert("trades", payload)
-
-    # ── Daily analytics ───────────────────────────────────────────────────────
-
-    def _sync_daily_analytics(self, trade_logger: Any, user_id: str) -> None:
-        try:
-            if trade_logger.total_closed() == 0:
-                return
-            from aurex_ai.analytics.performance import PerformanceEngine
-            report = PerformanceEngine.compute(trade_logger, window=200)
-            wins   = max(0, int(round(report.total_closed * report.win_rate)))
-            losses = report.total_closed - wins
-            self._upsert("daily_analytics", {
-                "user_id":          user_id,
-                "date":             datetime.now(timezone.utc).date().isoformat(),
-                "win_rate":         round(report.win_rate, 4),
-                "profit_factor":    round(max(0.0, report.profit_factor), 4),
-                "total_trades":     report.total_closed,
-                "winning_trades":   wins,
-                "losing_trades":    losses,
-                "gross_profit":     0.0,
-                "gross_loss":       0.0,
-                "total_pnl":        round(report.total_pnl_zar, 2),
-                "max_drawdown_pct": round(abs(report.max_drawdown_pct), 4),
-                "best_trade":       0.0,
-                "worst_trade":      0.0,
-            }, conflict="user_id,date")
-        except Exception as exc:
-            log.debug("[SYNC] _sync_daily_analytics error: %s", exc)
-
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
+    def _is_circuit_open(self, table: str) -> bool:
+        """Return True if this table's circuit breaker is tripped (skip it)."""
+        skip_until = self._circuit_skip_until.get(table, 0)
+        return self._sync_count < skip_until
+
+    def _record_table_error(self, table: str, status: int) -> None:
+        """Increment error counter; trip circuit breaker after threshold."""
+        n = self._circuit_consec_err.get(table, 0) + 1
+        self._circuit_consec_err[table] = n
+        if n >= _CIRCUIT_BREAK_THRESHOLD:
+            skip_until = self._sync_count + _CIRCUIT_SKIP_CYCLES
+            self._circuit_skip_until[table] = skip_until
+            log.warning(
+                "[SYNC] [CIRCUIT BREAKER] table=%s status=%d errors=%d — "
+                "skipping for %d cycles (resumes at cycle=%d)",
+                table, status, n, _CIRCUIT_SKIP_CYCLES, skip_until,
+            )
+
+    def _record_table_ok(self, table: str) -> None:
+        self._circuit_consec_err[table] = 0
+
     def _get(self, table: str, params: Dict[str, str]) -> List[Dict]:
+        if self._is_circuit_open(table):
+            return []
         try:
             r = self._client.get(table, params=params)
             if r.status_code == 200:
+                self._record_table_ok(table)
                 return r.json()
             log.debug("[SYNC] GET %s status=%d", table, r.status_code)
+            if r.status_code in (400, 404):
+                self._record_table_error(table, r.status_code)
         except Exception as exc:
             log.debug("[SYNC] GET %s error: %s", table, exc)
         return []
 
-    def _patch(self, table: str, filters: Dict[str, str], payload: Dict) -> None:
+    def _patch(self, table: str, filters: Dict[str, str], payload: Dict) -> bool:
+        """Returns True on success, False on error."""
+        if self._is_circuit_open(table):
+            return False
         try:
             r = self._client.patch(table, params=filters, json=payload,
                                    headers={"Prefer": "return=minimal"})
-            if r.status_code not in (200, 204):
-                log.debug("[SYNC] PATCH %s status=%d body=%s", table, r.status_code, r.text[:200])
+            if r.status_code in (200, 204):
+                self._patch_ok += 1
+                self._record_table_ok(table)
+                return True
+            self._patch_err += 1
+            self._record_table_error(table, r.status_code)
+            log.warning(
+                "[SUPABASE PATCH ERROR] table=%s status=%d | "
+                "body=%s | payload_keys=%s | filters=%s",
+                table, r.status_code,
+                r.text[:300],
+                list(payload.keys()),
+                filters,
+            )
         except Exception as exc:
+            self._patch_err += 1
             log.debug("[SYNC] PATCH %s error: %s", table, exc)
+        return False
 
     def _delete(self, table: str, filters: Dict[str, str]) -> None:
+        if self._is_circuit_open(table):
+            return
         try:
             r = self._client.delete(table, params=filters,
                                     headers={"Prefer": "return=minimal"})
-            if r.status_code not in (200, 204):
-                log.debug("[SYNC] DELETE %s status=%d", table, r.status_code)
+            if r.status_code in (200, 204):
+                self._record_table_ok(table)
+            else:
+                self._record_table_error(table, r.status_code)
+                log.debug("[SYNC] DELETE %s status=%d body=%s",
+                          table, r.status_code, r.text[:200])
         except Exception as exc:
             log.debug("[SYNC] DELETE %s error: %s", table, exc)
 
-    def _insert(self, table: str, payload: Dict) -> None:
+    def _insert(self, table: str, payload: Dict) -> bool:
+        """Returns True on success, False on error."""
+        if self._is_circuit_open(table):
+            return False
         try:
             r = self._client.post(
                 table,
                 json=payload,
                 headers={"Prefer": "return=minimal"},
             )
-            if r.status_code not in (200, 201, 204):
-                log.debug("[SYNC] INSERT %s status=%d body=%s", table, r.status_code, r.text[:200])
+            if r.status_code in (200, 201, 204):
+                self._insert_ok += 1
+                self._record_table_ok(table)
+                return True
+            self._insert_err += 1
+            self._record_table_error(table, r.status_code)
+            log.warning(
+                "[SUPABASE INSERT ERROR] table=%s status=%d | "
+                "body=%s | payload_keys=%s",
+                table, r.status_code,
+                r.text[:300],
+                list(payload.keys()),
+            )
         except Exception as exc:
+            self._insert_err += 1
             log.debug("[SYNC] INSERT %s error: %s", table, exc)
+        return False
 
-    def _upsert(self, table: str, payload: Dict, conflict: str = "id") -> None:
+    def _upsert(self, table: str, payload: Dict, conflict: str = "id") -> bool:
+        """Returns True on success, False on error."""
+        if self._is_circuit_open(table):
+            return False
         try:
             r = self._client.post(
                 table,
@@ -498,10 +615,23 @@ class SupabaseSync:
                 json=payload,
                 headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
             )
-            if r.status_code not in (200, 201, 204):
-                log.debug("[SYNC] UPSERT %s status=%d body=%s", table, r.status_code, r.text[:200])
+            if r.status_code in (200, 201, 204):
+                self._insert_ok += 1
+                self._record_table_ok(table)
+                return True
+            self._insert_err += 1
+            self._record_table_error(table, r.status_code)
+            log.warning(
+                "[SUPABASE UPSERT ERROR] table=%s status=%d | "
+                "body=%s | payload_keys=%s",
+                table, r.status_code,
+                r.text[:300],
+                list(payload.keys()),
+            )
         except Exception as exc:
+            self._insert_err += 1
             log.debug("[SYNC] UPSERT %s error: %s", table, exc)
+        return False
 
 
 # ── Module helpers ────────────────────────────────────────────────────────────
