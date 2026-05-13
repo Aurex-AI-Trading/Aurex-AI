@@ -146,9 +146,9 @@ class LearningEngine:
             if not _sample.allow_weight_adaptation:
                 log.info(
                     "[LEARNING] Weight adaptation deferred — "
-                    "AI_FORWARD_V2 sample too small (n=%d < 20). "
-                    "Accumulating clean data before adapting weights.",
-                    _n,
+                    "AI_FORWARD_V2 sample insufficient (n=%d < 100, status=%s). "
+                    "Requires VALID status (100+ clean AI_AUTO trades) before weights adjust.",
+                    _n, _sample.status,
                 )
                 return
         except Exception:

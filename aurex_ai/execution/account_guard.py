@@ -69,8 +69,9 @@ _STATE_FILE          = Path(__file__).resolve().parent.parent / "data" / "accoun
 
 # ── Adaptive symbol thresholds ────────────────────────────────────────────────
 # Balance-based symbol activation gates (Phase 13 — small account survivability).
-_XAUUSD_MIN_BALANCE_ZAR   = 7000.0   # XAUUSD only allowed when balance >= this value
+_XAUUSD_MIN_BALANCE_ZAR    = 7000.0  # XAUUSD only allowed when balance >= this value
 _GBPJPY_REDUCE_BALANCE_ZAR = 3000.0  # log GBPJPY reduced-allocation warning below this
+_MICRO_ACCT_ZAR            = 1000.0  # micro-account tier: Tier 1 only, max 1 open trade
 
 
 # ── Public data classes ───────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ class SmallAccountLimits:
     max_open:      int     # maximum simultaneous open trades
     max_lot_forex: float   # hard lot cap for FX pairs
     max_lot_gold:  float   # hard lot cap for XAUUSD / gold
+    micro_mode:    bool = False  # balance < 1000 ZAR: Tier 1 only, max 1 open
 
 
 # ── Account Guard ─────────────────────────────────────────────────────────────
@@ -216,11 +218,23 @@ class AccountGuard:
         """
         Return SmallAccountLimits.  active=True when balance < threshold.
 
+        Phase 13 tiers:
+          balance < 1000 ZAR  → micro_mode: max_open=1, Tier 1 only
+          balance < 2000 ZAR  → small account: max_open=5, lot capped at 0.01
+
         Caller must apply max_lot_forex / max_lot_gold as a hard ceiling
         on the computed lot size for the respective instrument type.
         """
-        active = balance > 0 and balance < self.small_acct_bal
-        if active:
+        micro  = balance > 0 and balance < _MICRO_ACCT_ZAR
+        small  = balance > 0 and balance < self.small_acct_bal
+        active = small or micro
+        if micro:
+            log.warning(
+                "[MICRO ACCOUNT MODE] balance=%.2f ZAR < %.0f ZAR | "
+                "Tier 1 only | max_open=1 | max_lot=0.01 | capital preservation priority",
+                balance, _MICRO_ACCT_ZAR,
+            )
+        elif small:
             log.warning(
                 "[SMALL ACCOUNT MODE] balance=%.2f < threshold=%.2f ZAR | "
                 "max_open=5 max_lot_forex=0.01 max_lot_gold=0.01",
@@ -228,9 +242,10 @@ class AccountGuard:
             )
         return SmallAccountLimits(
             active        = active,
-            max_open      = 5,
+            max_open      = 1 if micro else 5,
             max_lot_forex = 0.01,
             max_lot_gold  = 0.01,
+            micro_mode    = micro,
         )
 
     # ── Telemetry ─────────────────────────────────────────────────────────────

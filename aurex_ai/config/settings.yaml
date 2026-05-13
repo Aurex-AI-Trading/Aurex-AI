@@ -108,6 +108,12 @@ strategy:
   # core_score = trend + liquidity + fvg + fib + ema + confirmation (0-100, no bonuses)
   min_core_score:        45    # Phase 10: raised from 35 — need trend + at least 2 factors
 
+  # Minimum trend strength gate (Phase 13 — trend confirmation hardening)
+  # trend.strength scale: 0-25 (H1 full align=10, H4 EMA align=10, both agree=5)
+  # 0 = gate disabled; 5 = require any measurable trend alignment (recommended)
+  # Blocks execution when trend is completely absent or contradictory across TFs.
+  min_trend_score:       5.0   # Phase 13: reject if trend_strength < 5 (no alignment whatsoever)
+
   # ATR-based SL/TP multipliers (used by risk_manager.calculate)
   sl_atr_mult: 1.5    # SL = entry ± ATR(14) × this (1.5 ATR covers ~95% of normal moves)
   tp_atr_mult: 0.0    # 0 = use dynamic RR (Phase 5). Set >0 to override with fixed multiplier.
@@ -236,22 +242,22 @@ testing:
 
 # ── Session management ────────────────────────────────────────
 session:
-  # Phase 10: Analytics-driven session tuning.
-  # Live data: best_session=overlap (13-16 UTC), worst=london (07-13 UTC).
-  # overlap was previously blocked — that was counterproductive. Fixed.
-  # London produces the most false breakouts; confidence bar is raised.
-  # Overlap + NY are the priority execution windows.
-  block_overlap:        false  # Phase 10: UNBLOCKED — overlap is the best session
-  overlap_start_hour:   13     # kept for reference
-  overlap_end_hour:     16     # kept for reference
-  # Session quality multipliers (lot size adjustment)
-  london_quality:       0.85   # Phase 10: reduced — London is worst-performing session
-  newyork_quality:      0.95   # NY pure (16-21 UTC) — solid institutional flow
-  overlap_quality:      1.00   # overlap (13-16 UTC) — best session per live analytics
-  # Session confidence threshold adjustments (extra pts required)
-  london_open_conf_penalty:  6    # Phase 10: raised from 3 — noisiest window
-  newyork_conf_penalty:      2    # Phase 10: reduced from 4 — NY performs well
-  overlap_conf_bonus:        0    # overlap: no extra penalty needed
+  # Phase 13: Live WR data REVERSED Phase 10 session conclusions.
+  # Confirmed: best_session=newyork (16-21 UTC), worst=overlap (13-16 UTC).
+  # OVERLAP BLOCKED — consistent underperformance vs NY and London.
+  # Re-enable overlap only with statistically significant WR improvement (>35%).
+  # London is the secondary session; NY is the primary execution window.
+  block_overlap:        true   # Phase 13: BLOCKED — overlap worst live WR (was: false)
+  overlap_start_hour:   13
+  overlap_end_hour:     16
+  # Session quality multipliers (applied to lot size at execution)
+  london_quality:       0.90   # Phase 13: raised from 0.85 — London is 2nd-best, not worst
+  newyork_quality:      1.00   # Phase 13: raised from 0.95 — NY is best; full lot
+  overlap_quality:      0.50   # Phase 13: heavily reduced — blocked by default
+  # Session confidence adjustments (pts added to per-symbol minimum)
+  london_open_conf_penalty:  4    # Phase 13: reduced from 6 — London is 2nd-best
+  newyork_conf_penalty:      0    # Phase 13: reduced from 2 — NY best; no extra bar
+  overlap_conf_bonus:       -8    # Phase 13: heavy penalty if overlap re-enabled manually
   # Anti-overtrading session controls
   session_loss_halt:    2      # pause new entries after N losses in same session
   min_reentry_minutes:  30     # minimum gap between same-symbol same-direction entries
@@ -262,15 +268,15 @@ session:
 # Gold strictest: extreme ATR + frequent false breaks demand highest gate.
 # High-ATR FX pairs carry elevated noise — stricter threshold required.
 per_symbol:
-  # Phase 10: Updated floors based on live WR analytics.
-  # XAUUSD: best performer (44.4% WR) — keep strictest gate to preserve quality.
-  # EURUSD/USDJPY: worst performers (12-15% WR) — significantly raised.
-  # GBPJPY/GBPUSD: moderate — raised to maintain quality bar.
-  XAUUSD:   72    # Gold — 44.4% WR; keep strict; widest ATR requires strong confirmation
-  GBPJPY:   70    # Highest ATR cross — raised from 68; needs cleaner structure
-  GBPUSD:   70    # GBP cable — raised from 68; London session noise filter
-  USDJPY:   74    # Phase 10: raised from 66 — only 12.5% WR; needs macro-grade alignment
-  EURUSD:   74    # Phase 10: raised from 66 — only 15.4% WR; needs institutional quality only
+  # Phase 13: Confidence bars tightened per live WR analytics (FX-only, no gold).
+  # EURUSD WR=15.4%, USDJPY WR=12.5% — raised significantly to filter mediocre setups.
+  # GBPJPY: high ATR on small account = dangerous; stricter gate reduces exposure.
+  # XAUUSD: disabled by account_guard; threshold preserved for balance >= 7000 ZAR.
+  XAUUSD:   72    # disabled by account_guard; preserved for balance >= 7000 ZAR
+  GBPJPY:   72    # Phase 13: raised from 70 — high ATR on small account; stricter gate
+  GBPUSD:   71    # Phase 13: raised from 70 — moderate improvement
+  USDJPY:   76    # Phase 13: raised from 74 — 12.5% WR demands significantly higher bar
+  EURUSD:   76    # Phase 13: raised from 74 — 15.4% WR demands significantly higher bar
 
 # ── Trading mode gate presets ─────────────────────────────────
 # These override the individual strategy/risk/scoring values at runtime.
@@ -293,20 +299,20 @@ per_symbol:
 
 modes:
   normal:
-    # ── Institutional Normal: Phase 10 Performance Optimization ──────────────
-    # Analytics: WR=16% DD=-85% → aggressive quality filtering required.
-    # Strongest factors: order_block, trend, fibonacci (per analytics).
-    # Weakest factor: breakout (demoted to minor confirmation only).
-    # Session: overlap=best, london=worst → session weights adjusted.
-    # Tier thresholds raised to eliminate low-quality Tier-2 trades.
-    # min_core_score raised: bonuses cannot rescue a weak core signal.
-    min_confidence:       70     # Phase 10: raised from 68 — base forex floor
-    min_atr_pips:         8.0    # Phase 10: raised from 6 — need real volatility
-    atr_optimal_max_pips: 35     # slightly wider — XAUUSD benefits from higher ATR
-    min_core_score:       48.0   # Phase 10: raised from 42 — trend+OB+Fib minimum
+    # ── Institutional Normal: Phase 13 Strategy Refinement ───────────────────
+    # WR=16%, DD=-85%. Reducing low-quality trade volume via stricter quality gates.
+    # Session: NY=best (raised to 1.00), Overlap=blocked (reversed Phase 10 conclusion).
+    # XAUUSD removed — FX-only environment; tighten ATR ceiling for FX pairs.
+    # Liquidity weight reduced: weak factor in FX context; cap contribution at 10 pts.
+    # Quality-C trades blocked: only A+/A/B grades execute in normal mode.
+    # Trend gate added: minimum trend strength required before confluence check.
+    min_confidence:       71     # Phase 13: raised from 70 — FX-only, no gold dilution
+    min_atr_pips:         8.0    # unchanged — ATR floor appropriate for FX pairs
+    atr_optimal_max_pips: 30     # Phase 13: tightened from 35 — FX pairs; gold removed
+    min_core_score:       52.0   # Phase 13: raised from 48 — trend must contribute substance
     min_execution_tier:   2      # Tier 1+2 only; Tier 3 blocked
-    tier1:                80     # Phase 10: raised from 72 — A+ institutional only
-    tier2:                70     # Phase 10: raised from 65 — must have 2+ aligned factors
+    tier1:                80     # unchanged — A+ institutional only
+    tier2:                70     # unchanged — must have 2+ aligned factors
     tier3:                55     # blocked by min_execution_tier=2
     # Minimum vote count before tier check (set in confluence/decision logic)
     min_votes_tier1:      2      # Tier 1 needs ≥2 directional votes
@@ -320,12 +326,12 @@ modes:
       # A premium trend+OB+Fib setup scores ~88 (clear Tier 1).
       # A trend+Fib-only setup scores ~72 (low Tier 1 / high Tier 2).
       # Breakout alone cannot reach Tier 2 — must be confluence-confirmed.
-      trend:        40   # Phase 10: raised from 38 — primary analytical edge
-      liquidity:    18   # sweep: secondary institutional confirmation
-      fvg:           8   # valid in overlap/NY; doesn't need to dominate
-      fibonacci:    20   # Phase 10: raised from 18 — golden zone is core entry signal
-      ema:          10   # EMA proximity: continuation zone timing
-      confirmation:  4   # candle pattern: confirms, never leads
+      trend:        40   # unchanged — primary analytical edge; raises core when strong
+      liquidity:    10   # Phase 13: reduced from 18 — weak FX factor; cap at 10 pts max
+      fvg:           8   # unchanged — valid in London/NY; secondary to trend+OB
+      fibonacci:    20   # unchanged — golden zone is core entry signal
+      ema:          10   # unchanged — EMA proximity: continuation zone timing
+      confirmation:  4   # unchanged — candle pattern confirms, never leads
 
   aggressive:
     # ── Quality-Aggressive: small account survivability (R500/$30) ────────────

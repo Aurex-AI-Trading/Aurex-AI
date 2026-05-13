@@ -1253,9 +1253,10 @@ async def scan_symbol(
     idle_cycles:      int  = 0,
     signal_id:        str  = "",
     now_utc:          Optional[datetime] = None,
-    reentry_tracker:  Optional[ReEntryTracker] = None,
-    guard_size_mult:  float = 1.0,
-    guard:            Optional["AccountGuard"] = None,
+    reentry_tracker:      Optional[ReEntryTracker] = None,
+    guard_size_mult:      float = 1.0,
+    guard:                Optional["AccountGuard"] = None,
+    micro_account_mode:   bool  = False,
 ) -> Optional[TradeResult]:
     """
     Run the full Aurex AI pipeline for a single symbol.
@@ -1413,31 +1414,31 @@ async def scan_symbol(
         SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "OVERLAP_BLOCKED", symbol)
         return None
 
-    # ── Session quality multiplier (Phase 10: analytics-driven) ─────────────
-    # Live analytics: overlap (13-16 UTC) = BEST session, London = WORST.
-    # Overlap now allowed (block_overlap=false); session multipliers adjusted.
+    # ── Session quality multiplier (Phase 13: NY=best, Overlap=blocked) ──────
+    # Phase 13 analytics reversal: NY (16-21 UTC) = BEST, Overlap (13-16) = WORST.
+    # Overlap is blocked via config; quality mult is a fallback if unblocked.
     _sess_cfg_p5    = getattr(cfg, "session", None)
     _ov_start_hour  = int(getattr(_sess_cfg_p5, "overlap_start_hour", 13))
     _ov_end_hour    = int(getattr(_sess_cfg_p5, "overlap_end_hour",   16))
     if _ov_start_hour <= _utc_hour < _ov_end_hour:
-        # London-NY overlap — best session per analytics
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "overlap_quality", 1.00))
+        # London-NY overlap — WORST session per Phase 13 analytics (normally blocked)
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "overlap_quality", 0.50))
         log.info(
-            "[SESSION FILTER] %s OVERLAP session UTC=%d quality=%.0f%% [BEST SESSION]",
+            "[SESSION FILTER] %s OVERLAP session UTC=%d quality=%.0f%% [WORST SESSION]",
             symbol, _utc_hour, _session_quality_mult * 100,
         )
     elif 16 <= _utc_hour < 21:
-        # NY pure session
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "newyork_quality", 0.95))
+        # NY pure session — BEST session per Phase 13 analytics
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "newyork_quality", 1.00))
         log.info(
-            "[SESSION FILTER] %s NY session UTC=%d quality=%.0f%%",
+            "[SESSION FILTER] %s NY session UTC=%d quality=%.0f%% [BEST SESSION]",
             symbol, _utc_hour, _session_quality_mult * 100,
         )
     else:
-        # London session — worst per analytics; apply reduced multiplier
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "london_quality", 0.85))
+        # London session — secondary (not worst); full but not prime window
+        _session_quality_mult = float(getattr(_sess_cfg_p5, "london_quality", 0.90))
         log.info(
-            "[SESSION FILTER] %s London session UTC=%d quality=%.0f%% [WORST SESSION]",
+            "[SESSION FILTER] %s London session UTC=%d quality=%.0f%%",
             symbol, _utc_hour, _session_quality_mult * 100,
         )
 
@@ -2435,6 +2436,22 @@ async def scan_symbol(
         _sig_reject("CORE_SCORE_TOO_LOW")
         return None
 
+    # ── Minimum trend strength gate (Phase 13) ───────────────────────────────
+    # Rejects signals where trend is completely absent or contradictory.
+    # trend.strength scale: 0–25 (H1 full align=10, H4 EMA align=10, both agree=5).
+    # A score < min_trend_score means neither timeframe shows directional consensus.
+    _min_trend_str = float(getattr(getattr(cfg, "strategy", None), "min_trend_score", 0.0))
+    if _min_trend_str > 0:
+        _trend_str_val = float(getattr(trend_result, "strength", 0.0))
+        if _trend_str_val < _min_trend_str:
+            log.warning(
+                "[BLOCKED] %s %s — trend_strength=%.1f < min=%.1f | "
+                "[TREND GATE] no meaningful trend alignment across H1/H4",
+                symbol, direction, _trend_str_val, _min_trend_str,
+            )
+            _sig_reject("TREND_STRENGTH_BELOW_MIN")
+            return None
+
     # ── Tier filter ───────────────────────────────────────────────────────────
     _min_tier = mode.min_execution_tier
     if decision.tier > _min_tier:
@@ -2447,6 +2464,18 @@ async def scan_symbol(
         _log_rejected(symbol, "TIER_BELOW_MINIMUM",
                       confidence=decision.confidence, atr=atr_pips)
         _sig_reject("TIER_BELOW_MINIMUM")
+        return None
+
+    # ── Micro account Tier 1 gate (Phase 13) ─────────────────────────────────
+    # On sub-1000 ZAR accounts, Tier 2 lots are still significant % risk.
+    # Only Tier 1 (strongest setups) execute until balance grows above 1000 ZAR.
+    if micro_account_mode and decision.tier > 1:
+        log.warning(
+            "[MICRO ACCOUNT MODE] %s — Tier %d blocked | balance < 1000 ZAR "
+            "requires Tier 1 only | score=%.1f conf=%d",
+            symbol, decision.tier, decision.score, int(confidence.total),
+        )
+        _sig_reject("MICRO_MODE_TIER2_BLOCKED")
         return None
 
     # ── Score integrity: prevent inflation from missing institutional signals ──
@@ -2500,6 +2529,20 @@ async def scan_symbol(
         _quality = "B"    # Mid-quality: passes confluence, missing signals
     else:
         _quality = "C"    # Weak setup
+
+    # ── Quality-C filter (Phase 13) ──────────────────────────────────────────
+    # Block quality-C trades in normal mode. C-grade = score passes tier threshold
+    # but lacks sweep+BOS, strong trend+OB, and score is below tier1.
+    # These low-quality setups are the primary driver of the 16% WR.
+    # Bypass is still active for high-confidence A/A+ setups.
+    if _quality == "C" and mode.name == "normal" and not _bypass:
+        log.warning(
+            "[BLOCKED] %s %s | quality=C score=%.1f conf=%d → REJECTED | "
+            "[QUALITY GATE] C-grade insufficient in normal mode",
+            symbol, direction, decision.score, int(confidence.total),
+        )
+        _sig_reject("QUALITY_C_BLOCKED")
+        return None
 
     log.warning(
         "[SCORE INTEGRITY] %s | raw=%.1f adj=%.1f penalty=%.0f%% quality=%s | %s",
@@ -3340,6 +3383,28 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         "[ACTIVE SYMBOLS] %d symbols loaded | mode=%s | %s",
         len(symbols), _mode_name, ", ".join(symbols),
     )
+
+    # ── Session intelligence startup log (Phase 13) ──────────────────────────
+    _sess_cfg_init = getattr(cfg, "session", None)
+    _ov_blocked    = bool(getattr(_sess_cfg_init, "block_overlap", True))
+    _lon_q         = float(getattr(_sess_cfg_init, "london_quality",   0.90))
+    _ny_q          = float(getattr(_sess_cfg_init, "newyork_quality",  1.00))
+    _ov_q          = float(getattr(_sess_cfg_init, "overlap_quality",  0.50))
+    _lon_pen       = int(getattr(_sess_cfg_init,   "london_open_conf_penalty", 4))
+    _ny_pen        = int(getattr(_sess_cfg_init,   "newyork_conf_penalty",     0))
+    log.warning(
+        "\n[SESSION INTELLIGENCE]\n"
+        "  London  (07-13 UTC): ENABLED  | quality=%.0f%% | conf_penalty=%+d\n"
+        "  Overlap (13-16 UTC): %-8s | quality=%.0f%%\n"
+        "  NewYork (16-21 UTC): ENABLED  | quality=%.0f%% | conf_penalty=%+d\n"
+        "  Asian   (21-07 UTC): BLOCKED  | outside institutional execution window\n"
+        "  Primary execution window: NewYork (best WR) + London (secondary)\n"
+        "  Overlap block_overlap=%s",
+        _lon_q * 100, -_lon_pen,
+        "BLOCKED" if _ov_blocked else "ENABLED", _ov_q * 100,
+        _ny_q * 100, -_ny_pen,
+        _ov_blocked,
+    )
     for _sym in symbols:
         _sym_base = _sym.upper().replace(".Z", "").replace(".M", "").replace(".ECN", "")
         _sym_gold = "XAU" in _sym_base or "GOLD" in _sym_base
@@ -3508,6 +3573,15 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         )
         log.warning(guard.telemetry(_guard_equity, _guard_balance))
 
+        # Phase 13: Micro account mode — balance < 1000 ZAR → Tier 1 only
+        _micro_account_mode = _guard_balance > 0 and _guard_balance < 1000.0
+        if _micro_account_mode and scan_num % 20 == 0:
+            log.warning(
+                "[MICRO ACCOUNT MODE] balance=%.2f ZAR < 1000 — "
+                "Tier 2 signals blocked; Tier 1 only | capital preservation priority",
+                _guard_balance,
+            )
+
         # Phase 6: telemetry cycle start + adaptive learning compute
         telemetry.cycle_start()
         _al_snap = adaptive_learning.compute(trade_logger, cfg=cfg)
@@ -3646,20 +3720,21 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
 
             try:
                 result = await scan_symbol(
-                    symbol           = sym,
-                    feed             = feed,
-                    bridge           = bridge,
-                    cooldown         = cooldown,
-                    cfg              = cfg,
-                    daily            = daily,
-                    session          = session,
-                    engine           = engine,
-                    idle_cycles      = idle_cycles,
-                    signal_id        = f"{sym}-{scan_num}",
-                    now_utc          = server_time,
-                    reentry_tracker  = reentry_tracker,
-                    guard_size_mult  = _guard_decision.size_mult,
-                    guard            = guard,
+                    symbol              = sym,
+                    feed                = feed,
+                    bridge              = bridge,
+                    cooldown            = cooldown,
+                    cfg                 = cfg,
+                    daily               = daily,
+                    session             = session,
+                    engine              = engine,
+                    idle_cycles         = idle_cycles,
+                    signal_id           = f"{sym}-{scan_num}",
+                    now_utc             = server_time,
+                    reentry_tracker     = reentry_tracker,
+                    guard_size_mult     = _guard_decision.size_mult,
+                    guard               = guard,
+                    micro_account_mode  = _micro_account_mode,
                 )
                 valid_count += 1
                 if result is not None:

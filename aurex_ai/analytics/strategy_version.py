@@ -134,8 +134,8 @@ class SampleStatus:
 
     @property
     def allow_weight_adaptation(self) -> bool:
-        """Weight adaptation should only start once BUILDING state is reached."""
-        return self.n >= 20
+        """Weight adaptation requires VALID status (n >= 100) to prevent noise-driven drift."""
+        return self.n >= MIN_VALID_SAMPLE  # was: n >= 20 (BUILDING); now: n >= 100 (VALID)
 
 
 # ── Strategy version manager ─────────────────────────────────────────────────
