@@ -12,12 +12,25 @@ Enables:
 
 DB: analytics/data/signals.db (separate from trades.db for isolation)
 
+Schema Versioning
+-----------------
+  Uses PRAGMA user_version for incremental upgrades.
+  CURRENT_SCHEMA_VERSION = 1
+
+  v0 → base schema (original Phase 12 columns only)
+  v1 → adds quality_grade, core_score, trend/ob/fvg/liq scores, pipeline_stage
+
+Resilience
+----------
+  If SQLite initialization or any migration fails, SignalStore.get_instance()
+  returns a _NullSignalStore that silently no-ops all operations.
+  Live trading always continues; only telemetry is disabled.
+
 Logs emitted
 ------------
   [SIGNAL TRACKED]      — every signal logged
   [SIGNAL RESOLVED]     — hypothetical outcome determined
-  [FILTER EFFECTIVENESS]— periodic analytics summary
-  [CONFIDENCE BAND]     — near-threshold win-rate analysis
+  [DB MIGRATION]        — schema upgrade events
 """
 from __future__ import annotations
 
@@ -49,7 +62,14 @@ HYP_EXPIRED = "EXPIRED"
 # Signal resolution window — rejected signals older than this are expired
 _RESOLUTION_HOURS = 4
 
-_CREATE_SQL = """
+# ── Schema versioning ─────────────────────────────────────────────────────────
+# Increment when adding new columns / indexes.
+# Existing DBs are migrated automatically on startup.
+_CURRENT_SCHEMA_VERSION = 1
+
+# Base schema: columns present in the original Phase 12 release (v0).
+# DO NOT add new columns here — put them in _VERSIONED_MIGRATIONS instead.
+_BASE_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol            TEXT NOT NULL,
@@ -61,19 +81,12 @@ CREATE TABLE IF NOT EXISTS signals (
     market_state      TEXT DEFAULT '',
     signal_score      REAL DEFAULT 0,
     confidence        REAL DEFAULT 0,
-    core_score        REAL DEFAULT 0,
-    quality_grade     TEXT DEFAULT '',
     atr_pips          REAL DEFAULT 0,
     spread_pips       REAL DEFAULT 0,
     trend_strength    REAL DEFAULT 0,
-    trend_score       REAL DEFAULT 0,
-    ob_score          REAL DEFAULT 0,
-    fvg_score         REAL DEFAULT 0,
-    liquidity_score   REAL DEFAULT 0,
     executed          INTEGER DEFAULT 0,
     trade_ticket      INTEGER,
     rejection_reason  TEXT DEFAULT '',
-    pipeline_stage    TEXT DEFAULT '',
     confidence_band   TEXT DEFAULT 'BELOW',
     band_distance_pts REAL DEFAULT 0,
     strategy_version  TEXT DEFAULT 'AI_FORWARD_V2',
@@ -91,21 +104,32 @@ CREATE INDEX IF NOT EXISTS idx_sig_detected ON signals(detected_at);
 CREATE INDEX IF NOT EXISTS idx_sig_executed ON signals(executed);
 CREATE INDEX IF NOT EXISTS idx_sig_outcome  ON signals(hyp_outcome);
 CREATE INDEX IF NOT EXISTS idx_sig_band     ON signals(confidence_band);
-CREATE INDEX IF NOT EXISTS idx_sig_quality  ON signals(quality_grade);
 """
 
-# Columns added after initial schema — applied via ALTER TABLE to existing DBs
-_SCHEMA_MIGRATIONS = [
-    "ALTER TABLE signals ADD COLUMN core_score      REAL DEFAULT 0",
-    "ALTER TABLE signals ADD COLUMN quality_grade   TEXT DEFAULT ''",
-    "ALTER TABLE signals ADD COLUMN trend_score     REAL DEFAULT 0",
-    "ALTER TABLE signals ADD COLUMN ob_score        REAL DEFAULT 0",
-    "ALTER TABLE signals ADD COLUMN fvg_score       REAL DEFAULT 0",
-    "ALTER TABLE signals ADD COLUMN liquidity_score REAL DEFAULT 0",
-    "ALTER TABLE signals ADD COLUMN pipeline_stage  TEXT DEFAULT ''",
-    "ALTER TABLE signals ADD COLUMN spread_pips     REAL DEFAULT 0",
-    "CREATE INDEX IF NOT EXISTS idx_sig_quality ON signals(quality_grade)",
-]
+# Versioned migrations: schema_version → list of SQL statements.
+# Each list is applied in order; individual steps that fail are logged and skipped.
+# Idempotent: duplicate column / index errors are silently ignored.
+_VERSIONED_MIGRATIONS: Dict[int, List[str]] = {
+    1: [
+        "ALTER TABLE signals ADD COLUMN core_score      REAL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN quality_grade   TEXT DEFAULT ''",
+        "ALTER TABLE signals ADD COLUMN trend_score     REAL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN ob_score        REAL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN fvg_score       REAL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN liquidity_score REAL DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN pipeline_stage  TEXT DEFAULT ''",
+        # Index must come AFTER the column is added (always last in this version)
+        "CREATE INDEX IF NOT EXISTS idx_sig_quality ON signals(quality_grade)",
+    ],
+}
+
+
+def _col_name(sql: str) -> str:
+    """Extract column name from ALTER TABLE ADD COLUMN statement (for logging)."""
+    parts = sql.strip().split()
+    if len(parts) >= 6 and "ADD" in (p.upper() for p in parts):
+        return parts[5]
+    return ""
 
 
 @dataclass
@@ -152,12 +176,51 @@ def compute_band(
     return BAND_BELOW, round(threshold - score, 1)
 
 
+class _NullSignalStore:
+    """
+    Fallback no-op store used when SQLite initialization fails.
+
+    All write methods silently succeed (return safe defaults).
+    All read methods return empty results.
+    Live trading is never interrupted by telemetry failures.
+    """
+    def log_signal(self, record: SignalRecord) -> int:
+        return 0
+
+    def mark_executed(self, signal_id: int, ticket: int) -> None:
+        pass
+
+    def mark_rejected(self, signal_id: int, reason: str) -> None:
+        pass
+
+    def update_executed_outcome(self, ticket: int, won: bool, rr: float) -> None:
+        pass
+
+    def resolve_hypotheticals(self, get_price_fn) -> int:
+        return 0
+
+    def get_filter_effectiveness(self, window: int = 200) -> Dict:
+        return {}
+
+    def get_confidence_band_stats(self) -> List[Dict]:
+        return []
+
+    def get_rejection_breakdown(self) -> Dict[str, Dict]:
+        return {}
+
+    def get_setup_expectancy(self) -> List[Dict]:
+        return []
+
+    def total_signals(self, executed_only: bool = False) -> int:
+        return 0
+
+
 class SignalStore:
     """
     Singleton SQLite store for all strategy signals.
 
     Usage:
-        store = SignalStore.get_instance()
+        store = SignalStore.get_instance()   # may return _NullSignalStore on DB failure
         sid   = store.log_signal(record)
         store.mark_rejected(sid, "LOW_CONFIDENCE")
         store.mark_executed(sid, ticket=12345)
@@ -173,8 +236,22 @@ class SignalStore:
 
     @classmethod
     def get_instance(cls) -> "SignalStore":
+        """
+        Return the singleton SignalStore.
+
+        If initialization failed, returns a _NullSignalStore so the trading
+        engine continues safely with telemetry disabled.
+        """
         if cls._instance is None:
-            cls._instance = cls()
+            try:
+                cls._instance = cls()
+                log.info("[SIGNAL STORE] Initialized successfully")
+            except Exception as exc:
+                log.warning(
+                    "[SIGNAL STORE] Initialization failed — telemetry disabled "
+                    "(live trading continues normally): %s", exc,
+                )
+                cls._instance = _NullSignalStore()  # type: ignore[assignment]
         return cls._instance
 
     def _connect(self) -> sqlite3.Connection:
@@ -183,17 +260,85 @@ class SignalStore:
         return conn
 
     def _init_db(self) -> None:
+        """
+        Initialize the signals database with proper schema versioning.
+
+        1. Creates the base table + indexes (idempotent on every run).
+        2. Reads PRAGMA user_version to determine which migrations are pending.
+        3. Applies each pending migration version in order.
+        4. Updates PRAGMA user_version after each successful version block.
+
+        Individual migration steps (ALTER TABLE, CREATE INDEX) are individually
+        wrapped; duplicate-column / already-exists errors are silently skipped.
+        Other errors are logged but do not abort the migration sequence.
+        """
         with self._connect() as conn:
-            for stmt in _CREATE_SQL.strip().split(";"):
+            # ── Step 1: Create base schema (idempotent) ───────────────────────
+            for stmt in _BASE_CREATE_SQL.strip().split(";"):
                 stmt = stmt.strip()
                 if stmt:
                     conn.execute(stmt)
-            # Apply schema migrations for existing DBs (ignore "duplicate column" errors)
-            for migration in _SCHEMA_MIGRATIONS:
-                try:
-                    conn.execute(migration)
-                except Exception:
-                    pass
+
+            # ── Step 2: Read current schema version ───────────────────────────
+            current_version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+            log.info(
+                "[DB MIGRATION] signals.db schema v%d (target v%d)",
+                current_version, _CURRENT_SCHEMA_VERSION,
+            )
+
+            if current_version >= _CURRENT_SCHEMA_VERSION:
+                log.info(
+                    "[DB MIGRATION] Schema is current at v%d — no migrations needed",
+                    current_version,
+                )
+                return
+
+            # ── Step 3: Apply pending migration versions in order ─────────────
+            for target_ver, stmts in sorted(_VERSIONED_MIGRATIONS.items()):
+                if current_version >= target_ver:
+                    continue
+
+                log.warning(
+                    "[DB MIGRATION] Applying schema upgrade v%d to v%d ...",
+                    current_version, target_ver,
+                )
+                applied = 0
+                skipped = 0
+
+                for stmt in stmts:
+                    try:
+                        conn.execute(stmt)
+                        col = _col_name(stmt)
+                        if col:
+                            log.warning("[DB MIGRATION] Added missing column: %s", col)
+                        else:
+                            log.info("[DB MIGRATION] Applied: %s", stmt[:70])
+                        applied += 1
+
+                    except sqlite3.OperationalError as exc:
+                        err = str(exc).lower()
+                        if "duplicate column" in err or "already exists" in err:
+                            col = _col_name(stmt)
+                            log.debug(
+                                "[DB MIGRATION] Already exists — skipped: %s",
+                                col or stmt[:60],
+                            )
+                            skipped += 1
+                        else:
+                            log.warning(
+                                "[DB MIGRATION] Step failed (non-critical, skipping): %s | %s",
+                                stmt[:60], exc,
+                            )
+                            skipped += 1
+
+                # Update version even if some steps were skipped (idempotent intent)
+                conn.execute(f"PRAGMA user_version = {target_ver}")
+                log.warning(
+                    "[DB MIGRATION] Schema upgraded successfully to v%d "
+                    "(%d applied, %d skipped)",
+                    target_ver, applied, skipped,
+                )
+                current_version = target_ver
 
     # ── Write operations ──────────────────────────────────────────────────────
 
@@ -284,8 +429,8 @@ class SignalStore:
 
         Returns count of signals resolved this call.
         """
-        now     = datetime.now(timezone.utc)
-        cutoff  = (now - timedelta(hours=_RESOLUTION_HOURS)).isoformat(timespec="seconds")
+        now      = datetime.now(timezone.utc)
+        cutoff   = (now - timedelta(hours=_RESOLUTION_HOURS)).isoformat(timespec="seconds")
         resolved = 0
 
         with self._lock:
@@ -379,11 +524,11 @@ class SignalStore:
         Compute filter effectiveness over the last `window` resolved signals.
 
         Returns:
-            exec_win_rate      — real executed win rate
-            false_negative_rate — fraction of rejected signals that would have WON
-            false_positive_rate — fraction of executed signals that LOST
+            exec_win_rate        — real executed win rate
+            false_negative_rate  — fraction of rejected signals that would have WON
+            false_positive_rate  — fraction of executed signals that LOST
             missed_opportunities — count of rejected-would-win signals
-            successful_rejections — count of rejected-would-lose signals
+            successful_rejections— count of rejected-would-lose signals
         """
         with self._connect() as conn:
             rows = conn.execute("""
@@ -397,16 +542,16 @@ class SignalStore:
         if not rows:
             return {}
 
-        total      = len(rows)
-        executed   = [r for r in rows if r["executed"]]
-        rejected   = [r for r in rows if not r["executed"]]
-        exec_wins  = [r for r in executed if r["hyp_outcome"] == HYP_WIN]
-        exec_losses= [r for r in executed if r["hyp_outcome"] == HYP_LOSS]
-        rej_win    = [r for r in rejected if r["hyp_outcome"] == HYP_WIN]
-        rej_lose   = [r for r in rejected if r["hyp_outcome"] == HYP_LOSS]
+        total       = len(rows)
+        executed    = [r for r in rows if r["executed"]]
+        rejected    = [r for r in rows if not r["executed"]]
+        exec_wins   = [r for r in executed if r["hyp_outcome"] == HYP_WIN]
+        exec_losses = [r for r in executed if r["hyp_outcome"] == HYP_LOSS]
+        rej_win     = [r for r in rejected if r["hyp_outcome"] == HYP_WIN]
+        rej_lose    = [r for r in rejected if r["hyp_outcome"] == HYP_LOSS]
 
-        near_band  = [r for r in rejected if r["confidence_band"] == BAND_NEAR]
-        near_wins  = [r for r in near_band if r["hyp_outcome"] == HYP_WIN]
+        near_band = [r for r in rejected if r["confidence_band"] == BAND_NEAR]
+        near_wins = [r for r in near_band if r["hyp_outcome"] == HYP_WIN]
 
         reason_counts: Dict[str, int] = {}
         for r in rejected:
@@ -417,13 +562,13 @@ class SignalStore:
             "total_signals":         total,
             "executed_count":        len(executed),
             "rejected_count":        len(rejected),
-            "exec_win_rate":         len(exec_wins)  / max(len(executed), 1),
-            "false_negative_rate":   len(rej_win)    / max(len(rejected), 1),
-            "false_positive_rate":   len(exec_losses)/ max(len(executed), 1),
+            "exec_win_rate":         len(exec_wins)   / max(len(executed), 1),
+            "false_negative_rate":   len(rej_win)     / max(len(rejected), 1),
+            "false_positive_rate":   len(exec_losses) / max(len(executed), 1),
             "missed_opportunities":  len(rej_win),
             "successful_rejections": len(rej_lose),
             "near_band_count":       len(near_band),
-            "near_band_win_rate":    len(near_wins)  / max(len(near_band), 1),
+            "near_band_win_rate":    len(near_wins)   / max(len(near_band), 1),
             "rejection_reasons":     reason_counts,
         }
 
@@ -464,7 +609,7 @@ class SignalStore:
             """).fetchall()
         return {
             r["rejection_reason"]: {
-                "n":             r["n"],
+                "n":              r["n"],
                 "would_have_won": r["wins"],
                 "fn_rate":        r["wins"] / r["n"] if r["n"] else 0.0,
             }
