@@ -1374,6 +1374,15 @@ async def scan_symbol(
     except Exception:
         exec_quality = None
 
+    try:
+        adaptive_learning = AdaptiveLearning.get_instance()
+    except Exception as _al_exc:
+        adaptive_learning = None
+        log.warning(
+            "[ADAPTIVE LEARNING] status=MISSING fallback=modifier_1.0 symbol=%s err=%s",
+            symbol, _al_exc,
+        )
+
     log.warning(
         "[RUNTIME TRACE] stage=pre_signal_validation symbol=%s failsafe_loaded=%s",
         symbol, _failsafe_loaded,
@@ -1901,8 +1910,8 @@ async def scan_symbol(
     # Layer 4: AI adaptive learning modifier
     # If a symbol has been underperforming (modifier < 1.0), raise the threshold.
     # This dynamically tightens the gate for symbols with poor recent win rates.
-    _al_sym_mod  = adaptive_learning.get_symbol_modifier(symbol)   # 0.70–1.00
-    _al_sess_mod = adaptive_learning.get_session_modifier(current_time.hour)  # 0.75–1.00
+    _al_sym_mod  = adaptive_learning.get_symbol_modifier(symbol) if adaptive_learning is not None else 1.0   # 0.70–1.00
+    _al_sess_mod = adaptive_learning.get_session_modifier(current_time.hour) if adaptive_learning is not None else 1.0  # 0.75–1.00
     # Underperformance penalty: modifier=0.70 → +12 pts; modifier=0.85 → +6 pts; modifier=1.0 → 0
     _al_sym_penalty  = round((1.0 - _al_sym_mod)  * 40)   # max +12 at worst modifier
     _al_sess_penalty = round((1.0 - _al_sess_mod) * 20)   # max +5 at worst session modifier
