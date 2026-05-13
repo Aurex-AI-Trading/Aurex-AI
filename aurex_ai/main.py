@@ -124,6 +124,10 @@ log = get_logger("main")
 
 _SHUTDOWN = asyncio.Event()
 
+# Watchdog timestamp — updated at the top of every scan cycle.
+# _runtime_watchdog() checks this every 30s; stale > 60s → warning dump.
+_last_cycle_ts: float = 0.0
+
 
 # ── Pip-size helper ───────────────────────────────────────────────────────────
 
@@ -426,6 +430,10 @@ class _SessionState:
     gross_loss:       float = 0.0
     open_tickets:     Set[int]         = field(default_factory=set)
     open_trade_meta:  Dict[int, dict]  = field(default_factory=dict)
+    # Phase 10 anti-overtrading state — shared between scan_symbol and _check_live_outcomes
+    session_losses:   int              = 0
+    session_date:     str              = ""
+    last_entry_ts:    Dict[str, datetime] = field(default_factory=dict)
 
     def record_trade(self, pnl: float) -> None:
         self.total_trades += 1
@@ -1500,15 +1508,15 @@ async def scan_symbol(
     _sess_cfg        = getattr(cfg, "session", None)
     _sess_loss_halt  = int(getattr(_sess_cfg, "session_loss_halt", 2))
     _today_str       = current_time.strftime("%Y-%m-%d")
-    if _session_date != _today_str:
+    if session.session_date != _today_str:
         # New UTC day — reset session loss counter
-        _session_losses = 0
-        _session_date   = _today_str
-    if _session_losses >= _sess_loss_halt:
+        session.session_losses = 0
+        session.session_date   = _today_str
+    if session.session_losses >= _sess_loss_halt:
         log.info(
             "[SESSION HALT] %s — %d session losses reached limit of %d "
             "→ no new entries until next UTC day",
-            symbol, _session_losses, _sess_loss_halt,
+            symbol, session.session_losses, _sess_loss_halt,
         )
         SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "SESSION_LOSS_HALT", symbol)
         return None
@@ -1516,7 +1524,7 @@ async def scan_symbol(
     # ── Phase 10: Anti-overtrading: minimum re-entry gap ─────────────────────
     # Prevent clustered entries on the same symbol (e.g. chasing after a quick loss).
     _min_reentry = int(getattr(_sess_cfg, "min_reentry_minutes", 30))
-    _last_ts     = _last_entry_ts.get(symbol)
+    _last_ts     = session.last_entry_ts.get(symbol)
     if _last_ts is not None:
         _elapsed_min = (current_time - _last_ts).total_seconds() / 60.0
         if _elapsed_min < _min_reentry:
@@ -3478,6 +3486,44 @@ def _reconcile_open_db_trades(bridge: MT5Bridge, trade_logger) -> int:
     return count
 
 
+# ── Runtime watchdog ──────────────────────────────────────────────────────────
+
+async def _runtime_watchdog(interval: float = 30.0, stale_threshold: float = 90.0) -> None:
+    """
+    Background task: if the main scan loop has not advanced for > stale_threshold
+    seconds, emit [RUNTIME WATCHDOG] with thread/task state for diagnostics.
+    Polls every `interval` seconds.
+    """
+    import threading
+    await asyncio.sleep(interval)   # allow first cycle to start before first check
+    while not _SHUTDOWN.is_set():
+        await asyncio.sleep(interval)
+        if _last_cycle_ts == 0.0:
+            continue
+        stale = asyncio.get_event_loop().time() - _last_cycle_ts
+        if stale > stale_threshold:
+            log.warning(
+                "[RUNTIME WATCHDOG] STALE LOOP — no cycle advance for %.0fs "
+                "(threshold=%.0fs). Possible hang in MT5 call, Supabase sync, or symbol scan.",
+                stale, stale_threshold,
+            )
+            # Dump active asyncio tasks
+            try:
+                _tasks = [t for t in asyncio.all_tasks() if not t.done()]
+                for _t in _tasks:
+                    log.warning("[RUNTIME WATCHDOG] active_task: %s", _t.get_name())
+            except Exception:
+                pass
+            # Dump Python threads
+            try:
+                for _tid, _frame in sys._current_frames().items():
+                    import traceback as _tb
+                    _stack = "".join(_tb.format_stack(_frame, limit=8))
+                    log.warning("[RUNTIME WATCHDOG] thread tid=%d:\n%s", _tid, _stack)
+            except Exception:
+                pass
+
+
 # ── Live scan loop ─────────────────────────────────────────────────────────────
 
 async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None:
@@ -3667,20 +3713,19 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
 
     scan_num    = 0
     idle_cycles = 0
+    # Phase 10: Anti-overtrading state lives on session object (session_losses,
+    # session_date, last_entry_ts) so scan_symbol and _check_live_outcomes share it.
 
-    # Phase 10: Anti-overtrading state — session-loss counter and entry timer.
-    # _session_losses: counts losses in the current UTC-date-session window.
-    # _session_date:   the date string when session_losses was last reset.
-    # _last_entry_ts:  {symbol → datetime} — timestamp of most recent entry per symbol.
-    # Used to enforce min_reentry_minutes and session_loss_halt rules.
-    _session_losses: int   = 0
-    _session_date:   str   = ""
-    _last_entry_ts:  dict  = {}   # symbol → datetime of last entry
+    # Start background watchdog — detects loop hangs > 90s and dumps task/thread state
+    asyncio.ensure_future(_runtime_watchdog())
+    log.warning("[RUNTIME WATCHDOG] watchdog task started (check_interval=30s stale_threshold=90s)")
 
     while not _SHUTDOWN.is_set():
-        scan_num    = scan_num + 1
-        t_start     = asyncio.get_event_loop().time()
-        server_time = get_mt5_time()
+        global _last_cycle_ts
+        scan_num      = scan_num + 1
+        t_start       = asyncio.get_event_loop().time()
+        _last_cycle_ts = t_start
+        server_time   = get_mt5_time()
         now_ts      = server_time.strftime("%Y-%m-%d %H:%M:%S")
 
         if not is_mt5_time_fresh() and not bridge.dry_run:
@@ -3703,8 +3748,8 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         except Exception as _pe_exc:
             log.debug("[PERFORMANCE] snapshot error: %s", _pe_exc)
 
-        log.info(
-            "[HEARTBEAT] cycle=%d timestamp=%s symbols=%d trades_today=%d open=%d idle=%d",
+        log.warning(
+            "[RUNTIME LOOP] cycle=%d ts=%s symbols=%d trades_today=%d open=%d idle=%d",
             scan_num, now_ts, len(symbols), daily.trades, len(session.open_tickets), idle_cycles,
         )
 
@@ -3866,7 +3911,7 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         except Exception:
             pass
 
-        log.info("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
+        log.warning("[SCAN START] cycle=%d symbols=%d", scan_num, len(symbols))
 
         # Push live data to Supabase (non-blocking — runs in thread)
         if sync is not None and not bridge.dry_run:
@@ -3957,7 +4002,9 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 continue
 
             cached_conf = _symbol_confidence_cache.get(sym, 0.0)
-            log.info("[TOP PICK] Executing %s (confidence=%.0f)", sym, cached_conf)
+            _sym_t0 = asyncio.get_event_loop().time()
+            log.warning("[SCAN SYMBOL] cycle=%d scanning %s (conf_cache=%.0f)",
+                        scan_num, sym, cached_conf)
 
             try:
                 result = await scan_symbol(
@@ -3977,14 +4024,23 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                     guard               = guard,
                     micro_account_mode  = _micro_account_mode,
                 )
+                _sym_ms = round((asyncio.get_event_loop().time() - _sym_t0) * 1000)
+                log.warning("[SCAN TIMING] cycle=%d %s completed in %dms result=%s",
+                            scan_num, sym, _sym_ms,
+                            "TRADE" if result is not None else "no_signal")
                 valid_count += 1
                 if result is not None:
                     signals_generated += 1
                     trades_this_cycle += 1
                     # Phase 10: Record entry timestamp for anti-overtrading gate
-                    _last_entry_ts[sym] = server_time
+                    session.last_entry_ts[sym] = server_time
             except Exception as exc:
-                log.error("[ERROR] symbol=%s error=%s", sym, exc, exc_info=True)
+                _sym_ms = round((asyncio.get_event_loop().time() - _sym_t0) * 1000)
+                log.error(
+                    "[RUNTIME ERROR] cycle=%d %s EXCEPTION after %dms — %s: %s",
+                    scan_num, sym, _sym_ms, type(exc).__name__, exc,
+                    exc_info=True,
+                )
 
         # Update idle cycle counter
         if signals_generated > 0:
@@ -4041,11 +4097,7 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         elapsed = asyncio.get_event_loop().time() - t_start
         wait    = max(0.0, interval - elapsed)
 
-        log.info(
-            "[MT5 DATA] cycle=%d symbols_received=%d valid=%d",
-            scan_num, len(symbols), valid_count,
-        )
-        log.info(
+        log.warning(
             "[SCAN END] cycle=%d duration=%.2fs signals=%d trades_today=%d idle=%d sleeping=%.1fs",
             scan_num, elapsed, signals_generated, daily.trades, idle_cycles, wait,
         )
@@ -4137,19 +4189,19 @@ def _check_live_outcomes(
 
             # Phase 10: Session-loss counter — increments on loss, resets on win
             if not won:
-                _session_losses += 1
+                session.session_losses += 1
                 log.warning(
                     "[SESSION LOSS] %s — session losses=%d (halt at %d)",
-                    meta.get("symbol", "?"), _session_losses,
+                    meta.get("symbol", "?"), session.session_losses,
                     int(getattr(getattr(cfg, "session", None), "session_loss_halt", 2)),
                 )
             else:
-                if _session_losses > 0:
+                if session.session_losses > 0:
                     log.info(
                         "[SESSION RECOVERY] %s — win cleared session loss streak (was=%d)",
-                        meta.get("symbol", "?"), _session_losses,
+                        meta.get("symbol", "?"), session.session_losses,
                     )
-                _session_losses = 0
+                session.session_losses = 0
 
             # Record into learning engine — MANUAL trades are auto-rejected inside
             engine.record_outcome(
