@@ -1354,6 +1354,31 @@ async def scan_symbol(
     current_time = now_utc if now_utc is not None else get_mt5_time()
     today        = current_time.date()
 
+    # ── Phase 6: resolve singleton references ─────────────────────────────────
+    # scan_symbol() is a module-level function; Failsafe and ExecutionQualityEngine
+    # are singletons initialised in run_live(). Resolve via get_instance() here
+    # so this function is self-contained regardless of call context.
+    _failsafe_loaded = False
+    try:
+        failsafe = Failsafe.get_instance()
+        _failsafe_loaded = True
+    except Exception as _fs_exc:
+        failsafe = None
+        log.warning(
+            "[FAILSAFE CHECK] status=MISSING fallback=SAFE_DISABLED symbol=%s err=%s",
+            symbol, _fs_exc,
+        )
+
+    try:
+        exec_quality = ExecutionQualityEngine.get_instance()
+    except Exception:
+        exec_quality = None
+
+    log.warning(
+        "[RUNTIME TRACE] stage=pre_signal_validation symbol=%s failsafe_loaded=%s",
+        symbol, _failsafe_loaded,
+    )
+
     # Phase 12: Telemetry — count every symbol scan for the signal funnel
     SignalTelemetry.get_instance().count_scan(symbol)
 
@@ -1569,7 +1594,11 @@ async def scan_symbol(
             len(candles_m15) if candles_m15 else 0,
             len(candles_m5) if candles_m5 else 0,
         )
-        failsafe.mt5_error()
+        try:
+            if failsafe is not None:
+                failsafe.mt5_error()
+        except Exception:
+            pass
         SignalTelemetry.get_instance().block_stage(STAGE_DATA, "NO_CANDLE_DATA", symbol)
         return None
 
@@ -1586,10 +1615,17 @@ async def scan_symbol(
 
     # Phase 6: stale-candle detection (same candle repeated N cycles)
     _m15_open_iso = candles_m15[-1].time.isoformat()
-    if failsafe.is_stale(symbol, TF_M15, _m15_open_iso):
-        return None   # [FAILSAFE] already logged inside is_stale()
+    try:
+        if failsafe is not None and failsafe.is_stale(symbol, TF_M15, _m15_open_iso):
+            return None   # [FAILSAFE] already logged inside is_stale()
+    except Exception:
+        pass
 
-    failsafe.mt5_ok()   # data arrived — clear any MT5 error counter
+    try:
+        if failsafe is not None:
+            failsafe.mt5_ok()   # data arrived — clear any MT5 error counter
+    except Exception:
+        pass
 
     # Staleness guard: newest M15 candle must be < 30 min old in live mode.
     # Older data means MT5 is frozen or the symbol feed has dropped.
@@ -3309,17 +3345,25 @@ async def scan_symbol(
         pass
 
     # Phase 6: register trade with failsafe + record execution quality
-    failsafe.register_trade(trade.ticket, symbol, direction)
-    exec_quality.record_fill(
-        symbol         = symbol,
-        expected_price = risk.entry,
-        executed_price = trade.executed_price,
-        spread_pips    = _spread_pips,
-        direction      = direction,
-        pip            = pip,
-        cfg            = cfg,
-    )
-    exec_quality.record_spread(symbol, _spread_pips, cfg=cfg)
+    try:
+        if failsafe is not None:
+            failsafe.register_trade(trade.ticket, symbol, direction)
+    except Exception:
+        pass
+    try:
+        if exec_quality is not None:
+            exec_quality.record_fill(
+                symbol         = symbol,
+                expected_price = risk.entry,
+                executed_price = trade.executed_price,
+                spread_pips    = _spread_pips,
+                direction      = direction,
+                pip            = pip,
+                cfg            = cfg,
+            )
+            exec_quality.record_spread(symbol, _spread_pips, cfg=cfg)
+    except Exception:
+        pass
 
     # ── Post-execution ────────────────────────────────────────────────────────
     cooldown.arm(
@@ -3548,6 +3592,11 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
     failsafe           = Failsafe.get_instance(cfg)
     telemetry          = Telemetry.get_instance(cfg)
     exec_quality       = ExecutionQualityEngine.get_instance()
+    log.warning(
+        "[FAILSAFE CHECK] status=OK | stale_threshold=%d mt5_recovery_threshold=%d",
+        getattr(failsafe, "stale_threshold",    getattr(failsafe, "_stale_threshold",    3)),
+        getattr(failsafe, "mt5_error_threshold", getattr(failsafe, "_mt5_error_threshold", 5)),
+    )
     # Phase 11 — correlation engine + strategy version manager
     _correlation_engine = CorrelationEngine(cfg)
     _version_mgr        = StrategyVersionManager.get_instance()
