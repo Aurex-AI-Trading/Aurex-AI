@@ -69,7 +69,7 @@ _STATE_FILE          = Path(__file__).resolve().parent.parent / "data" / "accoun
 
 # ── Adaptive symbol thresholds ────────────────────────────────────────────────
 # Balance-based symbol activation gates (Phase 13 — small account survivability).
-_XAUUSD_MIN_BALANCE_ZAR    = 7000.0  # XAUUSD only allowed when balance >= this value
+_XAUUSD_MIN_BALANCE_ZAR    = 500.0   # Phase 14: lowered from 7000 ZAR; overridden by guard.xauusd_min_balance_zar in config
 _GBPJPY_REDUCE_BALANCE_ZAR = 3000.0  # log GBPJPY reduced-allocation warning below this
 _MICRO_ACCT_ZAR            = 1000.0  # micro-account tier: Tier 1 only, max 1 open trade
 
@@ -485,32 +485,38 @@ class AccountGuard:
 
 # ── Adaptive symbol activation ────────────────────────────────────────────────
 
-def get_active_symbols(balance: float, configured_symbols: list) -> list:
+def get_active_symbols(balance: float, configured_symbols: list, cfg=None) -> list:
     """
     Filter the configured symbol list based on account balance.
 
-    Phase 13 small-account survivability rules:
-      balance < 7000 ZAR  → XAUUSD removed (extreme ATR, requires larger cushion)
+    Phase 14 rules:
+      balance < guard.xauusd_min_balance_zar (default 500 ZAR) → XAUUSD removed
       balance < 3000 ZAR  → GBPJPY lot already capped at 0.01 by SmallAccountLimits;
                             a warning is emitted to flag reduced effective exposure
-      balance >= 7000 ZAR → all configured symbols allowed
+      balance >= threshold → all configured symbols allowed
 
     Logs [SMALL ACCOUNT PROTECTION] whenever a symbol is removed at startup.
     Returns the filtered list (never empty — falls back to full list if all removed).
     """
     from typing import List
+    _guard_cfg = getattr(cfg, "guard", None) if cfg is not None else None
+    _xau_threshold = float(
+        getattr(_guard_cfg, "xauusd_min_balance_zar", _XAUUSD_MIN_BALANCE_ZAR)
+        if _guard_cfg is not None else _XAUUSD_MIN_BALANCE_ZAR
+    )
+
     active: List[str] = list(configured_symbols)
     removed: List[str] = []
 
     xauusd_syms = [s for s in active if "XAU" in s.upper() or "GOLD" in s.upper()]
-    if xauusd_syms and balance < _XAUUSD_MIN_BALANCE_ZAR:
+    if xauusd_syms and balance < _xau_threshold:
         for sym in xauusd_syms:
             active.remove(sym)
             removed.append(sym)
         log.warning(
             "[SMALL ACCOUNT PROTECTION] XAUUSD DISABLED | balance=%.2f ZAR < %.0f ZAR threshold | "
             "gold ATR requires larger capital cushion. Re-enable when balance >= %.0f ZAR.",
-            balance, _XAUUSD_MIN_BALANCE_ZAR, _XAUUSD_MIN_BALANCE_ZAR,
+            balance, _xau_threshold, _xau_threshold,
         )
 
     if removed:

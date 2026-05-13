@@ -16,10 +16,10 @@ symbols:
   # Removed low-ATR pairs (AUDUSD, USDCAD, NZDUSD, USDCHF) — insufficient edge.
   # Added GBPJPY.Z — highest ATR cross; institutional order flow pairs only.
   #
-  # Phase 13 — Small account survivability: XAUUSD disabled.
-  # Re-enable when account balance >= 7000 ZAR (see account_guard._XAUUSD_MIN_BALANCE_ZAR).
-  # AccountGuard.get_active_symbols() enforces this at runtime regardless of this list.
-  # - XAUUSD   # Gold — disabled: extreme ATR unsuitable for <7000 ZAR accounts.
+  # Phase 14 — XAUUSD re-enabled with gold-specific controls.
+  # account_guard.get_active_symbols() enforces guard.xauusd_min_balance_zar at runtime.
+  # Gold has strict ATR gates, spread_block_pips=8, Asian session block, gold_max_open_trades=1.
+  - XAUUSD     # Gold — phase 14: re-enabled; lot capped at 0.01 by small-account limits
   - EURUSD.Z   # Deepest FX liquidity — trend continuation + sweep setups
   - GBPUSD.Z   # High ATR, strong institutional flow — London session leader
   - USDJPY.Z   # Risk-on/risk-off gauge; carry pair with strong directional bias
@@ -234,6 +234,8 @@ guard:
   daily_dd_reduce_pct:     2.5     # reduce to 50% lot when daily DD reaches this %
   total_dd_halt_pct:       15.0    # Phase 8: 15% max account drawdown from peak — safer ceiling
   small_account_balance:   2000.0  # ZAR balance below which small-account conservative limits apply
+  xauusd_min_balance_zar:  500.0   # Phase 14: XAUUSD allowed above this balance (was 7000 ZAR)
+  gold_max_open_trades:    1        # Phase 14: max simultaneous XAUUSD positions
 
 # ── Micro account conditional Tier 2 (Phase 13b) ─────────────
 # Allows Tier 2 execution on balance < 1000 ZAR ONLY when ALL
@@ -253,22 +255,34 @@ testing:
 
 # ── Session management ────────────────────────────────────────
 session:
-  # Phase 13: Live WR data REVERSED Phase 10 session conclusions.
-  # Confirmed: best_session=newyork (16-21 UTC), worst=overlap (13-16 UTC).
-  # OVERLAP BLOCKED — consistent underperformance vs NY and London.
-  # Re-enable overlap only with statistically significant WR improvement (>35%).
-  # London is the secondary session; NY is the primary execution window.
-  block_overlap:        true   # Phase 13: BLOCKED — overlap worst live WR (was: false)
+  # Phase 14: Adaptive session execution — all sessions enabled, no hard blocks.
+  # Controlled participation via lot multipliers, tier caps, and confidence adjustments.
+  # Session hierarchy: NY=prime (1.00x) | London=secondary (0.60x) | Overlap=restricted (0.40x) | Asian=minimal (0.25x)
+  block_overlap:        false   # Phase 14: re-enabled with 0.40x lot + conf_adj=+5 + tier≤2
   overlap_start_hour:   13
   overlap_end_hour:     16
-  # Session quality multipliers (applied to lot size at execution)
-  london_quality:       0.90   # Phase 13: raised from 0.85 — London is 2nd-best, not worst
-  newyork_quality:      1.00   # Phase 13: raised from 0.95 — NY is best; full lot
-  overlap_quality:      0.50   # Phase 13: heavily reduced — blocked by default
-  # Session confidence adjustments (pts added to per-symbol minimum)
-  london_open_conf_penalty:  4    # Phase 13: reduced from 6 — London is 2nd-best
-  newyork_conf_penalty:      0    # Phase 13: reduced from 2 — NY best; no extra bar
-  overlap_conf_bonus:       -8    # Phase 13: heavy penalty if overlap re-enabled manually
+
+  # Session lot multipliers (applied into combined_size_mult)
+  asian_quality:        0.25   # Asian   (00-07 + 21-24 UTC): micro-lot; Tier 1 only
+  london_quality:       0.60   # London  (07-13 UTC): secondary session; reduced from 0.90
+  overlap_quality:      0.40   # Overlap (13-16 UTC): restricted; high-conf only
+  newyork_quality:      1.00   # NY      (16-21 UTC): full execution power [PRIME]
+
+  # Session confidence adjustments (pts added to effective threshold; tighter = harder to pass)
+  asian_conf_penalty:        8    # Asian: only cleanest institutional setups qualify
+  london_open_conf_penalty:  2    # London open (07-09 UTC): extra penalty for wide spreads
+  overlap_conf_penalty:      5    # Overlap: above-normal gate; controlled access
+  newyork_conf_penalty:      0    # NY: no extra bar — best session
+
+  # Session tier caps (enforced independent of mode.min_execution_tier)
+  asian_max_tier:       1    # Asian: Tier 1 only — highest quality only
+  overlap_max_tier:     2    # Overlap: Tier 1+2; no Tier 3 fallback
+  # London and NY: no session tier cap (mode.min_execution_tier governs)
+
+  # Session-specific spread thresholds (fraction of ATR; stricter than global 0.40)
+  asian_spread_max_ratio:    0.15  # Asian: excellent spread required
+  overlap_spread_max_ratio:  0.20  # Overlap: tighter than global
+
   # Anti-overtrading session controls
   session_loss_halt:    2      # pause new entries after N losses in same session
   min_reentry_minutes:  30     # minimum gap between same-symbol same-direction entries
@@ -279,15 +293,15 @@ session:
 # Gold strictest: extreme ATR + frequent false breaks demand highest gate.
 # High-ATR FX pairs carry elevated noise — stricter threshold required.
 per_symbol:
-  # Phase 13: Confidence bars tightened per live WR analytics (FX-only, no gold).
-  # EURUSD WR=15.4%, USDJPY WR=12.5% — raised significantly to filter mediocre setups.
-  # GBPJPY: high ATR on small account = dangerous; stricter gate reduces exposure.
-  # XAUUSD: disabled by account_guard; threshold preserved for balance >= 7000 ZAR.
-  XAUUSD:   72    # disabled by account_guard; preserved for balance >= 7000 ZAR
-  GBPJPY:   72    # Phase 13: raised from 70 — high ATR on small account; stricter gate
-  GBPUSD:   71    # Phase 13: raised from 70 — moderate improvement
-  USDJPY:   76    # Phase 13: raised from 74 — 12.5% WR demands significantly higher bar
-  EURUSD:   76    # Phase 13: raised from 74 — 15.4% WR demands significantly higher bar
+  # Phase 14: Controlled relaxation from Phase 13 over-filtering.
+  # EURUSD/USDJPY at 76 caused signal starvation — reduced to 68 (above mode floor of 64).
+  # Session conf adjustments (+2 to +8) and AI adaptive modifiers provide further discrimination.
+  # XAUUSD: gold requires the highest base bar; spread/ATR/regime gates provide additional protection.
+  XAUUSD:   72    # Gold: institutional quality floor; regime+ATR gates protect further
+  GBPJPY:   68    # Phase 14: from 72 — session lot cap (0.25-0.60x) compensates
+  GBPUSD:   66    # Phase 14: from 71 — solid London performer; moderate softening
+  USDJPY:   68    # Phase 14: from 76 — controlled relaxation; was severely over-filtered
+  EURUSD:   68    # Phase 14: from 76 — controlled relaxation; was severely over-filtered
 
 # ── Trading mode gate presets ─────────────────────────────────
 # These override the individual strategy/risk/scoring values at runtime.
@@ -317,11 +331,11 @@ modes:
     # Liquidity weight reduced: weak factor in FX context; cap contribution at 10 pts.
     # Quality-C trades blocked: only A+/A/B grades execute in normal mode.
     # Trend gate added: minimum trend strength required before confluence check.
-    min_confidence:       71     # Phase 13: raised from 70 — FX-only, no gold dilution
+    min_confidence:       64     # Phase 14: from 71 — controlled relaxation; session+symbol gates discriminate
     min_atr_pips:         8.0    # unchanged — ATR floor appropriate for FX pairs
     atr_optimal_max_pips: 30     # Phase 13: tightened from 35 — FX pairs; gold removed
-    min_core_score:       52.0   # Phase 13: raised from 48 — trend must contribute substance
-    min_execution_tier:   2      # Tier 1+2 only; Tier 3 blocked
+    min_core_score:       48.0   # Phase 14: from 52.0 — allows solid 2-factor setups; trend gate still applies
+    min_execution_tier:   3      # Phase 14: from 2 — Tier 3 allowed in London/NY; session cap prevents Asian/Overlap abuse
     tier1:                80     # unchanged — A+ institutional only
     tier2:                70     # unchanged — must have 2+ aligned factors
     tier3:                55     # blocked by min_execution_tier=2

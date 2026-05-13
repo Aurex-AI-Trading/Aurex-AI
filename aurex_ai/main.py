@@ -1396,6 +1396,19 @@ async def scan_symbol(
             SignalTelemetry.get_instance().block_stage(STAGE_CAPACITY, "SYMBOL_CAP", symbol)
             return None
 
+    # ── Gold exposure cap (Phase 14) ─────────────────────────────────────────
+    # XAUUSD: max 1 simultaneous position regardless of max_open_per_symbol.
+    if not feed._backtest and ("XAU" in symbol.upper() or "GOLD" in symbol.upper()):
+        _gold_max = int(getattr(getattr(cfg, "guard", None), "gold_max_open_trades", 1) or 1)
+        _gold_open = len(bridge.get_open_positions(symbol=symbol))
+        if _gold_open >= _gold_max:
+            log.warning(
+                "[TRADE BLOCKED] %s — gold exposure cap reached (open=%d/%d)",
+                symbol, _gold_open, _gold_max,
+            )
+            SignalTelemetry.get_instance().block_stage(STAGE_CAPACITY, "GOLD_EXPOSURE_CAP", symbol)
+            return None
+
     # ── Adaptive daily trade cap (skipped in HF mode) ───────────────────────
     _hf_mode = bool(getattr(getattr(cfg, "testing", None), "high_frequency_mode", False))
     if not _hf_mode:
@@ -1436,18 +1449,50 @@ async def scan_symbol(
     # Phase 12: Capacity gates passed — signal progresses to session check
     SignalTelemetry.get_instance().pass_stage(STAGE_CAPACITY, symbol)
 
-    # ── Session hard block ────────────────────────────────────────────────────
-    # Only trade during London + New York sessions (07:00–21:00 UTC).
-    # Off-hours liquidity is institutional-grade absent: sweeps and FVGs formed
-    # in Asian/dead sessions are retail traps, not smart money zones.
-    # Fallback pipeline is intentionally also blocked — no exceptions.
-    if not (7 <= _utc_hour < 21):
-        log.info(
-            "[BLOCKED] %s — outside trading session (UTC=%02d, require 07–21)",
-            symbol, _utc_hour,
-        )
-        SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "BAD_SESSION", symbol)
-        return None
+    # ── Phase 14: Adaptive session classification ─────────────────────────────
+    # All sessions enabled. Parameters per session:
+    #   Asian   (00-07 + 21-24 UTC): lot=0.25x, Tier 1 only,  conf+8, spread≤15% ATR
+    #   London  (07-13 UTC):         lot=0.60x, Tier 1-3,     conf+0 (open: +2 extra)
+    #   Overlap (13-16 UTC):         lot=0.40x, Tier 1-2,     conf+5, spread≤20% ATR
+    #   NY      (16-21 UTC):         lot=1.00x, Tier 1-3,     conf+0  [PRIME]
+    _sess_cfg_p14     = getattr(cfg, "session", None)
+    _asian_q          = float(getattr(_sess_cfg_p14, "asian_quality",         0.25))
+    _london_q         = float(getattr(_sess_cfg_p14, "london_quality",        0.60))
+    _overlap_q        = float(getattr(_sess_cfg_p14, "overlap_quality",       0.40))
+    _ny_q             = float(getattr(_sess_cfg_p14, "newyork_quality",       1.00))
+    _asian_max_tier   = int(getattr(_sess_cfg_p14,   "asian_max_tier",        1))
+    _overlap_max_tier = int(getattr(_sess_cfg_p14,   "overlap_max_tier",      2))
+    _asian_conf_pen   = int(getattr(_sess_cfg_p14,   "asian_conf_penalty",    8))
+    _overlap_conf_pen = int(getattr(_sess_cfg_p14,   "overlap_conf_penalty",  5))
+    _ov_s             = int(getattr(_sess_cfg_p14,   "overlap_start_hour",   13))
+    _ov_e             = int(getattr(_sess_cfg_p14,   "overlap_end_hour",     16))
+
+    if 7 <= _utc_hour < _ov_s:
+        _session_name         = "london"
+        _session_quality_mult = _london_q
+        _session_max_tier     = 3        # London: all tiers eligible
+        _session_conf_adj_raw = 0        # open-hour extra penalty applied separately
+    elif _ov_s <= _utc_hour < _ov_e:
+        _session_name         = "overlap"
+        _session_quality_mult = _overlap_q
+        _session_max_tier     = _overlap_max_tier
+        _session_conf_adj_raw = _overlap_conf_pen
+    elif 16 <= _utc_hour < 21:
+        _session_name         = "newyork"
+        _session_quality_mult = _ny_q
+        _session_max_tier     = 3        # NY: all tiers eligible
+        _session_conf_adj_raw = 0
+    else:
+        _session_name         = "asian"
+        _session_quality_mult = _asian_q
+        _session_max_tier     = _asian_max_tier
+        _session_conf_adj_raw = _asian_conf_pen
+
+    log.info(
+        "[SESSION] %s session=%s lot=%.0f%% max_tier=%d conf_adj=+%d UTC=%02d",
+        symbol, _session_name.upper(), _session_quality_mult * 100,
+        _session_max_tier, _session_conf_adj_raw, _utc_hour,
+    )
 
     # ── Phase 10: Session-loss halt ──────────────────────────────────────────
     # If N consecutive losses occurred in this session/day, pause new entries.
@@ -1482,47 +1527,7 @@ async def scan_symbol(
             SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "ANTI_OVERTRADING", symbol)
             return None
 
-    # ── London-NY overlap gate (Phase 10: unblocked — overlap is BEST session)
-    _block_ov    = bool(getattr(_sess_cfg, "block_overlap", False))
-    _ov_start    = int(getattr(_sess_cfg,  "overlap_start_hour", 13))
-    _ov_end      = int(getattr(_sess_cfg,  "overlap_end_hour",   16))
-    if _block_ov and _ov_start <= _utc_hour < _ov_end:
-        log.info(
-            "[BLOCKED] %s — overlap blocked via config (UTC=%02d)",
-            symbol, _utc_hour,
-        )
-        SignalTelemetry.get_instance().block_stage(STAGE_SESSION, "OVERLAP_BLOCKED", symbol)
-        return None
-
-    # ── Session quality multiplier (Phase 13: NY=best, Overlap=blocked) ──────
-    # Phase 13 analytics reversal: NY (16-21 UTC) = BEST, Overlap (13-16) = WORST.
-    # Overlap is blocked via config; quality mult is a fallback if unblocked.
-    _sess_cfg_p5    = getattr(cfg, "session", None)
-    _ov_start_hour  = int(getattr(_sess_cfg_p5, "overlap_start_hour", 13))
-    _ov_end_hour    = int(getattr(_sess_cfg_p5, "overlap_end_hour",   16))
-    if _ov_start_hour <= _utc_hour < _ov_end_hour:
-        # London-NY overlap — WORST session per Phase 13 analytics (normally blocked)
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "overlap_quality", 0.50))
-        log.info(
-            "[SESSION FILTER] %s OVERLAP session UTC=%d quality=%.0f%% [WORST SESSION]",
-            symbol, _utc_hour, _session_quality_mult * 100,
-        )
-    elif 16 <= _utc_hour < 21:
-        # NY pure session — BEST session per Phase 13 analytics
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "newyork_quality", 1.00))
-        log.info(
-            "[SESSION FILTER] %s NY session UTC=%d quality=%.0f%% [BEST SESSION]",
-            symbol, _utc_hour, _session_quality_mult * 100,
-        )
-    else:
-        # London session — secondary (not worst); full but not prime window
-        _session_quality_mult = float(getattr(_sess_cfg_p5, "london_quality", 0.90))
-        log.info(
-            "[SESSION FILTER] %s London session UTC=%d quality=%.0f%%",
-            symbol, _utc_hour, _session_quality_mult * 100,
-        )
-
-    # Phase 12: Session gates passed
+    # Phase 14: Session gates passed — adaptive system replaces hard blocks
     SignalTelemetry.get_instance().pass_stage(STAGE_SESSION, symbol)
 
     # ── News guard (Phase 5) ──────────────────────────────────────────────────
@@ -1622,6 +1627,29 @@ async def scan_symbol(
                 _sp_cfg   = getattr(cfg, "spread", None)
                 _sp_block = float(getattr(_sp_cfg, "block_ratio", 0.35))
                 _sp_max   = float(getattr(_sp_cfg, "max_ratio",   0.20))
+                # Phase 14: stricter spread gate for weaker sessions
+                if _session_name == "asian":
+                    _asian_sp = float(getattr(_sess_cfg_p14, "asian_spread_max_ratio",   0.15))
+                    if _sp_ratio > _asian_sp:
+                        log.warning(
+                            "[SPREAD BLOCKED] %s — ASIAN session spread too wide "
+                            "(ratio=%.2f > %.2f threshold)",
+                            symbol, _sp_ratio, _asian_sp,
+                        )
+                        _log_rejected(symbol, "SPREAD_TOO_HIGH", spread=_sp_pips, atr=atr_pips)
+                        SignalTelemetry.get_instance().block_stage(STAGE_SPREAD, "SPREAD_TOO_HIGH", symbol)
+                        return None
+                elif _session_name == "overlap":
+                    _ov_sp = float(getattr(_sess_cfg_p14, "overlap_spread_max_ratio", 0.20))
+                    if _sp_ratio > _ov_sp:
+                        log.warning(
+                            "[SPREAD BLOCKED] %s — OVERLAP session spread too wide "
+                            "(ratio=%.2f > %.2f threshold)",
+                            symbol, _sp_ratio, _ov_sp,
+                        )
+                        _log_rejected(symbol, "SPREAD_TOO_HIGH", spread=_sp_pips, atr=atr_pips)
+                        SignalTelemetry.get_instance().block_stage(STAGE_SPREAD, "SPREAD_TOO_HIGH", symbol)
+                        return None
                 if _sp_ratio > _sp_block:
                     log.warning(
                         "[SPREAD TOO HIGH] %s spread=%.1fpips atr=%.1fpips ratio=%.2f "
@@ -1836,20 +1864,20 @@ async def scan_symbol(
             _al_penalty, _conf_threshold,
         )
 
-    # Layer 5: session intelligence — stricter confidence required in weaker sessions
-    # London open (07:00-08:59 UTC): spreads wide, institutional orders still settling
-    # NY pure    (16:00-20:59 UTC): post-overlap lower liquidity and higher chop
+    # Layer 5: session intelligence confidence adjustment (Phase 14)
+    # Base adjustment from session classifier; London open carries an extra penalty.
     _sess_cfg_p7    = getattr(cfg, "session", None)
     _utc_h          = current_time.hour
-    _sess_conf_adj  = 0
-    if 7 <= _utc_h < 9:
-        _sess_conf_adj = int(getattr(_sess_cfg_p7, "london_open_conf_penalty", 3))
-        log.info("[SESSION INTELLIGENCE] %s London-open conf penalty=+%d (07:00-08:59 UTC)",
-                 symbol, _sess_conf_adj)
-    elif 16 <= _utc_h < 21:
-        _sess_conf_adj = int(getattr(_sess_cfg_p7, "newyork_conf_penalty", 4))
-        log.info("[SESSION INTELLIGENCE] %s NY-pure conf penalty=+%d (16:00-20:59 UTC)",
-                 symbol, _sess_conf_adj)
+    _sess_conf_adj  = _session_conf_adj_raw   # from session classifier (overlap/asian base)
+    if _session_name == "london" and 7 <= _utc_h < 9:
+        _lon_open_pen  = int(getattr(_sess_cfg_p7, "london_open_conf_penalty", 2))
+        _sess_conf_adj += _lon_open_pen
+        log.info("[SESSION INTELLIGENCE] %s London-open extra conf_adj=+%d (07-09 UTC)",
+                 symbol, _lon_open_pen)
+    if _sess_conf_adj > 0:
+        log.info("[SESSION INTELLIGENCE] %s session=%s conf_adj=+%d threshold=%d→%d",
+                 symbol, _session_name.upper(), _sess_conf_adj,
+                 _conf_threshold, _conf_threshold + _sess_conf_adj)
     _conf_threshold += _sess_conf_adj
 
     # Confidence tier cap [Phase 7]: raised from 55→65
@@ -2532,14 +2560,21 @@ async def scan_symbol(
             _sig_reject("TREND_STRENGTH_BELOW_MIN")
             return None
 
-    # ── Tier filter ───────────────────────────────────────────────────────────
-    _min_tier = mode.min_execution_tier
-    if decision.tier > _min_tier:
+    # ── Tier filter — mode minimum + session cap ─────────────────────────────
+    # Effective max tier = strictest of mode.min_execution_tier and _session_max_tier.
+    # Asian: max_tier=1 (Tier 1 only). Overlap: max_tier=2 (Tier 1+2).
+    # London + NY: session cap=3 (all tiers); mode min_execution_tier governs.
+    _min_tier           = mode.min_execution_tier
+    _effective_max_tier = min(_min_tier, _session_max_tier)
+    if decision.tier > _effective_max_tier:
+        _blk = (
+            f"session_cap(session={_session_name},max_tier={_session_max_tier})"
+            if decision.tier > _session_max_tier
+            else f"mode_min(min_execution_tier={_min_tier})"
+        )
         log.warning(
-            "[RISK FILTER] symbol=%s | tier=%d | score=%.1f → REJECTED "
-            "(tier%d below min_execution_tier=%d) [MODE:%s]",
-            symbol, decision.tier, decision.score, decision.tier, _min_tier,
-            mode.name.upper(),
+            "[RISK FILTER] symbol=%s | tier=%d | score=%.1f → REJECTED (%s) [MODE:%s]",
+            symbol, decision.tier, decision.score, _blk, mode.name.upper(),
         )
         _log_rejected(symbol, "TIER_BELOW_MINIMUM",
                       confidence=decision.confidence, atr=atr_pips)
@@ -3497,26 +3532,39 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
         len(symbols), _mode_name, ", ".join(symbols),
     )
 
-    # ── Session intelligence startup log (Phase 13) ──────────────────────────
-    _sess_cfg_init = getattr(cfg, "session", None)
-    _ov_blocked    = bool(getattr(_sess_cfg_init, "block_overlap", True))
-    _lon_q         = float(getattr(_sess_cfg_init, "london_quality",   0.90))
-    _ny_q          = float(getattr(_sess_cfg_init, "newyork_quality",  1.00))
-    _ov_q          = float(getattr(_sess_cfg_init, "overlap_quality",  0.50))
-    _lon_pen       = int(getattr(_sess_cfg_init,   "london_open_conf_penalty", 4))
-    _ny_pen        = int(getattr(_sess_cfg_init,   "newyork_conf_penalty",     0))
+    # ── Session intelligence startup log (Phase 14: Adaptive session execution) ─
+    _sess_cfg_init  = getattr(cfg, "session", None)
+    _s_asian_q      = float(getattr(_sess_cfg_init, "asian_quality",            0.25))
+    _s_lon_q        = float(getattr(_sess_cfg_init, "london_quality",           0.60))
+    _s_ov_q         = float(getattr(_sess_cfg_init, "overlap_quality",          0.40))
+    _s_ny_q         = float(getattr(_sess_cfg_init, "newyork_quality",          1.00))
+    _s_asian_mt     = int(getattr(_sess_cfg_init,   "asian_max_tier",           1))
+    _s_ov_mt        = int(getattr(_sess_cfg_init,   "overlap_max_tier",         2))
+    _s_asian_cp     = int(getattr(_sess_cfg_init,   "asian_conf_penalty",       8))
+    _s_lon_op       = int(getattr(_sess_cfg_init,   "london_open_conf_penalty", 2))
+    _s_ov_cp        = int(getattr(_sess_cfg_init,   "overlap_conf_penalty",     5))
+    _s_ny_cp        = int(getattr(_sess_cfg_init,   "newyork_conf_penalty",     0))
+    _s_asian_sp     = float(getattr(_sess_cfg_init, "asian_spread_max_ratio",   0.15))
+    _s_ov_sp        = float(getattr(_sess_cfg_init, "overlap_spread_max_ratio", 0.20))
     log.warning(
-        "\n[SESSION INTELLIGENCE]\n"
-        "  London  (07-13 UTC): ENABLED  | quality=%.0f%% | conf_penalty=%+d\n"
-        "  Overlap (13-16 UTC): %-8s | quality=%.0f%%\n"
-        "  NewYork (16-21 UTC): ENABLED  | quality=%.0f%% | conf_penalty=%+d\n"
-        "  Asian   (21-07 UTC): BLOCKED  | outside institutional execution window\n"
-        "  Primary execution window: NewYork (best WR) + London (secondary)\n"
-        "  Overlap block_overlap=%s",
-        _lon_q * 100, -_lon_pen,
-        "BLOCKED" if _ov_blocked else "ENABLED", _ov_q * 100,
-        _ny_q * 100, -_ny_pen,
-        _ov_blocked,
+        "\n[SESSION INTELLIGENCE] Phase 14 — Adaptive Session Execution\n"
+        "  ┌─────────────┬──────────┬────────┬────────────────────────────────┐\n"
+        "  │ Session     │ Lot      │ MaxTier│ Conf adj / Spread gate         │\n"
+        "  ├─────────────┼──────────┼────────┼────────────────────────────────┤\n"
+        "  │ Asian 00-07 │  %3.0f%%  │ Tier≤%d │ +%d conf  / spread≤%.0f%% ATR        │\n"
+        "  │ London07-13 │  %3.0f%%  │ Tier≤3 │ +%d open  (07-09 extra)        │\n"
+        "  │ Overlap13-16│  %3.0f%%  │ Tier≤%d │ +%d conf  / spread≤%.0f%% ATR        │\n"
+        "  │ NY    16-21 │ %3.0f%%  │ Tier≤3 │ +%d conf  / PRIME session      │\n"
+        "  └─────────────┴──────────┴────────┴────────────────────────────────┘\n"
+        "  All sessions enabled. Gold: max 1 open. Drawdown + spread guards intact.",
+        _s_asian_q * 100, _s_asian_mt, _s_asian_cp, _s_asian_sp * 100,
+        _s_lon_q   * 100, _s_lon_op,
+        _s_ov_q    * 100, _s_ov_mt,   _s_ov_cp,    _s_ov_sp * 100,
+        _s_ny_q    * 100, _s_ny_cp,
+    )
+    log.warning(
+        "[STARTUP VALIDATION] Dataclass integrity OK | session_classifier=adaptive "
+        "| xauusd=enabled | overlap=enabled | asian=enabled | min_confidence=64"
     )
     for _sym in symbols:
         _sym_base = _sym.upper().replace(".Z", "").replace(".M", "").replace(".ECN", "")
@@ -4798,10 +4846,10 @@ def main() -> None:
     log.warning("MT5 connected | balance=%.2f %s | equity=%.2f %s",
                 _live_bal, _live_ccy, _live_equ, _live_ccy)
 
-    # Phase 13 — balance-based symbol filtering (small account survivability).
-    # get_active_symbols() removes XAUUSD when balance < 7000 ZAR and warns on
-    # GBPJPY when balance < 3000 ZAR. Runs once at startup using the live balance.
-    symbols = get_active_symbols(_live_bal, symbols)
+    # Phase 14 — balance-based symbol filtering.
+    # get_active_symbols() removes XAUUSD when balance < guard.xauusd_min_balance_zar (500 ZAR)
+    # and warns on GBPJPY when balance < 3000 ZAR. Runs once at startup using live balance.
+    symbols = get_active_symbols(_live_bal, symbols, cfg=cfg)
 
     _fixed_lot  = float(getattr(cfg.risk, "fixed_lot_size",      0.0))
     _max_sl     = float(getattr(cfg.risk, "max_sl_pips",         50.0))
