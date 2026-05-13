@@ -1855,6 +1855,27 @@ async def scan_symbol(
     _al_sym_penalty  = round((1.0 - _al_sym_mod)  * 40)   # max +12 at worst modifier
     _al_sess_penalty = round((1.0 - _al_sess_mod) * 20)   # max +5 at worst session modifier
     _al_penalty      = _al_sym_penalty + _al_sess_penalty
+
+    # Phase 15: Participation mode — cap AI learning penalty when execution-starved.
+    # Without this cap, degraded modifiers inflate the effective threshold by up to +21 pts
+    # (e.g. 68 base → 89+), making setup execution practically impossible.
+    # London/NY only; Asian/Overlap retain full penalty (session quality already limits exposure).
+    # idle >= 40 cycles (~10 min): cap at +6. idle >= 80 cycles (~20 min): cap at +3.
+    _participation_mode = (
+        idle_cycles >= 40
+        and _session_name in ("london", "newyork")
+    )
+    if _participation_mode and _al_penalty > 0:
+        _al_cap = 3 if idle_cycles >= 80 else 6
+        if _al_penalty > _al_cap:
+            log.warning(
+                "[PARTICIPATION MODE] %s idle=%d %s — AI penalty capped +%d→+%d "
+                "(starvation prevention; base_threshold=%d)",
+                symbol, idle_cycles, _session_name.upper(), _al_penalty, _al_cap,
+                _conf_threshold,
+            )
+            _al_penalty = _al_cap
+
     if _al_penalty > 0:
         _conf_threshold += _al_penalty
         log.info(
@@ -2001,6 +2022,16 @@ async def scan_symbol(
             log.warning(
                 "[MTF WARNING] %s — H1/H4 inconsistent (H1=%s H4=%s), allowing with 30%% size reduction | %s",
                 symbol, _h1_bias, _h4_bias, trend_result.reason,
+            )
+        elif _participation_mode:
+            # Phase 15: Soft MTF filter — hard block replaced with 30% size penalty
+            # when execution-starved in London/NY. H1/H4 inconsistency penalises size
+            # rather than killing the trade entirely, allowing controlled participation.
+            _mtf_h4_size_penalty = 0.7
+            log.warning(
+                "[MTF SOFT] %s — H1/H4 inconsistent (H1=%s H4=%s), 30%% size penalty "
+                "(participation mode: idle=%d %s) | %s",
+                symbol, _h1_bias, _h4_bias, idle_cycles, _session_name.upper(), trend_result.reason,
             )
         else:
             log.warning(
@@ -2683,7 +2714,11 @@ async def scan_symbol(
     # but lacks sweep+BOS, strong trend+OB, and score is below tier1.
     # These low-quality setups are the primary driver of the 16% WR.
     # Bypass is still active for high-confidence A/A+ setups.
-    if _quality == "C" and mode.name == "normal" and not _bypass:
+    # Phase 15: Emergency participation — Quality-C allowed when execution-starved ≥80 cycles.
+    # 0.65× size modifier already applies for C-grade (see _quality_size_mult below).
+    # Session cap, ATR gate, spread gate, risk manager, and drawdown protection remain active.
+    _emergency_mode = idle_cycles >= 80 and _session_name in ("london", "newyork")
+    if _quality == "C" and mode.name == "normal" and not _bypass and not _emergency_mode:
         log.warning(
             "[BLOCKED] %s %s | quality=C score=%.1f conf=%d → REJECTED | "
             "[QUALITY GATE] C-grade insufficient in normal mode",
@@ -2691,6 +2726,12 @@ async def scan_symbol(
         )
         _sig_reject("QUALITY_C_BLOCKED")
         return None
+    if _quality == "C" and _emergency_mode:
+        log.warning(
+            "[PARTICIPATION MODE] %s %s — Quality-C allowed in emergency mode "
+            "(idle=%d cycles, %s) | 0.65× size cap active | all risk gates retained",
+            symbol, direction, idle_cycles, _session_name.upper(),
+        )
 
     log.warning(
         "[SCORE INTEGRITY] %s | raw=%.1f adj=%.1f penalty=%.0f%% quality=%s | %s",
@@ -3765,6 +3806,28 @@ async def run_live(cfg: Settings, symbols: List[str], bridge: MT5Bridge) -> None
                 _tel = SignalTelemetry.get_instance()
                 _tel.log_funnel()
                 _tel.log_filter_analytics()
+
+                # Phase 15: Execution starvation telemetry
+                if idle_cycles >= 20:
+                    _stv_stats = _tel.get_funnel_stats()
+                    _stv_top   = list(_stv_stats["top_rejections"].items())[:3]
+                    _stv_mode  = (
+                        "EMERGENCY (idle>=80: AI+MTF+C relaxed)"
+                        if idle_cycles >= 80 else
+                        "ACTIVE (idle>=40: AI capped, MTF soft)"
+                        if idle_cycles >= 40 else
+                        "PENDING (idle<40)"
+                    )
+                    log.warning(
+                        "[EXECUTION STARVATION] idle=%d cycles (~%d min) | "
+                        "participation_mode=%s | trades_today=%d | near_misses=%d | "
+                        "top_rejections: %s",
+                        idle_cycles, idle_cycles * 15 // 60,
+                        _stv_mode,
+                        daily.trades,
+                        _stv_stats["near_miss_count"],
+                        " | ".join(f"{r}:{n}" for r, n in _stv_top) if _stv_top else "none",
+                    )
             except Exception:
                 pass
 
