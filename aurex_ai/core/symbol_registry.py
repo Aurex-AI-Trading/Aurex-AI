@@ -299,7 +299,7 @@ SYMBOL_CONFIG: Dict[str, dict] = {
         "notes": (
             "Highest-ATR major FX cross. MOMENTUM_TREND execution only. "
             "London/Overlap sessions exclusively. Block Asian session. "
-            "Block RANGING/COMPRESSION regimes — ATR collapse = whipsaw trap. "
+            "RANGING → 0.80× size penalty (active sessions); COMPRESSION → hard block. "
             "Wide SL required; use full ATR-adaptive sizing (no hard pips cap). "
             "OB+Trend is the primary edge; pure breakout is a trap on this pair."
         ),
@@ -347,15 +347,16 @@ SYMBOL_CONFIG: Dict[str, dict] = {
         # mismatches far more costly than on EURUSD-class pairs.
         #   TRENDING:              1.00  (home territory — full size)
         #   VOLATILE_EXPANSION:    0.65  (extra caution vs global 0.70; gap risk)
-        #   RANGING:               0.00  (hard block; GBPJPY chop is savage)
-        #   VOLATILITY_COMPRESSION: 0.00 (coiling → direction unknown; avoid)
+        #   RANGING:               0.80  (soft penalty during active sessions;
+        #                                  Asian is already blocked by session gate)
+        #   VOLATILITY_COMPRESSION: 0.00 (coiling → direction unknown; hard block)
         #   REVERSAL_ENVIRONMENT:  0.50  (risky but sometimes valid with full OB)
         #   DEAD:                  0.00  (standard)
         "regime_mult": {
             "TRENDING":               1.00,
             "VOLATILE_EXPANSION":     0.65,
-            "RANGING":                0.00,   # hard block — identical to EURUSD treatment
-            "VOLATILITY_COMPRESSION": 0.00,   # block: breakout direction unknown
+            "RANGING":                0.80,   # soft 20% penalty; Asian blocked by session gate
+            "VOLATILITY_COMPRESSION": 0.00,   # hard block: breakout direction unknown
             "REVERSAL_ENVIRONMENT":   0.50,
             "DEAD":                   0.00,
         },

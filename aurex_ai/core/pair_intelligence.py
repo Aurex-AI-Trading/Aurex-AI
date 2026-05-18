@@ -74,20 +74,21 @@ def _utc_session(utc_hour: int) -> str:
 @dataclass
 class PairConditions:
     """Output of evaluate_symbol_quality()."""
-    allowed:              bool
-    symbol:               str
-    session:              str           # "london" | "overlap" | "asian" | ...
-    atr_pips:             float
-    atr_quality:          str           # "dead" | "low" | "ideal" | "elevated" | "extreme"
-    atr_size_mult:        float         # size factor for ATR zone (1.0 = ideal)
-    spread_pips:          float
-    spread_quality:       str           # "acceptable" | "elevated" | "blocked"
-    market_state:         str           # regime string from MarketStateResult
-    exec_mult_override:   Optional[float]  # None = use market_state.exec_mult
-    lot_mult_cap:         float         # applied on top of all other size factors
-    scoring_mods:         Dict[str, float]  # factor → multiplier for confluence
-    block_reason:         str           # "" when allowed; human-readable when blocked
-    confidence_override:  Optional[int]    # None = use normal threshold
+    allowed:                  bool
+    symbol:                   str
+    session:                  str           # "london" | "overlap" | "asian" | ...
+    atr_pips:                 float
+    atr_quality:              str           # "dead" | "low" | "ideal" | "elevated" | "extreme"
+    atr_size_mult:            float         # size factor for ATR zone (1.0 = ideal)
+    spread_pips:              float
+    spread_quality:           str           # "acceptable" | "elevated" | "blocked"
+    market_state:             str           # regime string from MarketStateResult
+    exec_mult_override:       Optional[float]  # None = use market_state.exec_mult
+    lot_mult_cap:             float         # applied on top of all other size factors
+    scoring_mods:             Dict[str, float]  # factor → multiplier for confluence
+    block_reason:             str           # "" when allowed; human-readable when blocked
+    confidence_override:      Optional[int]    # None = use normal threshold
+    regime_confidence_penalty: int = 0     # additive threshold penalty for degraded regime
 
 
 def evaluate_symbol_quality(
@@ -226,12 +227,16 @@ def evaluate_symbol_quality(
             )
 
     # ── Regime gate ───────────────────────────────────────────────────────────
+    # Hard blocks: DEAD (0.0), VOLATILITY_COMPRESSION (0.0).
+    # RANGING (0.80 for GBPJPY) is a soft penalty — Asian session is already
+    # blocked by the session gate above, so 0.80 only applies during active sessions.
     regime_override = get_regime_mult(symbol, market_state)
+    regime_conf_penalty = 0
 
     if regime_override == 0.0:
         reason = (
             f"regime_block | state={market_state} exec_mult=0.0 "
-            f"(hard-blocked for {base})"
+            f"(hard-blocked for {base} — DEAD or VOLATILITY_COMPRESSION)"
         )
         log.warning(
             "[PAIR BLOCK] [PAIR INTELLIGENCE] %s — regime hard-block: state=%s | "
@@ -240,6 +245,14 @@ def evaluate_symbol_quality(
         )
         return _blocked(symbol, session, atr_pips, spread_pips, market_state,
                         scoring_mods, reason)
+
+    if market_state == "RANGING" and regime_override is not None and regime_override < 1.0:
+        regime_conf_penalty = 2
+        log.warning(
+            "[PAIR REGIME SOFT] %s — RANGING during %s | exec_mult=%.2f "
+            "conf_penalty=+%d (no hard block; size reduced)",
+            symbol, session.upper(), regime_override, regime_conf_penalty,
+        )
 
     # ── All gates passed — build ALLOW result ─────────────────────────────────
     lot_cap = get_lot_mult_cap(symbol)
@@ -288,8 +301,9 @@ def evaluate_symbol_quality(
         exec_mult_override  = regime_override,
         lot_mult_cap        = lot_cap,
         scoring_mods        = scoring_mods,
-        block_reason        = "",
-        confidence_override = None,
+        block_reason               = "",
+        confidence_override        = None,
+        regime_confidence_penalty  = regime_conf_penalty,
     )
 
 

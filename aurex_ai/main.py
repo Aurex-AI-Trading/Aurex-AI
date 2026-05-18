@@ -75,7 +75,7 @@ from aurex_ai.core.symbol_registry import (
     get_profile          as _get_symbol_profile,
 )
 from aurex_ai.core.pair_intelligence import evaluate_symbol_quality as _eval_pair_quality
-from aurex_ai.core.failsafe  import Failsafe
+from aurex_ai.core.failsafe  import Failsafe, StalenessLevel
 from aurex_ai.core.telemetry import Telemetry
 from aurex_ai.execution.execution_quality import ExecutionQualityEngine
 
@@ -1622,11 +1622,27 @@ async def scan_symbol(
         symbol, len(candles_h4), len(candles_h1), len(candles_m15), len(candles_m5),
     )
 
-    # Phase 6: stale-candle detection (same candle repeated N cycles)
-    _m15_open_iso = candles_m15[-1].time.isoformat()
+    # Phase 6: timeframe-aware stale-candle detection.
+    # M15 candles naturally persist 15 min — only flag if no new candle >20 min.
+    # DEGRADED → reduce position size; BLOCKED → hard block (true feed freeze).
+    _m15_open_iso   = candles_m15[-1].time.isoformat()
+    _stale_size_mult = 1.0
     try:
-        if failsafe is not None and failsafe.is_stale(symbol, TF_M15, _m15_open_iso):
-            return None   # [FAILSAFE] already logged inside is_stale()
+        if failsafe is not None:
+            _stale_level = failsafe.is_stale(symbol, TF_M15, _m15_open_iso)
+            if _stale_level == StalenessLevel.BLOCKED:
+                log.warning(
+                    "[FAILSAFE] %s — stale HARD BLOCK: feed frozen >50min [RECOVERY MODE]",
+                    symbol,
+                )
+                return None
+            elif _stale_level == StalenessLevel.DEGRADED:
+                _stale_size_mult = 0.5
+                log.warning(
+                    "[FAILSAFE] %s — stale DEGRADED: feed age >35min → 0.50× size",
+                    symbol,
+                )
+            # StalenessLevel.WARNING: already logged in [STALE CHECK], allow through
     except Exception:
         pass
 
@@ -2141,8 +2157,9 @@ async def scan_symbol(
     # ── Pair intelligence (Phase 10) ─────────────────────────────────────────
     # Symbol-specific quality gate: bespoke ATR range, absolute spread threshold,
     # session restrictions, and per-symbol regime overrides.
-    # Example: GBPJPY RANGING → exec_mult=0.0 (stricter than global 0.80 default),
-    #          GBPJPY Asian   → hard block regardless of ATR or regime.
+    # GBPJPY RANGING → exec_mult=0.80 soft penalty (Asian already blocked by session gate).
+    # GBPJPY VOLATILITY_COMPRESSION / DEAD → exec_mult=0.0 hard block.
+    # GBPJPY Asian → hard block regardless of ATR or regime.
     _pair_cond = _eval_pair_quality(
         symbol       = symbol,
         atr_pips     = atr_pips,
@@ -2161,7 +2178,19 @@ async def scan_symbol(
     SignalTelemetry.get_instance().pass_stage(STAGE_REGIME, symbol)
     SignalTelemetry.get_instance().pass_stage(STAGE_PAIR, symbol)
 
-    # Apply symbol-specific regime override (e.g. GBPJPY VOLATILE_EXPANSION=0.65 vs global 0.70).
+    # Apply regime confidence penalty (e.g. RANGING +2 pts on threshold).
+    # This fires AFTER the confidence gate — setups that scraped through with
+    # borderline scores in a ranging market are flagged for diagnostics.
+    if _pair_cond.regime_confidence_penalty > 0:
+        log.warning(
+            "[PAIR REGIME SOFT] %s — regime=%s session=%s | "
+            "conf_penalty=+%d (post-gate informational) exec_mult=%.2f",
+            symbol, _market_state.state, _pair_cond.session,
+            _pair_cond.regime_confidence_penalty,
+            _pair_cond.exec_mult_override if _pair_cond.exec_mult_override is not None else _market_mult,
+        )
+
+    # Apply symbol-specific regime override (e.g. GBPJPY RANGING=0.80, VOLATILE_EXPANSION=0.65).
     # None means no override — leave _market_mult from market_state.exec_mult unchanged.
     if _pair_cond.exec_mult_override is not None:
         _market_mult = _pair_cond.exec_mult_override
@@ -3005,19 +3034,22 @@ async def scan_symbol(
         * _news_mult
         * _pair_atr_size_mult
         * _entry_timing_mult
-        * _corr_size_mult,
+        * _corr_size_mult
+        * _stale_size_mult,
         2,
     )))
     log.warning(
         "[EXECUTION SCALING] %s %s | tier=%.2f opt=%.2f mtf_h4=%.2f m5=%.2f "
         "atr=%.2f quality=%.2f guard=%.2f market=%.2f(%s) "
-        "spread=%.2f session=%.2f news=%.2f pair_atr=%.2f timing=%.2f corr=%.2f → combined=%.2f",
+        "spread=%.2f session=%.2f news=%.2f pair_atr=%.2f timing=%.2f corr=%.2f "
+        "stale=%.2f → combined=%.2f",
         symbol, direction,
         decision.size_mult, opt.lot_mult, _mtf_h4_size_penalty,
         _m5_size_penalty, _atr_size_penalty, _quality_size_mult,
         guard_size_mult, _market_mult, _market_state.state,
         _early_spread_mult, _session_quality_mult, _news_mult,
         _pair_atr_size_mult, _entry_timing_mult, _corr_size_mult,
+        _stale_size_mult,
         combined_size_mult,
     )
 

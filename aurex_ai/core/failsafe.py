@@ -36,53 +36,112 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict, deque
-from typing import Dict, Deque, Optional, Set, Tuple
+from enum import IntEnum
+from typing import Dict, Optional, Tuple
 
 from aurex_ai.core.logger import get_logger
 
 log = get_logger("core.failsafe")
 
 
+class StalenessLevel(IntEnum):
+    """Graded staleness: FRESH → WARNING → DEGRADED → BLOCKED."""
+    FRESH    = 0   # data is fresh; normal execution
+    WARNING  = 1   # first detection; warn only, allow through
+    DEGRADED = 2   # prolonged stale; warn + 0.5× size reduction
+    BLOCKED  = 3   # true feed freeze; hard block execution
+
+
+# Timeframe-aware stale thresholds (minutes).
+# M15 candles persist 15 min naturally — don't flag until >20 min stale.
+_TF_STALE_THRESHOLDS: Dict[int, Tuple[int, int, int]] = {
+    15:  (20,  35,  50),    # M15: warn @20m  degrade @35m  block @50m
+    60:  (75,  100, 130),   # H1:  warn @75m  degrade @100m block @130m
+    240: (300, 360, 480),   # H4:  warn @5h   degrade @6h   block @8h
+}
+
+
 class StaleCandleDetector:
     """
-    Track the last-seen candle open-time per symbol×timeframe.
-    After `threshold` consecutive identical candle times → stale.
+    Time-based stale candle detection.
+
+    Tracks wall-clock age of the current candle per (symbol, tf).
+    Returns a StalenessLevel rather than a plain bool, enabling graded
+    responses (warn → reduce size → hard block) instead of an immediate block.
+
+    Rationale: M15 candles live for 15 minutes.  A count-based detector
+    that fires after 3 identical readings (≈45 seconds) produces constant
+    false positives on normal 15-second scan cycles.
     """
 
     def __init__(self, threshold: int = 3) -> None:
-        self._threshold = threshold
-        self._lock      = threading.Lock()
-        # key = (symbol, tf) → deque of recent candle open-time strings
-        self._history: Dict[Tuple[str, int], Deque[str]] = defaultdict(
-            lambda: deque(maxlen=self._threshold)
-        )
+        # `threshold` kept for API compatibility; not used in time-based logic.
+        self._lock  = threading.Lock()
+        # (symbol, tf) → {open_time, first_seen, stale_hits}
+        self._state: Dict[Tuple[str, int], dict] = {}
 
-    def check(self, symbol: str, tf: int, candle_open_time: str) -> bool:
+    def _thresholds(self, tf: int) -> Tuple[int, int, int]:
+        if tf in _TF_STALE_THRESHOLDS:
+            return _TF_STALE_THRESHOLDS[tf]
+        # Unknown TF: 1.5×, 2.5×, 4× the candle duration in minutes
+        return (int(tf * 1.5), int(tf * 2.5), int(tf * 4.0))
+
+    def check(self, symbol: str, tf: int, candle_open_time: str) -> StalenessLevel:
         """
-        Record candle_open_time and return True if the feed is STALE (same
-        timestamp repeated threshold times) or False if data is fresh.
+        Record candle_open_time and return the current StalenessLevel.
+
+        FRESH    → candle is new or age is within normal timeframe duration.
+        WARNING  → first stale detection; allow execution, emit [STALE CHECK].
+        DEGRADED → prolonged stale; execution continues at 0.5× size.
+        BLOCKED  → true feed freeze; caller must skip execution.
         """
         key = (symbol, tf)
+        now = time.monotonic()
+        warn_min, degrade_min, block_min = self._thresholds(tf)
+
         with self._lock:
-            self._history[key].append(candle_open_time)
-            times = list(self._history[key])
+            s = self._state.get(key)
+            if s is None or s["open_time"] != candle_open_time:
+                # New or first-seen candle — reset to fresh
+                self._state[key] = {
+                    "open_time":  candle_open_time,
+                    "first_seen": now,
+                    "stale_hits": 0,
+                }
+                return StalenessLevel.FRESH
 
-        if len(times) >= self._threshold and len(set(times)) == 1:
-            log.warning(
-                "[FAILSAFE] Stale candle data | %s tf=%d | same candle repeated %d× (%s) "
-                "— skipping execution [RECOVERY MODE]",
-                symbol, tf, self._threshold, candle_open_time,
+            age_min = (now - s["first_seen"]) / 60.0
+
+            if age_min >= block_min:
+                s["stale_hits"] += 1
+                level = StalenessLevel.BLOCKED
+            elif age_min >= degrade_min:
+                s["stale_hits"] += 1
+                level = StalenessLevel.DEGRADED
+            elif age_min >= warn_min:
+                s["stale_hits"] += 1
+                level = StalenessLevel.WARNING
+            else:
+                level = StalenessLevel.FRESH
+
+        if level != StalenessLevel.FRESH:
+            _thresh = (
+                block_min   if level == StalenessLevel.BLOCKED  else
+                degrade_min if level == StalenessLevel.DEGRADED else
+                warn_min
             )
-            return True   # stale
+            log.warning(
+                "[STALE CHECK] symbol=%s tf=%d age_minutes=%.1f threshold=%d status=%s",
+                symbol, tf, age_min, _thresh, level.name,
+            )
 
-        return False   # fresh
+        return level
 
     def reset(self, symbol: str, tf: int) -> None:
-        """Clear stale history for a symbol after data resumes."""
+        """Clear stale state for a symbol after data resumes."""
         key = (symbol, tf)
         with self._lock:
-            self._history[key].clear()
+            self._state.pop(key, None)
 
 
 class DuplicateTicketGuard:
@@ -278,7 +337,7 @@ class Failsafe:
             cls._instance = cls(cfg)
         return cls._instance
 
-    def is_stale(self, symbol: str, tf: int, candle_open_iso: str) -> bool:
+    def is_stale(self, symbol: str, tf: int, candle_open_iso: str) -> StalenessLevel:
         return self._stale.check(symbol, tf, candle_open_iso)
 
     def reset_stale(self, symbol: str, tf: int) -> None:
