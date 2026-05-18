@@ -1089,6 +1089,74 @@ class MT5Bridge:
 
         return list(grouped.values())
 
+    def get_all_recent_deals(self, lookback_days: int = 7) -> List[Dict]:
+        """
+        Return all closed position deals from MT5 history regardless of magic number.
+
+        Unlike get_closed_deals() which filters to Aurex AI trades only (by magic),
+        this method returns EVERY deal — AI, manual, and third-party — so the sync
+        layer can show the complete MT5 account history on the user dashboard.
+
+        Each entry has: ticket, symbol, direction, entry_price, lot_size,
+        profit, opened_at, closed_at, is_manual (bool).
+        """
+        if not _MT5_AVAILABLE or not self._connected:
+            return []
+
+        now       = get_mt5_time()
+        date_from = now - _dt.timedelta(days=lookback_days)
+        date_to   = now + _dt.timedelta(hours=1)
+        deals     = mt5.history_deals_get(date_from, date_to)
+        if deals is None:
+            return []
+
+        _IN  = 0   # DEAL_ENTRY_IN
+        _OUT = 1   # DEAL_ENTRY_OUT
+
+        ins:  Dict[int, Dict] = {}
+        outs: Dict[int, Dict] = {}
+
+        for d in deals:
+            pos_id = d.position_id
+            if d.entry == _IN:
+                ins[pos_id] = {
+                    "ticket":      pos_id,
+                    "symbol":      d.symbol,
+                    "direction":   "BUY" if d.type == 0 else "SELL",
+                    "entry_price": round(float(d.price), 5),
+                    "lot_size":    round(float(d.volume), 2),
+                    "opened_at":   _dt.datetime.fromtimestamp(
+                        d.time, tz=_dt.timezone.utc
+                    ).isoformat(),
+                    "magic":       d.magic,
+                }
+            elif d.entry == _OUT:
+                if pos_id not in outs:
+                    outs[pos_id] = {"profit": 0.0, "closed_at": None}
+                outs[pos_id]["profit"] += d.profit
+                ts = _dt.datetime.fromtimestamp(d.time, tz=_dt.timezone.utc).isoformat()
+                if outs[pos_id]["closed_at"] is None or ts > outs[pos_id]["closed_at"]:
+                    outs[pos_id]["closed_at"] = ts
+
+        result = []
+        for pos_id, entry in ins.items():
+            if pos_id not in outs:
+                continue   # still open — handled by _sync_positions
+            out = outs[pos_id]
+            result.append({
+                "ticket":      entry["ticket"],
+                "symbol":      entry["symbol"],
+                "direction":   entry["direction"],
+                "entry_price": entry["entry_price"],
+                "lot_size":    entry["lot_size"],
+                "opened_at":   entry["opened_at"],
+                "profit":      round(out["profit"], 2),
+                "closed_at":   out["closed_at"],
+                "is_manual":   entry["magic"] != self.magic,
+            })
+
+        return result
+
     def modify_sl(self, ticket: int, new_sl: float, new_tp: Optional[float] = None) -> bool:
         """Move SL (and optionally TP) on an open position.  Returns True on success."""
         if self.dry_run or not _MT5_AVAILABLE or not self._connected:

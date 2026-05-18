@@ -123,6 +123,7 @@ class SupabaseSync:
             self._sync_positions(bridge, user_id)
             self._sync_bot_heartbeat(user_id)
             self._sync_trades(trade_logger, user_id)
+            self._sync_mt5_deals(bridge, user_id)
             self._sync_daily_analytics(trade_logger, user_id)
             self._sync_ai_analytics(trade_logger, user_id)
             self._sync_sample_status(trade_logger, user_id)
@@ -207,7 +208,7 @@ class SupabaseSync:
 
     def _sync_positions(self, bridge: Any, user_id: str) -> None:
         try:
-            positions = bridge.get_open_positions()
+            positions = bridge.get_all_positions()   # includes manual trades (magic != Aurex)
             self._delete("open_positions", {"user_id": f"eq.{user_id}"})
             for p in positions:
                 ticket = p.get("ticket")
@@ -303,6 +304,63 @@ class SupabaseSync:
 
         if ok and status == "closed":
             self._synced_closed.add(ticket)
+
+    # ── MT5 deals sync (AI + manual) ─────────────────────────────────────────
+
+    def _sync_mt5_deals(self, bridge: Any, user_id: str) -> None:
+        """
+        Push ALL closed MT5 deals (AI and manual) to the trades table.
+
+        Aurex AI trades already have richer metadata (score, confidence, tier, etc.)
+        inserted by _sync_trades(). This method adds manual trades that would
+        otherwise be invisible (magic number != Aurex magic) and fills gaps for
+        any AI trade whose SQLite record is incomplete.
+
+        Existing rows are patched only for fields that are not yet set (status,
+        pnl_zar, closed_at). AI trades with full data are left untouched to avoid
+        overwriting richer analytics fields.
+        """
+        try:
+            deals = bridge.get_all_recent_deals(lookback_days=7)
+            for d in deals:
+                ticket = d.get("ticket")
+                if not ticket:
+                    continue
+
+                existing = self._get("trades", {
+                    "mt5_ticket": f"eq.{ticket}",
+                    "user_id":    f"eq.{user_id}",
+                    "select":     "id,status",
+                })
+
+                pnl    = round(float(d.get("profit", 0.0) or 0.0), 2)
+                closed = d.get("closed_at") or _now_iso()
+
+                if existing:
+                    row = existing[0]
+                    # Only patch if still showing as open — avoid overwriting closed AI data
+                    if row.get("status") == "open":
+                        self._patch(
+                            "trades",
+                            {"mt5_ticket": f"eq.{ticket}", "user_id": f"eq.{user_id}"},
+                            {"status": "closed", "pnl_zar": pnl, "closed_at": closed},
+                        )
+                else:
+                    # New row — manual trade not known to Aurex AI at all
+                    self._insert("trades", {
+                        "user_id":     user_id,
+                        "mt5_ticket":  ticket,
+                        "symbol":      d.get("symbol", ""),
+                        "direction":   d.get("direction", "BUY"),
+                        "entry_price": d.get("entry_price"),
+                        "lot_size":    d.get("lot_size"),
+                        "status":      "closed",
+                        "pnl_zar":     pnl,
+                        "opened_at":   d.get("opened_at"),
+                        "closed_at":   closed,
+                    })
+        except Exception as exc:
+            log.debug("[SYNC] _sync_mt5_deals error: %s", exc)
 
     # ── Daily analytics ───────────────────────────────────────────────────────
 
