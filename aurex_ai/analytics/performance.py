@@ -232,8 +232,10 @@ class PerformanceEngine:
             dd = equity - peak
             if dd < max_dd:
                 max_dd = dd
+        # When peak == 0 (no profitable trades yet), drawdown % is undefined.
+        # Return 0.0 rather than -100.0 to avoid alarming dashboards.
         report.max_drawdown_pct = round(
-            max(max_dd / peak * 100.0, -100.0) if peak > 0 else (-100.0 if max_dd < 0 else 0.0), 2
+            max(max_dd / peak * 100.0, -100.0) if peak > 0 else 0.0, 2
         )
 
         # ── Trades per day ────────────────────────────────────────────────────

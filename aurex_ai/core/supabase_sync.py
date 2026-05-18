@@ -67,6 +67,7 @@ class SupabaseSync:
         self._user_id: Optional[str] = None
         self._client:  Optional[Any] = None
         self._enabled = _HTTPX_OK and bool(_URL) and bool(_KEY)
+        self._session_start = time.monotonic()   # for uptime_seconds calculation
 
         # ── Circuit breaker per table ─────────────────────────────────────────
         # Maps table name → sync_count value at which to re-enable it
@@ -231,11 +232,14 @@ class SupabaseSync:
 
     def _sync_bot_heartbeat(self, user_id: str) -> None:
         try:
+            uptime_sec = int(time.monotonic() - self._session_start)
             self._upsert("bot_instances", {
                 "user_id":        user_id,
                 "status":         "running",
                 "last_heartbeat": _now_iso(),
                 "pid":            os.getpid(),
+                "uptime_seconds": uptime_sec,
+                "stopped_at":     None,   # clear stale stop timestamp from previous session
             }, conflict="user_id")
         except Exception as exc:
             log.debug("[SYNC] _sync_bot_heartbeat error: %s", exc)
@@ -310,6 +314,15 @@ class SupabaseSync:
             report = PerformanceEngine.compute(trade_logger, window=200)
             wins   = max(0, int(round(report.total_closed * report.win_rate)))
             losses = report.total_closed - wins
+
+            # Compute gross_profit / gross_loss / best_trade / worst_trade from raw trades
+            _closed = trade_logger.get_closed_trades(limit=500)
+            _pnls   = [float(t.get("profit_zar", 0.0) or 0.0) for t in _closed]
+            _gross_profit = round(sum(p for p in _pnls if p > 0), 2)
+            _gross_loss   = round(sum(p for p in _pnls if p < 0), 2)
+            _best_trade   = round(max(_pnls, default=0.0), 2)
+            _worst_trade  = round(min(_pnls, default=0.0), 2)
+
             self._upsert("daily_analytics", {
                 "user_id":          user_id,
                 "date":             datetime.now(timezone.utc).date().isoformat(),
@@ -318,12 +331,12 @@ class SupabaseSync:
                 "total_trades":     report.total_closed,
                 "winning_trades":   wins,
                 "losing_trades":    losses,
-                "gross_profit":     0.0,
-                "gross_loss":       0.0,
+                "gross_profit":     _gross_profit,
+                "gross_loss":       _gross_loss,
                 "total_pnl":        round(report.total_pnl_zar, 2),
                 "max_drawdown_pct": round(abs(report.max_drawdown_pct), 4),
-                "best_trade":       0.0,
-                "worst_trade":      0.0,
+                "best_trade":       _best_trade,
+                "worst_trade":      _worst_trade,
             }, conflict="user_id,date")
         except Exception as exc:
             log.debug("[SYNC] _sync_daily_analytics error: %s", exc)
